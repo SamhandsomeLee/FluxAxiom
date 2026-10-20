@@ -1,0 +1,9 @@
+[package]
+name = "fluxaxiom-cli"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "flux"
+path = "src/main.rs"
