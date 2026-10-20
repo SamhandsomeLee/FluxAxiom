@@ -1,0 +1,28 @@
+---
+description: 一次提交一个功能点，提交说明使用英文 Conventional Commits
+alwaysApply: true
+---
+
+# Git 提交
+
+只有用户明确要求时才创建提交。一个功能点一次提交：一次逻辑变更，以及证明它的测试。无关改动拆开，不要把功能、顺手重构和无关文档混在同一次提交里。
+
+提交说明使用英文 [Conventional Commits](https://www.conventionalcommits.org/)：
+
+```text
+<type>(<scope>): <祈使句摘要>
+
+<主题说不清时，用正文说明原因>
+```
+
+- 类型：`feat`、`fix`、`docs`、`refactor`、`test`、`chore`、`build`、`ci`。
+- 范围清楚时使用：`host`、`engine`、`contract`、`cli`、`docs`、`ci`。
+- 主题用英文祈使句、小写、不加句号，并控制在 72 个字符以内。
+- 正文说明为什么，不要复述 diff。
+- 不要提交密钥（`.env`、凭据、私钥）。
+
+```text
+feat(host): persist run status and durable events in one transaction
+
+Restart must not observe a status change without its audit event.
+```

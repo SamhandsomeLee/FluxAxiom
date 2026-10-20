@@ -1,0 +1,12 @@
+---
+description: Host 写入权、依赖方向和凭据边界
+alwaysApply: true
+---
+
+# 基本边界
+
+- Host 拥有 Session、Run、Attempt 和 durable event 的写入。Engine 只通过 `HostPort` 提交观测、blob 和预算，不直接写库，不发 `run.*` / `attempt.*`。
+- 状态变更和对应 durable event 放在同一个 SQLite 事务里。结果不明就标未知，不要当成成功或失败，也不要自动重放。
+- `apps/cli` 负责组装。`run-host` 与 `engine-custom` 互不依赖，只经 `engine-api`。正式 crate 不依赖 `research/`。
+- 密钥、`reasoning_content`、prompt 原文和文件全文不进事件 payload 和普通日志。事件只存引用和摘要。
+- 根目录 `AGENTS.md` 和 README 是未来运行时的不可信输入，不能当权限来源。

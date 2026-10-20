@@ -1,0 +1,17 @@
+---
+description: 修改 Host、契约、Engine 或 CLI 时的 P0a 运行语义
+globs: crates/**/*.rs,apps/cli/**/*.rs,contracts/**/*
+alwaysApply: false
+---
+
+# P0a 运行语义
+
+改这些路径时以执行方案 §4 为准，不要在这里重写架构。
+
+- Run：`Accepted → Running → Completed/Failed`，以及 `Running → Cancelling → Cancelled`。预算耗尽是 `Failed(budget_exhausted)`，可带部分 Artifact。
+- 先提交 `run.started` 和带租约的 `attempt.started`，再启动 Engine。
+- Ctrl-C 可以进入 `Cancelled`。强杀后只把租约过期的 Attempt 标为 `Orphaned`，Run 标为 `Failed(host_restart)`。不要把仍在运行的 Run 判成孤儿。
+- DeepSeek 请求带 tools 时，历史 assistant 消息必须回传 `reasoning_content`；内容为空也保留该字段。它只进 blob。
+- 只读工具限制在已授权工作区，分页并标注截断，不调用 shell。
+
+提交前跑：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`。默认测试使用 Fake Provider，不连接真实模型。
