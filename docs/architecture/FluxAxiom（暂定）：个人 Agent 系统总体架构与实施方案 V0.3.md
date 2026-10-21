@@ -483,6 +483,22 @@ trait EngineAdapter {
 
 `EngineAdapter` 是**整体替换边界**；P0a 不实现内部 Provider Registry。`InferenceProvider` 和 `ToolExecutor` 可先用显式 trait 与构造器注入；未来第三方能力需要时再独立抽象。
 
+### 8.1.1 HostPort 与 Blob
+
+P0 执行方案把上述替换边界落实为 `EngineAdapter::run` 与 `HostPort`。`HostPort` 放在 `engine-api`，由 `run-host` 实现，由具体 Engine 调用。`apps/cli` 作为组合根把二者装到一起。它是内部 Rust 接口，不进入对外 JSON Schema。
+
+`HostPort` 是 Engine 向 Host 提交观测、blob 和预算的唯一入口。Engine 不写数据库，也不发出 `run.*` / `attempt.*`。Run 终态由 Host 根据 `EngineOutcome` 决定。一次调用的顺序是：
+
+1. Host 先创建 Session、Run、Attempt，并写入 `run.accepted`、`run.started`、`attempt.started`。
+2. Host 调用 `EngineAdapter::run`，传入 `HostPort`。
+3. Engine 在每次模型或工具调用前执行 `reserve`。预算耗尽时 Host 返回错误，Engine 收尾并交回部分结果。
+4. 模型返回后，Engine 用 `put_blob` 保存请求、响应和 `reasoning_content`，再用 `observe` 提交摘要。`observe` 返回时，对应的 durable event 已经写入。
+5. 只读工具同样先 `put_blob` 再 `observe`。
+6. Engine 只返回 `EngineOutcome`。Host 再写入产物、Attempt 结束和 Run 终态。
+7. Engine 通过 `cancellation` 观察取消。`propose_effect` 与 `request_input` 的签名在 P0a 固定，实现留到 P0b；P0a 返回不支持。
+
+Blob 是 Host 按内容保存的原文。`put_blob` 接收字节，Host 以 sha256 作为地址写入自己的数据目录，并返回 `BlobRef`；相同内容只存一份。事件只保存 `request_ref`、`response_ref`、`result_ref` 这类引用。模型请求与响应、`reasoning_content`、工具结果和 Artifact 正文进入 blob；事件中的模型别名、用量、延迟和摘要不替代这些原文。样本必须能从 blob 重建完整模型请求。Blob 与样本使用同一保留和删除策略。该存储在 P0a 的持久化阶段实现，契约阶段只冻结引用字段。
+
 ### 8.2 Engine B：Codex app-server
 
 以 Codex app-server 作为 E-001 的 Engine B 候选，约定 `Host Session ↔ Codex Thread`、`Run Attempt ↔ Codex Turn` 的实际映射；兼容差异通过 Adapter 显式记录。Thread/Turn、审批回调、sandboxPolicy、interrupt、事件通知与原生工具不被强行抹平。
