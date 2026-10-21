@@ -1,3 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["apps/cli", "crates/agent-contract", "crates/engine-api"]
+members = [
+    "apps/cli",
+    "crates/agent-contract",
+    "crates/engine-api",
+    "crates/run-host",
+]

@@ -1,0 +1,22 @@
+[package]
+name = "fluxaxiom-run-host"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+fluxaxiom-contract = { path = "../agent-contract" }
+fluxaxiom-engine-api = { path = "../engine-api" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+time = { version = "0.3", default-features = false, features = ["std"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+async-trait = "0.1"
+bytes = "1"
+fluxaxiom-contract = { path = "../agent-contract" }
+fluxaxiom-engine-api = { path = "../engine-api" }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt"] }
