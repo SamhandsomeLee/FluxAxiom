@@ -1,0 +1,22 @@
+{
+  "event_id": "evt_018f6b2a-7c3a-7d31-8f3a-9c0b1d2e3f44",
+  "schema_version": "0.3-draft",
+  "run_id": "run_018f6b2a-7c3a-7b10-8f3a-9c0b1d2e3f41",
+  "sequence": 2,
+  "subject_id": "attempt_018f6b2a-7c3a-7c20-8f3a-9c0b1d2e3f42",
+  "occurred_at": "2026-10-21T01:22:01Z",
+  "event_type": "model.call_completed",
+  "payload": {
+    "model_alias": "deepseek-flash",
+    "usage": {
+      "prompt_tokens": 120,
+      "completion_tokens": 40,
+      "prompt_cache_hit_tokens": "unknown",
+      "prompt_cache_miss_tokens": "unknown"
+    },
+    "finish_reason": "stop",
+    "latency_ms": 350,
+    "request_ref": "request_001",
+    "response_ref": "response_001"
+  }
+}

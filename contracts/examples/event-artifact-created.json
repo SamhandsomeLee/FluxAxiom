@@ -1,0 +1,15 @@
+{
+  "event_id": "evt_018f6b2a-7c3a-7d33-8f3a-9c0b1d2e3f46",
+  "schema_version": "0.3-draft",
+  "run_id": "run_018f6b2a-7c3a-7b10-8f3a-9c0b1d2e3f41",
+  "sequence": 4,
+  "subject_id": "artifact_018f6b2a-7c3a-7e40-8f3a-9c0b1d2e3f47",
+  "occurred_at": "2026-10-21T01:22:03Z",
+  "event_type": "artifact.created",
+  "payload": {
+    "artifact_id": "artifact_018f6b2a-7c3a-7e40-8f3a-9c0b1d2e3f47",
+    "artifact_type": "report",
+    "storage_ref": "artifact_body_001",
+    "summary": "runtime module responsibilities"
+  }
+}

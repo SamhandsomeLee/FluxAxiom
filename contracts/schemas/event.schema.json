@@ -1,0 +1,261 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "event.schema.json",
+  "title": "Event",
+  "description": "P0a durable event. schema_version 0.3-draft is not Contract v1. Payload holds refs and summaries only.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "schema_version",
+    "run_id",
+    "sequence",
+    "subject_id",
+    "occurred_at",
+    "event_type",
+    "payload"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "pattern": "^evt_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "schema_version": { "const": "0.3-draft" },
+    "run_id": {
+      "type": "string",
+      "pattern": "^run_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "sequence": { "type": "integer", "minimum": 1 },
+    "subject_id": { "type": "string", "minLength": 1 },
+    "occurred_at": { "$ref": "#/$defs/timestamp" },
+    "event_type": {
+      "enum": [
+        "run.accepted",
+        "run.started",
+        "run.cancelling",
+        "run.cancelled",
+        "run.completed",
+        "run.failed",
+        "attempt.started",
+        "attempt.ended",
+        "attempt.orphaned",
+        "model.call_completed",
+        "tool.call_completed",
+        "artifact.created"
+      ]
+    },
+    "payload": { "type": "object" }
+  },
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+    },
+    "attemptId": {
+      "type": "string",
+      "pattern": "^attempt_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "artifactId": {
+      "type": "string",
+      "pattern": "^artifact_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "terminalReason": {
+      "enum": [
+        "completed",
+        "cancelled",
+        "budget_exhausted",
+        "host_restart",
+        "engine_error",
+        "provider_error"
+      ]
+    },
+    "tokenCount": {
+      "anyOf": [{ "type": "integer", "minimum": 0 }, { "const": "unknown" }]
+    },
+    "emptyPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {}
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "event_type": { "enum": ["run.accepted", "run.started", "run.cancelling"] }
+        },
+        "required": ["event_type"]
+      },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/emptyPayload" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": { "enum": ["run.cancelled", "run.completed", "run.failed"] }
+        },
+        "required": ["event_type"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["terminal_reason"],
+            "properties": { "terminal_reason": { "$ref": "#/$defs/terminalReason" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "event_type": { "const": "attempt.started" } },
+        "required": ["event_type"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["attempt_id", "owner", "lease_expires_at"],
+            "properties": {
+              "attempt_id": { "$ref": "#/$defs/attemptId" },
+              "owner": { "type": "string", "minLength": 1 },
+              "lease_expires_at": { "$ref": "#/$defs/timestamp" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "event_type": { "const": "attempt.ended" } },
+        "required": ["event_type"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["attempt_id", "outcome"],
+            "properties": {
+              "attempt_id": { "$ref": "#/$defs/attemptId" },
+              "outcome": { "enum": ["completed", "failed", "cancelled"] }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "event_type": { "const": "attempt.orphaned" } },
+        "required": ["event_type"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["attempt_id"],
+            "properties": { "attempt_id": { "$ref": "#/$defs/attemptId" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "event_type": { "const": "model.call_completed" } },
+        "required": ["event_type"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "model_alias",
+              "usage",
+              "finish_reason",
+              "latency_ms",
+              "request_ref",
+              "response_ref"
+            ],
+            "properties": {
+              "model_alias": { "type": "string", "minLength": 1 },
+              "usage": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "prompt_tokens",
+                  "completion_tokens",
+                  "prompt_cache_hit_tokens",
+                  "prompt_cache_miss_tokens"
+                ],
+                "properties": {
+                  "prompt_tokens": { "$ref": "#/$defs/tokenCount" },
+                  "completion_tokens": { "$ref": "#/$defs/tokenCount" },
+                  "prompt_cache_hit_tokens": { "$ref": "#/$defs/tokenCount" },
+                  "prompt_cache_miss_tokens": { "$ref": "#/$defs/tokenCount" }
+                }
+              },
+              "finish_reason": { "type": "string", "minLength": 1 },
+              "latency_ms": { "type": "integer", "minimum": 0 },
+              "request_ref": { "type": "string", "minLength": 1 },
+              "response_ref": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "event_type": { "const": "tool.call_completed" } },
+        "required": ["event_type"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "tool_name",
+              "normalized_path_or_query",
+              "result_ref",
+              "byte_count",
+              "truncated",
+              "duration_ms"
+            ],
+            "properties": {
+              "tool_name": { "type": "string", "minLength": 1 },
+              "normalized_path_or_query": { "type": "string", "minLength": 1 },
+              "result_ref": { "type": "string", "minLength": 1 },
+              "byte_count": { "type": "integer", "minimum": 0 },
+              "truncated": { "type": "boolean" },
+              "duration_ms": { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "event_type": { "const": "artifact.created" } },
+        "required": ["event_type"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["artifact_id", "artifact_type", "storage_ref", "summary"],
+            "properties": {
+              "artifact_id": { "$ref": "#/$defs/artifactId" },
+              "artifact_type": { "type": "string", "minLength": 1 },
+              "storage_ref": { "type": "string", "minLength": 1 },
+              "summary": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

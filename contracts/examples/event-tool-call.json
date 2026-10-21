@@ -1,0 +1,17 @@
+{
+  "event_id": "evt_018f6b2a-7c3a-7d32-8f3a-9c0b1d2e3f45",
+  "schema_version": "0.3-draft",
+  "run_id": "run_018f6b2a-7c3a-7b10-8f3a-9c0b1d2e3f41",
+  "sequence": 3,
+  "subject_id": "attempt_018f6b2a-7c3a-7c20-8f3a-9c0b1d2e3f42",
+  "occurred_at": "2026-10-21T01:22:02Z",
+  "event_type": "tool.call_completed",
+  "payload": {
+    "tool_name": "read_file",
+    "normalized_path_or_query": "src/lib.rs",
+    "result_ref": "tool_result_001",
+    "byte_count": 128,
+    "truncated": false,
+    "duration_ms": 4
+  }
+}

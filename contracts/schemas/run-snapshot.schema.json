@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "run-snapshot.schema.json",
+  "title": "RunSnapshot",
+  "description": "P0a draft assembled from authoritative records. Not a second source of truth. schema_version 0.3-draft is not Contract v1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "session_id",
+    "status",
+    "terminal_reason",
+    "last_sequence",
+    "input_ref",
+    "workspace_ref",
+    "budget",
+    "artifact_ids",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "0.3-draft" },
+    "run_id": {
+      "type": "string",
+      "pattern": "^run_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "session_id": {
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "string",
+          "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        }
+      ]
+    },
+    "status": {
+      "enum": ["Accepted", "Running", "Cancelling", "Completed", "Failed", "Cancelled"]
+    },
+    "terminal_reason": {
+      "anyOf": [
+        { "type": "null" },
+        {
+          "enum": [
+            "completed",
+            "cancelled",
+            "budget_exhausted",
+            "host_restart",
+            "engine_error",
+            "provider_error"
+          ]
+        }
+      ]
+    },
+    "last_sequence": { "type": "integer", "minimum": 0 },
+    "input_ref": { "type": "string", "minLength": 1 },
+    "workspace_ref": { "type": "string", "minLength": 1 },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_model_calls", "max_tool_calls"],
+      "properties": {
+        "max_model_calls": { "type": "integer", "minimum": 0 },
+        "max_tool_calls": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "artifact_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^artifact_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      }
+    },
+    "updated_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "status": { "enum": ["Completed", "Failed", "Cancelled"] } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "terminal_reason": {
+            "enum": [
+              "completed",
+              "cancelled",
+              "budget_exhausted",
+              "host_restart",
+              "engine_error",
+              "provider_error"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "status": { "enum": ["Accepted", "Running", "Cancelling"] } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": { "terminal_reason": { "type": "null" } }
+      }
+    }
+  ]
+}
