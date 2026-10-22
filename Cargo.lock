@@ -267,6 +267,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluxaxiom-engine-custom"
+version = "0.1.0"
+dependencies = [
+ "fluxaxiom-contract",
+ "fluxaxiom-engine-api",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "fluxaxiom-run-host"
 version = "0.1.0"
 dependencies = [

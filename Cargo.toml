@@ -5,4 +5,5 @@ members = [
     "crates/agent-contract",
     "crates/engine-api",
     "crates/run-host",
+    "crates/engine-custom",
 ]
