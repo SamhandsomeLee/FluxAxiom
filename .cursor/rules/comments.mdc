@@ -15,6 +15,13 @@ alwaysApply: true
 
 测试和测试里的辅助函数同样要写。不要复述代码在按什么顺序执行。已有注释若和当前行为不一致，改注释，不要另起一段叠在过期说明上。
 
+## `impl` 里的每个方法都要单独写
+
+- `impl Trait for Type` 里的方法各写一段。trait 上的注释只描述契约，不代替某一份实现。
+- 同一个 trait 的不同实现必须分开写。Fake 和 HTTP 的 `round` 失败方式不同，不能共用一段。
+- `Debug`、`Display`、`Serialize`、`Deserialize` 的方法也要写：输出里有什么、故意不输出什么、线上字段长什么样。
+- 写在类型或 `impl` 块上面的注释，不算这个方法已经有注释。
+
 ```rust
 /// 把一次观测写成 durable event。
 ///
