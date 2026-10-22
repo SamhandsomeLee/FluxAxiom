@@ -8,7 +8,7 @@ use std::time::Duration;
 use fluxaxiom_contract::{ModelUsage, TokenCount};
 use fluxaxiom_engine_custom::{
     execute, observe_reasoning, replay_reasoning, usage_from_json, ChatError, ChatRequest,
-    ChatTransport, FakeChat, FakeStep, FinishReason, Message, ObservedReasoning, RecordingBackoff,
+    ChatTransport, FakeChat, FakeStep, FinishReason, Message, ObservedText, RecordingBackoff,
     Round, ScriptedTurn, ToolCall, ToolSpec, API_KEY_ENV, DEFAULT_MODEL, RETRY_DELAYS,
 };
 use serde_json::json;
@@ -68,8 +68,11 @@ fn empty_reasoning_field_is_accepted_and_deltas_are_joined() {
     let mut fake = FakeChat::script([turn(FinishReason::Stop)]);
     let mut backoff = RecordingBackoff::default();
     let completion = execute(&mut fake, &request(vec![assistant("")]), &mut backoff).unwrap();
-    assert_eq!(completion.reasoning_content, "think more");
-    assert_eq!(completion.content, "hello");
+    assert_eq!(
+        completion.reasoning,
+        ObservedText::Text("think more".to_owned())
+    );
+    assert_eq!(completion.content, ObservedText::Text("hello".to_owned()));
     assert!(backoff.waits.is_empty());
     assert!(!format!("{completion:?}").contains(API_KEY_ENV));
 }
@@ -96,7 +99,13 @@ fn raw_json_without_reasoning_and_with_tools_is_400() {
         "messages": [{ "role": "assistant", "content": "prior" }],
         "tools": [{ "name": "read_file", "parameters": {} }]
     });
-    assert_eq!(fake.round(&raw).unwrap(), Round::Status(400));
+    assert_eq!(
+        fake.round(&raw).unwrap(),
+        Round::Status {
+            status: 400,
+            summary: String::new(),
+        }
+    );
     let mut backoff = RecordingBackoff::default();
     let completion = execute(&mut fake, &request(vec![assistant("")]), &mut backoff).unwrap();
     assert_eq!(completion.finish_reason, FinishReason::Stop);
@@ -165,7 +174,13 @@ fn status_503_stops_after_three_retries() {
     ]);
     let mut backoff = RecordingBackoff::default();
     let error = execute(&mut fake, &request(vec![assistant("kept")]), &mut backoff).unwrap_err();
-    assert_eq!(error, ChatError::Unavailable { status: 503 });
+    assert_eq!(
+        error,
+        ChatError::Unavailable {
+            status: 503,
+            summary: String::new(),
+        }
+    );
     assert_eq!(
         backoff.waits,
         vec![
@@ -184,7 +199,13 @@ fn status_400_from_provider_does_not_retry() {
     let mut fake = FakeChat::script([FakeStep::Status(400), turn(FinishReason::Stop)]);
     let mut backoff = RecordingBackoff::default();
     let error = execute(&mut fake, &request(vec![assistant("")]), &mut backoff).unwrap_err();
-    assert_eq!(error, ChatError::Rejected { status: 400 });
+    assert_eq!(
+        error,
+        ChatError::Rejected {
+            status: 400,
+            summary: String::new(),
+        }
+    );
     assert!(backoff.waits.is_empty());
 }
 
@@ -244,19 +265,21 @@ fn missing_cache_tokens_are_unknown_and_zero_is_known() {
 fn replay_does_not_invent_an_empty_string_without_recording_it() {
     assert_eq!(
         observe_reasoning(&json!({"role": "assistant", "content": ""})),
-        ObservedReasoning::Absent
+        ObservedText::Absent
     );
     assert_eq!(
         observe_reasoning(&json!({"reasoning_content": null})),
-        ObservedReasoning::Absent
+        ObservedText::Absent
     );
-    let filled = replay_reasoning(ObservedReasoning::Absent, true);
+    let filled = replay_reasoning(ObservedText::Absent, true);
     assert_eq!(filled.reasoning_content.as_deref(), Some(""));
     assert!(filled.filled_by_host);
-    let kept = replay_reasoning(ObservedReasoning::Empty, true);
+    let kept = replay_reasoning(ObservedText::Empty, true);
     assert!(!kept.filled_by_host);
-    let omitted = replay_reasoning(ObservedReasoning::Text("think".to_owned()), false);
+    let omitted = replay_reasoning(ObservedText::Text("think".to_owned()), false);
     assert_eq!(omitted.reasoning_content, None);
+    assert!(!format!("{omitted:?}").contains("think"));
+    assert!(!format!("{:?}", ObservedText::Text("think".to_owned())).contains("think"));
 }
 
 /// 工具声明、工具调用和 tool 消息必须是思考模式样例里的嵌套 JSON。
@@ -334,8 +357,8 @@ fn non_integer_token_counts_stay_unknown() {
 fn debug_redacts_reasoning_and_content() {
     let message = assistant("secret-thought");
     let completion = fluxaxiom_engine_custom::ChatCompletion {
-        reasoning_content: "secret-thought".to_owned(),
-        content: "secret-answer".to_owned(),
+        reasoning: ObservedText::Text("secret-thought".to_owned()),
+        content: ObservedText::Text("secret-answer".to_owned()),
         tool_calls: Vec::new(),
         finish_reason: FinishReason::Stop,
         usage: usage(),

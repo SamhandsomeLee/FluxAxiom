@@ -28,6 +28,7 @@ P0 需要一个云端模型完成只读仓库分析。执行方案已经排除 A
 - 官方写明：请求携带 `tools` 时，后续必须回传 `reasoning_content`，否则 400。未携带 `tools` 时不必回传；传了也会被忽略，不拼进上下文。
 - 官方没有定义“省略键”“空字符串”“`null`”哪一种算回传，也没有定义 `tools: []`。
 - 同一页的工具样例把工具声明写成 `{"type":"function","function":{"name","description","parameters"}}`。样例回传的 `tool_calls` 是 SDK 对象，含 `id`、`type: function` 和嵌套的 `function.name` / `function.arguments`。工具结果消息是 `{"role":"tool","tool_call_id","content"}`。这是样例形状，不是这次对真实 API 的调用。
+- [Create Chat Completion](https://api-docs.deepseek.com/zh-cn/api/create-chat-completion) 写明：不设置 `include_usage` 时，中间块没有 `usage`，但 `[DONE]` 前的最后一块仍带整次用量。设为 `true` 时，中间块的 `usage` 为 `null`，统计仍在最后一块。`stream_options` 必须与 `stream: true` 一起发送，否则 400。这次没有调用真实 API。
 - 空字符串能通过，来自 2026-04-24 对真实 API 的社区核对，不是官方条文：没有该键会 400，`"reasoning_content": ""` 能通过。`null` 没有这份核对。
 - Fake 按上述假设拒绝“带 tools 且 assistant 没有该键”的原始 JSON。Fake 通过不证明当前 DeepSeek 版本也这样。真实端到端仍需覆盖：带 tools / 不带 tools，以及字段缺失 / 空串。
 

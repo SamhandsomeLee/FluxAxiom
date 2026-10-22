@@ -14,11 +14,15 @@ pub const RETRY_DELAYS: [Duration; 3] = [
 /// 一次传输的结果。
 ///
 /// **作用**：让重试逻辑和具体 HTTP 分开。
-/// **边界**：400 不重试。429 与 5xx 最多重试 3 次。流中断和非法工具参数不重试。
+/// **边界**：400 不重试。429 与 5xx 最多重试 3 次。流中断、非法工具参数，以及还没拿到状态码的 `Transport` 不重试。`summary` 只是截断后的错误说明，不是响应原文。
 #[derive(Debug, PartialEq, Eq)]
 pub enum Round {
     Completed(ChatCompletion),
-    Status(u16),
+    /// HTTP 状态。`summary` 只来自 JSON 的 `error.message` 或 `message`，最长 160 个字符。没有则为空，不放原始正文。
+    Status {
+        status: u16,
+        summary: String,
+    },
     Interrupted,
     InvalidToolArguments,
 }
@@ -27,6 +31,7 @@ pub enum Round {
 ///
 /// **作用**：Fake 和以后的 `reqwest` 客户端都走这个入口。
 /// **边界**：实现不读密钥。请求 JSON 只用于协议判断，不写入日志。
+/// 方法是同步的。`DeepSeekClient::round` 用 `block_on` 占位，接入 `EngineAdapter::run` 之前要换成可取消的异步传输。
 pub trait ChatTransport {
     /// **参数**：`request_json` 是已经序列化的请求。实现用它判断协议，不写入日志。
     fn round(&mut self, request_json: &Value) -> Result<Round, ChatError>;
@@ -51,6 +56,9 @@ pub struct RecordingBackoff {
 }
 
 impl Backoff for RecordingBackoff {
+    /// **作用**：把这次退避间隔记下来，让测试断言 200ms、400ms、800ms。
+    /// **参数**：`delay` 是 `execute` 要求等待的时长。
+    /// **边界**：不睡眠，也不连接网络。
     fn wait(&mut self, delay: Duration) {
         self.waits.push(delay);
     }
@@ -61,6 +69,7 @@ impl Backoff for RecordingBackoff {
 /// **作用**：把 Chat Completions 请求交给 `ChatTransport`。
 /// **参数**：`transport` 执行一次已序列化的请求。`request` 是要发送的消息和工具。`backoff` 只负责按给定间隔等待，测试里可以不睡眠。
 /// **边界**：最多 1 次初始调用加 3 次重试。400、流中断、非法工具参数立刻返回。
+/// `Transport`（DNS、连接在拿到状态码前失败）也立刻返回。P0 不把这类抖动当成可退避错误，以后可以再加重试。
 /// 流中断不附带已拼接的片段，调用方不得把它写入下一轮历史。不读取 `DEEPSEEK_API_KEY`。
 pub fn execute(
     transport: &mut dyn ChatTransport,
@@ -74,14 +83,16 @@ pub fn execute(
             Round::Completed(completion) => return Ok(completion),
             Round::Interrupted => return Err(ChatError::StreamInterrupted),
             Round::InvalidToolArguments => return Err(ChatError::InvalidToolArguments),
-            Round::Status(status) if is_retryable(status) => {
+            Round::Status { status, summary } if is_retryable(status) => {
                 if retries == RETRY_DELAYS.len() {
-                    return Err(ChatError::Unavailable { status });
+                    return Err(ChatError::Unavailable { status, summary });
                 }
                 backoff.wait(RETRY_DELAYS[retries]);
                 retries += 1;
             }
-            Round::Status(status) => return Err(ChatError::Rejected { status }),
+            Round::Status { status, summary } => {
+                return Err(ChatError::Rejected { status, summary })
+            }
         }
     }
 }

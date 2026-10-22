@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use fluxaxiom_contract::ModelUsage;
 use serde_json::Value;
 
-use crate::chat::{ChatCompletion, ChatError, FinishReason, ToolCall};
+use crate::chat::{ChatCompletion, ChatError, FinishReason, ObservedText, ToolCall};
 use crate::retry::{ChatTransport, Round};
 
 /// Fake 按顺序交回的一步。
@@ -54,16 +54,25 @@ impl FakeChat {
 }
 
 impl ChatTransport for FakeChat {
+    /// **作用**：按脚本交回下一步，供重试测试使用。
+    /// **参数**：`request_json` 用来判断带 `tools` 的请求是否漏了 `reasoning_content`。
+    /// **边界**：这种 400 不消耗脚本，也不访问网络。空脚本在真正取步时 panic。
     fn round(&mut self, request_json: &Value) -> Result<Round, ChatError> {
         if request_rejected(request_json) {
-            return Ok(Round::Status(400));
+            return Ok(Round::Status {
+                status: 400,
+                summary: String::new(),
+            });
         }
         let step = self
             .steps
             .pop_front()
             .expect("fake chat script has no step left");
         Ok(match step {
-            FakeStep::Status(status) => Round::Status(status),
+            FakeStep::Status(status) => Round::Status {
+                status,
+                summary: String::new(),
+            },
             FakeStep::Interrupt => Round::Interrupted,
             FakeStep::Turn(turn) => assemble(turn),
         })
@@ -106,10 +115,27 @@ fn assemble(turn: ScriptedTurn) -> Round {
         return Round::InvalidToolArguments;
     }
     Round::Completed(ChatCompletion {
-        reasoning_content: turn.reasoning_deltas.concat(),
-        content: turn.content_deltas.concat(),
+        reasoning: observed_from_deltas(&turn.reasoning_deltas),
+        content: observed_from_deltas(&turn.content_deltas),
         tool_calls: turn.tool_calls,
         finish_reason: turn.finish_reason,
         usage: turn.usage,
     })
+}
+
+/// 把脚本 delta 收成观测值。
+///
+/// **参数**：`deltas` 是这一字段实际出现过的片段。空切片表示字段没出现。
+/// **边界**：只含空字符串时是 `Empty`，不是 `Absent`。
+fn observed_from_deltas(deltas: &[String]) -> ObservedText {
+    if deltas.is_empty() {
+        ObservedText::Absent
+    } else {
+        let text = deltas.concat();
+        if text.is_empty() {
+            ObservedText::Empty
+        } else {
+            ObservedText::Text(text)
+        }
+    }
 }

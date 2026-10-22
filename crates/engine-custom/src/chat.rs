@@ -52,6 +52,9 @@ pub enum Message {
 }
 
 impl std::fmt::Debug for Message {
+    /// **作用**：让日志能看出消息角色和文本有多长。
+    /// **参数**：`formatter` 接收调试文本。
+    /// **边界**：不写入 `content` 或 `reasoning_content` 的原文。工具调用只写个数。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::System { content } => formatter
@@ -98,6 +101,9 @@ pub struct ToolCall {
 }
 
 impl Serialize for ToolCall {
+    /// **作用**：把内存里的平铺字段收成线上的嵌套对象。
+    /// **参数**：`serializer` 接收 `{"id","type":"function","function":{"name","arguments"}}`。
+    /// **边界**：不输出顶层的 `name` 或 `arguments`。形状来自思考模式文档样例，不是这次对真实 API 的调用。
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -139,6 +145,9 @@ pub struct ToolSpec {
 }
 
 impl Serialize for ToolSpec {
+    /// **作用**：把工具声明收成线上的 `function` 对象。
+    /// **参数**：`serializer` 接收 `{"type":"function","function":{"name","description","parameters"}}`。
+    /// **边界**：`description` 即使为空也保留该键。不在顶层写 `name` 或 `parameters`。
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -210,11 +219,29 @@ impl ChatRequest {
 }
 
 /// 模型结束原因。`length` 表示输出被截断，但仍是一次成功响应。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// **边界**：未知原因放在 `Other` 里，原文要留给 `EngineObservation` 的非空 `finish_reason`。`Debug` 不打印这段原文。
+#[derive(Clone, PartialEq, Eq)]
 pub enum FinishReason {
     Stop,
     Length,
     ToolCalls,
+    /// 文档样例之外的结束原因。字符串是 Provider 原文。
+    Other(String),
+}
+
+impl std::fmt::Debug for FinishReason {
+    /// **作用**：日志里区分已知结束原因。
+    /// **参数**：`formatter` 接收调试文本。
+    /// **边界**：`Other` 只打印变体名。原文留在值里，不进 `Debug`。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stop => formatter.write_str("Stop"),
+            Self::Length => formatter.write_str("Length"),
+            Self::ToolCalls => formatter.write_str("ToolCalls"),
+            Self::Other(_) => formatter.write_str("Other"),
+        }
+    }
 }
 
 /// 一次已经成功结束的模型响应。
@@ -222,21 +249,25 @@ pub enum FinishReason {
 /// **作用**：把流式 delta 收成 Host 以后可以放入 blob 的完整文本。
 /// **边界**：只有成功结束才产生这个值。流中断或 400 不返回半截 `reasoning_content`，调用方也不能把它写入下一轮历史。
 /// 本 crate 不写 blob，也不写 durable event。`Debug` 只打印长度，不打印正文。
+/// `reasoning` 与 `content` 用观测值：字段没出现是 `Absent`，不用空串填上。
 #[derive(Clone, PartialEq, Eq)]
 pub struct ChatCompletion {
-    pub reasoning_content: String,
-    pub content: String,
+    pub reasoning: ObservedText,
+    pub content: ObservedText,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: FinishReason,
     pub usage: ModelUsage,
 }
 
 impl std::fmt::Debug for ChatCompletion {
+    /// **作用**：日志里能看出结束原因、用量和文本长度。
+    /// **参数**：`formatter` 接收调试文本。
+    /// **边界**：不写入思维链或正文。`Round` 包含这个值，因此也不会带出原文。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ChatCompletion")
-            .field("reasoning_len", &self.reasoning_content.len())
-            .field("content_len", &self.content.len())
+            .field("reasoning_len", &observed_len(&self.reasoning))
+            .field("content_len", &observed_len(&self.content))
             .field("tool_calls", &self.tool_calls.len())
             .field("finish_reason", &self.finish_reason)
             .field("usage", &self.usage)
@@ -247,58 +278,123 @@ impl std::fmt::Debug for ChatCompletion {
 /// 客户端失败。
 ///
 /// **作用**：区分不能重试的拒绝、重试耗尽、流中断和非法工具参数。
-/// **边界**：不携带请求正文或密钥。400 用 `Rejected`。429 / 5xx 重试耗尽后用 `Unavailable`。
-/// 本地序列化失败用 `NotEncodable`，不编造 HTTP 状态码。
+/// **边界**：不携带请求正文或密钥。400 用 `Rejected`。429 / 5xx 重试耗尽后用 `Unavailable`。二者的 `summary` 只可能是截断后的 `error.message`。
+/// 本地序列化失败用 `NotEncodable`，缺密钥用 `MissingCredential`，连接失败用 `Transport`。这些都不是 HTTP 状态码。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatError {
     Rejected {
         status: u16,
+        /// 最多 160 个字符，只来自 JSON 的 `error.message` 或 `message`。没有则空。
+        summary: String,
     },
     Unavailable {
         status: u16,
+        /// 最多 160 个字符，只来自 JSON 的 `error.message` 或 `message`。没有则空。
+        summary: String,
     },
     /// 流在完成前断开。没有可回传的 `reasoning_content`。
     StreamInterrupted,
     InvalidToolArguments,
     /// 请求在离开本进程之前无法序列化。这不是 Provider 返回的 HTTP 状态。
     NotEncodable,
+    /// 没有 `DEEPSEEK_API_KEY`，因此没有发出请求。
+    MissingCredential,
+    /// 流里出现了这一刀还不解析的 delta，例如 `tool_calls`。
+    UnsupportedDelta,
+    /// 还没拿到 HTTP 状态就失败了，例如无法连接。不是超时。
+    Transport,
 }
 
 impl std::fmt::Display for ChatError {
+    /// **作用**：给调用方一句可读的失败说明。
+    /// **参数**：`formatter` 接收显示文本。
+    /// **边界**：状态码之外最多再写 160 个字符的 `error.message`。不写原始响应体、思维链或密钥。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Rejected { status } => write!(formatter, "chat request rejected: {status}"),
-            Self::Unavailable { status } => {
-                write!(formatter, "chat provider unavailable: {status}")
+            Self::Rejected { status, summary } => {
+                write_status(formatter, "rejected", *status, summary)
+            }
+            Self::Unavailable { status, summary } => {
+                write_status(formatter, "unavailable", *status, summary)
             }
             Self::StreamInterrupted => formatter.write_str("chat stream interrupted"),
             Self::InvalidToolArguments => formatter.write_str("tool call arguments are not json"),
             Self::NotEncodable => formatter.write_str("chat request could not be encoded"),
+            Self::MissingCredential => formatter.write_str("deepseek api key is missing"),
+            Self::UnsupportedDelta => {
+                formatter.write_str("chat stream delta is not parsed in this slice")
+            }
+            Self::Transport => formatter.write_str("chat transport failed before a status"),
         }
     }
 }
 
 impl std::error::Error for ChatError {}
 
-/// Provider 消息里实际出现的 `reasoning_content`。
+/// 写出带可选摘要的 HTTP 失败。
 ///
-/// **作用**：把“没这个键”“空字符串”“有文本”分开，避免反序列化时编造空串。
-/// **边界**：`null` 和其他类型都视为没有这个键。官方文档没有定义 `null`。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ObservedReasoning {
+/// **作用**：`Display` 在有摘要时带上截断后的 Provider 说明。
+/// **参数**：`kind` 是 `rejected` 或 `unavailable`。`summary` 已经截断并去掉控制字符。
+/// **边界**：摘要为空时只写状态码。不写原始响应体。
+fn write_status(
+    formatter: &mut std::fmt::Formatter<'_>,
+    kind: &str,
+    status: u16,
+    summary: &str,
+) -> std::fmt::Result {
+    if summary.is_empty() {
+        write!(formatter, "chat request {kind}: {status}")
+    } else {
+        write!(formatter, "chat request {kind}: {status}: {summary}")
+    }
+}
+
+/// 一段文本字段实际出现过什么。
+///
+/// **作用**：把“没这个键”“空字符串”“有文本”分开，避免反序列化时编造空串。思维链和正文共用这一形状。
+/// **边界**：`null` 和其他类型都视为没有这个键。官方文档没有定义 `null`。`Debug` 只打印变体和长度，不打印文本。
+#[derive(Clone, PartialEq, Eq)]
+pub enum ObservedText {
     Absent,
     Empty,
     Text(String),
 }
 
+impl std::fmt::Debug for ObservedText {
+    /// **作用**：日志里能看出字段有没有文本。
+    /// **参数**：`formatter` 接收调试文本。
+    /// **边界**：`Text` 只打印字符数。思维链和正文都不进 `Debug`。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent => formatter.write_str("Absent"),
+            Self::Empty => formatter.write_str("Empty"),
+            Self::Text(text) => formatter.debug_tuple("Text").field(&text.len()).finish(),
+        }
+    }
+}
+
 /// 下一轮要不要回传思维链。
 ///
 /// **作用**：带 `tools` 时给出要写入 assistant 消息的字符串。不带 `tools` 时不回传。
-/// **边界**：`filled_by_host` 为真表示空串是我们补的，不是 Provider 原文。blob 必须把这件事和原始响应分开保存。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// **边界**：`filled_by_host` 为真表示空串是我们补的，不是 Provider 原文。blob 必须把这件事和原始响应分开保存。`Debug` 只打印长度。
+#[derive(Clone, PartialEq, Eq)]
 pub struct ReplayReasoning {
     pub reasoning_content: Option<String>,
     pub filled_by_host: bool,
+}
+
+impl std::fmt::Debug for ReplayReasoning {
+    /// **作用**：日志里能看出回传了多长的思维链，以及是不是 Host 补的空串。
+    /// **参数**：`formatter` 接收调试文本。
+    /// **边界**：不打印 `reasoning_content` 原文。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let length = self.reasoning_content.as_ref().map_or(0, String::len);
+        formatter
+            .debug_struct("ReplayReasoning")
+            .field("reasoning_len", &length)
+            .field("filled_by_host", &self.filled_by_host)
+            .finish()
+    }
 }
 
 /// 从一条原始 assistant JSON 读取思维链。
@@ -307,11 +403,11 @@ pub struct ReplayReasoning {
 /// **参数**：`message` 是响应或历史里的一条消息对象。
 /// **边界**：不用 `#[serde(default)]`。缺键和 `null` 都是 `Absent`，不会变成 `""`。
 #[must_use]
-pub fn observe_reasoning(message: &Value) -> ObservedReasoning {
+pub fn observe_reasoning(message: &Value) -> ObservedText {
     match message.get("reasoning_content") {
-        Some(Value::String(text)) if text.is_empty() => ObservedReasoning::Empty,
-        Some(Value::String(text)) => ObservedReasoning::Text(text.clone()),
-        None | Some(_) => ObservedReasoning::Absent,
+        Some(Value::String(text)) if text.is_empty() => ObservedText::Empty,
+        Some(Value::String(text)) => ObservedText::Text(text.clone()),
+        None | Some(_) => ObservedText::Absent,
     }
 }
 
@@ -321,7 +417,7 @@ pub fn observe_reasoning(message: &Value) -> ObservedReasoning {
 /// **参数**：`observed` 是 Provider 原文里看到的值。`request_has_tools` 表示这一轮请求是否携带 `tools`。
 /// **边界**：带工具但原文缺失或为 `null` 时，回传 `""` 并标记 `filled_by_host`。空字符串原文不标记为补写。
 #[must_use]
-pub fn replay_reasoning(observed: ObservedReasoning, request_has_tools: bool) -> ReplayReasoning {
+pub fn replay_reasoning(observed: ObservedText, request_has_tools: bool) -> ReplayReasoning {
     if !request_has_tools {
         return ReplayReasoning {
             reasoning_content: None,
@@ -329,15 +425,15 @@ pub fn replay_reasoning(observed: ObservedReasoning, request_has_tools: bool) ->
         };
     }
     match observed {
-        ObservedReasoning::Text(text) => ReplayReasoning {
+        ObservedText::Text(text) => ReplayReasoning {
             reasoning_content: Some(text),
             filled_by_host: false,
         },
-        ObservedReasoning::Empty => ReplayReasoning {
+        ObservedText::Empty => ReplayReasoning {
             reasoning_content: Some(String::new()),
             filled_by_host: false,
         },
-        ObservedReasoning::Absent => ReplayReasoning {
+        ObservedText::Absent => ReplayReasoning {
             reasoning_content: Some(String::new()),
             filled_by_host: true,
         },
@@ -356,6 +452,30 @@ pub fn usage_from_json(value: &Value) -> ModelUsage {
         completion_tokens: token_count(value, "completion_tokens"),
         prompt_cache_hit_tokens: token_count(value, "prompt_cache_hit_tokens"),
         prompt_cache_miss_tokens: token_count(value, "prompt_cache_miss_tokens"),
+    }
+}
+
+/// 把已经拼好的文本收成观测值。
+///
+/// **参数**：`text` 是该字段出现过之后的拼接结果。
+/// **边界**：空文本是 `Empty`。调用方在字段从未出现时不要调用它。
+#[must_use]
+pub fn observe_reasoning_text(text: &str) -> ObservedText {
+    if text.is_empty() {
+        ObservedText::Empty
+    } else {
+        ObservedText::Text(text.to_owned())
+    }
+}
+
+/// `Debug` 只报告文本长度。
+///
+/// **参数**：`value` 是思维链或正文的观测值。
+/// **边界**：`Empty` 和 `Absent` 都是 0。不返回原文。
+fn observed_len(value: &ObservedText) -> usize {
+    match value {
+        ObservedText::Text(text) => text.len(),
+        ObservedText::Empty | ObservedText::Absent => 0,
     }
 }
 
