@@ -1,84 +1,120 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use bytes::Bytes;
+use fluxaxiom_contract::{AttemptStatus, RunId, RunStatus};
 use fluxaxiom_engine_api::{
     BlobRef, BudgetExhausted, BudgetLease, BudgetRequest, EffectOutcome, EngineObservation,
     HostPort, HostPortError, InputOutcome, InputRequest, ProposedEffect,
 };
 use tokio_util::sync::CancellationToken;
 
-/// A1.1 阶段交给 Engine 的 [`HostPort`] 实现。
+use crate::blob;
+use crate::error::HostError;
+use crate::events;
+use crate::host::Shared;
+use crate::store;
+
+/// 一次 `drive_run` 交给 Engine 的 [`HostPort`]。
 ///
-/// **作用**：在 `RunHost::drive_run` 里以 `Arc<dyn HostPort>` 注入，供 Engine 在 `run` 期间回调 Host，
-/// 而不让 Engine 直接访问 SQLite 或改写 Session / Run / Attempt。
-///
-/// **执行边界（本类型不负责）**：
-/// - Run / Attempt 状态迁移、`run.*` / `attempt.*` 类 durable event：由 `RunHost::prepare_drive` /
-///   `finish_drive` 在持锁与事务内完成。
-/// - 模型 / 工具观测、`artifact.created`、内容寻址 blob：A1.2 起在本 trait 的其它实现中落地（ADR-014）。
-/// - 预算记账、租约续期 / 过期扫描、Ctrl-C 取消：更后续里程碑。
-///
-/// **本阶段策略**：除提供可克隆的取消令牌外，凡需要「先持久再返回 Ok」的路径一律显式失败，
-/// 避免 Engine 误以为观测或 blob 已 durable。
-pub(crate) struct A11HostPort {
+/// **作用**：Engine 只能经这里提交 blob 和观测。`run_id` 在构造时固定。
+/// **边界**：不写 `run.*` / `attempt.*`。观测在 Run 不是 `Running` 时返回 `Invalid`。
+/// `reserve` 仍不记账。`propose_effect` / `request_input` 仍不支持。
+pub(crate) struct DrivePort {
+    shared: Arc<Shared>,
+    run_id: RunId,
     cancel: CancellationToken,
 }
 
-impl A11HostPort {
-    /// 为单次 `drive_run` 构造独立端口；令牌生命周期与该次 Engine 调用绑定。
-    pub(crate) fn new() -> Self {
+impl DrivePort {
+    pub(crate) fn new(shared: Arc<Shared>, run_id: RunId) -> Self {
         Self {
+            shared,
+            run_id,
             cancel: CancellationToken::new(),
         }
     }
 }
 
-/// A1.1 对 [`HostPort`] 的桩实现：满足 trait 与 `dyn HostPort` 分发，不假装已有 A1.2+ 存储能力。
-///
-/// 同步方法在 Engine 线程上直接返回；异步方法无 I/O，仅返回阶段常量。
-/// 所有方法均不访问 `RunHost` 或数据库。
 #[async_trait]
-impl HostPort for A11HostPort {
-    /// **trait 语义**：校验观测并写入 durable fact（含 sequence），成功才返回 `Ok(())`。
-    ///
-    /// **A1.1 边界**：无 `events` 表；返回 `Ok` 会误导 Engine。恒 `Err(Unsupported)`，不读写字段。
-    /// `Invalid` / `Storage` 留给已落地存储的实现；本桩还没有存储，不能把「没实现」说成写失败。
-    fn observe(&self, _observation: EngineObservation) -> Result<(), HostPortError> {
-        Err(HostPortError::Unsupported)
+impl HostPort for DrivePort {
+    /// **作用**：校验观测并写入一条 `model.call_completed` 或 `tool.call_completed`。
+    /// **边界**：返回 `Ok` 时该 event 已 COMMIT。缺字段或 `byte_count` 对不上返回 `Invalid`，不写 event。
+    /// 写失败返回 `Storage`，细节只进日志。
+    fn observe(&self, observation: EngineObservation) -> Result<(), HostPortError> {
+        observe_durable(&self.shared, &self.run_id, &observation).map_err(to_port_error)
     }
 
-    /// **trait 语义**：内容寻址保存原文，返回供事件引用的 [`BlobRef`]；失败时不应产出可用引用。
-    ///
-    /// **A1.1 边界**：无 blob 存储；假引用会导致后续事件指向空内容。恒 `Err(Unsupported)`。
-    /// 磁盘失败才是 `Storage`；本桩还没有目录，不使用那个变体。
-    fn put_blob(&self, _bytes: Bytes, _media_type: &str) -> Result<BlobRef, HostPortError> {
-        Err(HostPortError::Unsupported)
+    /// **作用**：按内容保存原文并返回引用。
+    /// **边界**：`media_type` 为空返回 `Invalid`，类型不入库。写失败返回 `Storage`。
+    fn put_blob(&self, bytes: Bytes, media_type: &str) -> Result<BlobRef, HostPortError> {
+        blob::put(&self.shared.root, &bytes, media_type).map_err(to_port_error)
     }
 
-    /// **trait 语义**：调用模型 / 工具前预留额度；耗尽时 Engine 应收尾并上报部分结果。
-    ///
-    /// **A1.1 边界**：无预算表与 lease 持久化；批准额度会产生假账。恒 `Err(BudgetExhausted)`。
+    /// **作用**：调用模型或工具前预留额度。
+    /// **边界**：A1.2 不记账。调用即视为没有可用额度，避免批准一笔没写入的预算。
     fn reserve(&self, _request: BudgetRequest) -> Result<BudgetLease, BudgetExhausted> {
         Err(BudgetExhausted)
     }
 
-    /// **trait 语义**：返回本次 Run 的取消令牌；Host 在 Ctrl-C 等场景下 `cancel()`，Engine 在 await 点协作退出。
-    ///
-    /// **A1.1 边界**：仅返回本 `drive` 实例持有的令牌；未接全局中断，默认不会被 cancel。允许 clone 给 Engine 任务。
+    /// **作用**：把这次 drive 的取消令牌交给 Engine，供它在 await 点观察。
+    /// **边界**：令牌只属于这一次 drive。A1.2 没有 Ctrl-C，不会被 cancel。
     fn cancellation(&self) -> CancellationToken {
         self.cancel.clone()
     }
 
-    /// **trait 语义**：提议经 Effect Gateway 执行的外部副作用（P0b 及以后）。
-    ///
-    /// **P0a 边界**：只读 CLI，无 Gateway。恒 [`EffectOutcome::Unsupported`]，不触达文件系统或网络。
+    /// **作用**：提议经 Effect Gateway 执行的外部副作用。
+    /// **边界**：P0a 不执行外部副作用，恒返回 `Unsupported`。
     async fn propose_effect(&self, _effect: ProposedEffect) -> EffectOutcome {
         EffectOutcome::Unsupported
     }
 
-    /// **trait 语义**：向用户索取非审批类输入（交互式补全等）。
-    ///
-    /// **P0a 边界**：CLI 不在 run 中途阻塞要输入。恒 [`InputOutcome::Unsupported`]。
+    /// **作用**：向用户索取非审批输入。
+    /// **边界**：P0a 不在 run 中途阻塞要输入，恒返回 `Unsupported`。
     async fn request_input(&self, _request: InputRequest) -> InputOutcome {
         InputOutcome::Unsupported
+    }
+}
+
+/// 把一次观测写成 durable event。
+///
+/// **作用**：在 Run 与 Attempt 都处于 `Running` 时，用当前 Attempt 做 `subject_id` 写入一条模型或工具事件。
+/// **边界**：先校验再开 `BEGIN IMMEDIATE`。校验失败不写行。返回 `Ok` 时事务已提交。不发 `run.*` / `attempt.*`。
+pub(crate) fn observe_durable(
+    shared: &Shared,
+    run_id: &RunId,
+    observation: &EngineObservation,
+) -> Result<(), HostError> {
+    let body = events::observation_body(&shared.root, observation)?;
+    let mut connection = shared.conn.lock().map_err(|_| HostError::Poisoned)?;
+    let transaction = store::immediate(&mut connection)?;
+    let run = store::load_run(&transaction, run_id)?;
+    let attempt = store::latest_attempt(&transaction, run_id)?;
+    if run.status != RunStatus::Running || attempt.status != AttemptStatus::Running {
+        return Err(HostError::Invalid("run is not running"));
+    }
+    let sequence = events::max_sequence(&transaction, run_id)? + 1;
+    events::record(
+        &transaction,
+        run_id,
+        sequence,
+        attempt.attempt_id.as_str(),
+        body,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// 把 Host 内部错误收成端口错误。
+///
+/// **作用**：让 Engine 只看见 `Invalid` 或 `Storage`。
+/// **边界**：校验失败保持 `Invalid`，不写日志。写库或写文件失败抹成无载荷的 `Storage`，路径和 SQLite 原文只进日志。
+fn to_port_error(error: HostError) -> HostPortError {
+    match error {
+        HostError::Invalid(_) => HostPortError::Invalid,
+        other => {
+            log::error!("host persist failed: {other}");
+            HostPortError::Storage
+        }
     }
 }

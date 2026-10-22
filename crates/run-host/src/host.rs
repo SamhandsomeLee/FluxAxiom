@@ -1,19 +1,38 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fluxaxiom_contract::{
-    attempt_transition_allowed, run_transition_allowed, Attempt, AttemptId, AttemptOutcome,
-    AttemptStatus, Budget, Run, RunId, RunStatus, Session, SessionId, TerminalReason,
+    attempt_transition_allowed, run_transition_allowed, Artifact, ArtifactId, Attempt, AttemptId,
+    AttemptOutcome, AttemptStatus, Budget, Event, Run, RunId, RunSnapshot, RunStatus, Session,
+    SessionId, TerminalReason, SCHEMA_VERSION,
 };
 use fluxaxiom_engine_api::{
-    EngineAdapter, EngineDescriptor, EngineOutcome, EngineRunRequest, FailureReason, HostPort,
+    ArtifactDraft, BlobRef, EngineAdapter, EngineDescriptor, EngineOutcome, EngineRunRequest,
+    FailureReason, HostPort,
 };
 use rusqlite::Connection;
 
+use crate::blob;
 use crate::error::{is_constraint_violation, HostError};
-use crate::port::A11HostPort;
+use crate::events;
+use crate::port::DrivePort;
 use crate::store;
 use crate::time::{lease_expires_at, now_utc};
+
+/// 进程内共享的库连接和数据目录。
+///
+/// **作用**：`RunHost` 与 `DrivePort` 共用同一把锁和同一个 blob 根目录。
+/// **边界**：锁只串行化本进程。跨进程仍靠 SQLite 的 WAL 和 `busy_timeout`。
+pub(crate) struct Shared {
+    pub(crate) conn: Mutex<Connection>,
+    pub(crate) root: PathBuf,
+    #[cfg(test)]
+    fail_prepare: AtomicBool,
+    #[cfg(test)]
+    fail_finish: AtomicBool,
+}
 
 /// 创建 Run 的 Host 受理参数。`request_id` 只在 Host 侧做幂等，不进入契约 `Run`。
 pub struct CreateRun {
@@ -21,7 +40,7 @@ pub struct CreateRun {
     pub request_id: String,
     /// 省略则 Run 不挂 Session；传入的 Session 必须已经存在。
     pub session_id: Option<SessionId>,
-    /// A1.1 暂存任务文本，并原样交给 Engine。A1.2 改为 blob 引用。
+    /// 调用方传入的任务文本。Host 先把它写成 blob，库存的 `Run.input_ref` 是 `sha256:` 引用。
     pub input_ref: String,
     /// 授权工作区标识。A1.1 只保存字符串，不检查路径。
     pub workspace_ref: String,
@@ -38,20 +57,34 @@ pub struct CreatedRun {
     pub attempt: Attempt,
 }
 
-/// Session / Run / Attempt 的权威写入点。Engine 不持有这个类型。
+/// Session、Run、Attempt 和 durable event 的权威写入点。Engine 不持有这个类型。
 ///
-/// 进程内用互斥锁串行化同一连接；跨进程靠 WAL 与 `busy_timeout` 等待写锁。
+/// **作用**：进程内用互斥锁串行化同一连接；跨进程靠 WAL 与 `busy_timeout` 等待写锁。
+/// **边界**：写 event 的事务使用 `BEGIN IMMEDIATE`。blob 文件不在这些事务里。
 pub struct RunHost {
-    conn: Mutex<Connection>,
+    shared: Arc<Shared>,
 }
 
 impl RunHost {
-    /// 打开或创建 SQLite 文件，启用 WAL，并跑完待执行的迁移。
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, HostError> {
-        let mut connection = store::connect(path.as_ref())?;
+    /// 打开或创建 Host 数据目录。
+    ///
+    /// **作用**：在目录里建 `host.db`，启用 WAL，跑完迁移，并准备 `blobs/`。
+    /// **边界**：参数是目录，不是数据库文件。blob 放在 `blobs/ab/cd/<hex>`。
+    pub fn open(directory: impl AsRef<Path>) -> Result<Self, HostError> {
+        install_host_log();
+        let root = directory.as_ref();
+        std::fs::create_dir_all(root.join("blobs").join("tmp"))?;
+        let mut connection = store::connect(&root.join("host.db"))?;
         store::migrate(&mut connection)?;
         Ok(Self {
-            conn: Mutex::new(connection),
+            shared: Arc::new(Shared {
+                conn: Mutex::new(connection),
+                root: root.to_path_buf(),
+                #[cfg(test)]
+                fail_prepare: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_finish: AtomicBool::new(false),
+            }),
         })
     }
 
@@ -68,19 +101,27 @@ impl RunHost {
         Ok(session)
     }
 
-    /// 创建 Accepted 的 Run 和 Starting 的 Attempt。
-    /// 租约此刻写入，但本阶段不根据它判活。
-    pub fn create_run(&self, request: CreateRun) -> Result<CreatedRun, HostError> {
+    /// 创建 Accepted 的 Run、Starting 的 Attempt，并写入 `run.accepted`。
+    ///
+    /// **作用**：同一 `BEGIN IMMEDIATE` 事务提交状态行和 event。任务文本先落成 blob。
+    /// **边界**：blob 的 fsync 发生在连接锁之外。租约此刻写入，但不续期、不扫描过期。重复 `request_id` 返回已有 Run。
+    pub fn create_run(&self, mut request: CreateRun) -> Result<CreatedRun, HostError> {
         validate_create(&request)?;
-        let mut connection = self.lock()?;
-        if let Some(created) = load_created(&connection, &request.request_id)? {
-            return Ok(created);
+        {
+            let connection = self.lock()?;
+            if let Some(created) = load_created(&connection, &request.request_id)? {
+                return Ok(created);
+            }
+            if let Some(session_id) = &request.session_id {
+                store::load_session(&connection, session_id)?;
+            }
         }
-        if let Some(session_id) = &request.session_id {
-            store::load_session(&connection, session_id)?;
-        }
+        let text = std::mem::take(&mut request.input_ref);
+        let stored = blob::put(&self.shared.root, text.as_bytes(), "text/plain")?;
+        request.input_ref = stored.as_str().to_owned();
         let prepared = build_created(request)?;
-        let transaction = connection.transaction()?;
+        let mut connection = self.lock()?;
+        let transaction = store::immediate(&mut connection)?;
         match store::insert_created(
             &transaction,
             &prepared.record.run,
@@ -88,17 +129,83 @@ impl RunHost {
             &prepared.request_id,
         ) {
             Ok(()) => {
+                let sequence = events::max_sequence(&transaction, &prepared.record.run.run_id)? + 1;
+                events::record(
+                    &transaction,
+                    &prepared.record.run.run_id,
+                    sequence,
+                    prepared.record.run.run_id.as_str(),
+                    events::accepted(),
+                )?;
                 transaction.commit()?;
                 Ok(prepared.record)
             }
             Err(HostError::Sqlite(error)) if is_constraint_violation(&error) => {
                 // 并发下两个进程可能同时插入同一 request_id。回滚后读赢家那一行。
+                // 这次先写的 blob 若无人引用，留在目录里。P0 不回收。
                 transaction.rollback()?;
                 load_created(&connection, &prepared.request_id)?.ok_or(HostError::Corrupt(
                     "unique request_id conflict but row missing",
                 ))
             }
             Err(error) => Err(error),
+        }
+    }
+
+    /// 按内容保存原文。
+    ///
+    /// **作用**：返回 `sha256:` 引用。相同字节返回同一引用。
+    /// **边界**：`media_type` 必须非空，但不写入文件或数据库。
+    pub fn put_blob(&self, bytes: &[u8], media_type: &str) -> Result<BlobRef, HostError> {
+        blob::put(&self.shared.root, bytes, media_type)
+    }
+
+    /// 按引用读回原文。
+    ///
+    /// **作用**：把库存的 `sha256:` 引用还原成字节。
+    /// **边界**：引用格式不对返回 `Invalid`。文件不存在返回 `NotFound`。不检查这些字节属于哪一次 Run。
+    /// P0 不重新计算哈希，文件被替换后读回的内容可以和引用不一致。
+    pub fn read_blob(&self, blob_ref: &BlobRef) -> Result<Vec<u8>, HostError> {
+        blob::read(&self.shared.root, blob_ref)
+    }
+
+    /// 补读已提交的 durable event。
+    ///
+    /// **作用**：返回该 Run 上 `sequence > after` 的事件，按序号升序。
+    /// **边界**：只看见已 COMMIT 的行。不跨 Run 排序。
+    pub fn events_after(&self, run_id: &RunId, after: u64) -> Result<Vec<Event>, HostError> {
+        let connection = self.lock()?;
+        events::load_after(&connection, run_id, after)
+    }
+
+    /// 从权威表组装快照。
+    ///
+    /// **作用**：在一条 `DEFERRED` 读事务里带上当前状态、`MAX(sequence)` 和 Artifact 列表。
+    /// **边界**：不另建快照表。没有 event 时 `last_sequence` 为 0。不把全部 event 反序列化出来。
+    pub fn snapshot(&self, run_id: &RunId) -> Result<RunSnapshot, HostError> {
+        let mut connection = self.lock()?;
+        let transaction = store::deferred(&mut connection)?;
+        let run = store::load_run(&transaction, run_id)?;
+        let last_sequence = events::max_sequence(&transaction, run_id)?;
+        let artifact_ids = events::artifact_ids(&transaction, run_id)?;
+        transaction.commit()?;
+        let snapshot = RunSnapshot {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            run_id: run.run_id.clone(),
+            session_id: run.session_id,
+            status: run.status,
+            terminal_reason: run.terminal_reason,
+            last_sequence,
+            input_ref: run.input_ref,
+            workspace_ref: run.workspace_ref,
+            budget: run.budget,
+            artifact_ids,
+            updated_at: run.updated_at,
+        };
+        if snapshot.invariants_hold() {
+            Ok(snapshot)
+        } else {
+            Err(HostError::Corrupt("snapshot"))
         }
     }
 
@@ -128,55 +235,246 @@ impl RunHost {
 
     /// 经 `HostPort` 跑一次 Engine，再根据 `EngineOutcome` 写入终态。
     ///
-    /// 不持锁越过 `.await`。报告草稿本阶段丢弃，等 A1.2 与 `artifact.created` 同事务写入。
+    /// **作用**：启动前提交 `run.started` 与 `attempt.started`，结束后把报告、Attempt 和 Run 终态放进同一事务。
+    /// **边界**：不持锁越过 `.await`。报告正文先进 blob，事务只写引用和 event。
     pub async fn drive_run(
         &self,
         run_id: &RunId,
         engine: &dyn EngineAdapter,
     ) -> Result<EngineOutcome, HostError> {
         let request = self.prepare_drive(run_id)?;
-        let host: Arc<dyn HostPort> = Arc::new(A11HostPort::new());
+        let host: Arc<dyn HostPort> =
+            Arc::new(DrivePort::new(Arc::clone(&self.shared), run_id.clone()));
         let outcome = engine.run(request, host).await;
-        self.finish_drive(run_id, &outcome)?;
-        Ok(outcome)
+        self.finish_drive(run_id, outcome)
     }
 
+    /// 在调用 Engine 之前把 Run 标成运行中。
+    ///
+    /// **作用**：同一事务写入 `Running`、`run.started` 和 `attempt.started`，并把任务原文交给 Engine。
+    /// **边界**：任务原文在写锁外读取。能否从 `Accepted` 进入 `Running` 在 `IMMEDIATE` 事务内判断，避免两个进程同时启动。任务 blob 缺失或不是 UTF-8 时不改状态。测试可在 COMMIT 前中止。
     fn prepare_drive(&self, run_id: &RunId) -> Result<EngineRunRequest, HostError> {
+        let input_ref = {
+            let connection = self.lock()?;
+            store::load_run(&connection, run_id)?.input_ref
+        };
+        let input = read_task_text(&self.shared.root, &input_ref)?;
+        let fail = self.take_fail_prepare();
         let mut connection = self.lock()?;
-        let mut run = store::load_run(&connection, run_id)?;
-        let mut attempt = store::latest_attempt(&connection, run_id)?;
+        let transaction = store::immediate(&mut connection)?;
+        let mut run = store::load_run(&transaction, run_id)?;
+        let mut attempt = store::latest_attempt(&transaction, run_id)?;
         if !run_transition_allowed(run.status, RunStatus::Running)
             || !attempt_transition_allowed(attempt.status, AttemptStatus::Running)
         {
             return Err(HostError::Invalid("run is not startable"));
         }
-        let now = now_utc();
         run.status = RunStatus::Running;
-        run.updated_at = now;
+        run.updated_at = now_utc();
         attempt.status = AttemptStatus::Running;
-        let input = run.input_ref.clone();
-        let transaction = connection.transaction()?;
         store::update_run_and_attempt(&transaction, &run, &attempt)?;
-        transaction.commit()?;
+        let mut sequence = events::max_sequence(&transaction, run_id)? + 1;
+        events::record(
+            &transaction,
+            run_id,
+            sequence,
+            run.run_id.as_str(),
+            events::started(),
+        )?;
+        sequence += 1;
+        events::record(
+            &transaction,
+            run_id,
+            sequence,
+            attempt.attempt_id.as_str(),
+            events::attempt_started(
+                attempt.attempt_id.clone(),
+                attempt.owner.clone(),
+                attempt.lease_expires_at.clone(),
+            ),
+        )?;
+        commit_tx(transaction, fail)?;
         Ok(EngineRunRequest {
             run_id: run.run_id,
             input,
         })
     }
 
-    fn finish_drive(&self, run_id: &RunId, outcome: &EngineOutcome) -> Result<(), HostError> {
+    /// 按 `EngineOutcome` 写入终态。
+    ///
+    /// **作用**：有报告时先把摘要正文写成 blob，再在同一事务写入 Artifact、`artifact.created`、`attempt.ended` 和 Run 终态事件。
+    /// **边界**：状态是否还能收尾，在 `IMMEDIATE` 事务内判断。`artifact_type` 为空时改记 `Failed(engine_error)`，不把 Run 留在 `Running`。没有报告则不写 Artifact。blob 在写锁外落盘，回滚后允许留下孤儿文件。
+    fn finish_drive(
+        &self,
+        run_id: &RunId,
+        outcome: EngineOutcome,
+    ) -> Result<EngineOutcome, HostError> {
+        let outcome = normalize_outcome(outcome);
+        let draft = report_draft(&outcome).cloned();
+        let stored = draft
+            .as_ref()
+            .map(|draft| blob::put(&self.shared.root, draft.summary.as_bytes(), "text/plain"))
+            .transpose()?;
+        let fail = self.take_fail_finish();
         let mut connection = self.lock()?;
-        let mut run = store::load_run(&connection, run_id)?;
-        let mut attempt = store::latest_attempt(&connection, run_id)?;
-        apply_outcome(&mut run, &mut attempt, outcome)?;
-        let transaction = connection.transaction()?;
+        let transaction = store::immediate(&mut connection)?;
+        let mut run = store::load_run(&transaction, run_id)?;
+        let mut attempt = store::latest_attempt(&transaction, run_id)?;
+        apply_outcome(&mut run, &mut attempt, &outcome)?;
         store::update_run_and_attempt(&transaction, &run, &attempt)?;
-        transaction.commit()?;
-        Ok(())
+        let mut sequence = events::max_sequence(&transaction, run_id)? + 1;
+        if let Some(draft) = draft {
+            let artifact = Artifact {
+                artifact_id: ArtifactId::generate(),
+                run_id: run.run_id.clone(),
+                artifact_type: draft.artifact_type.clone(),
+                storage_ref: stored
+                    .as_ref()
+                    .expect("draft blob is stored before the transaction")
+                    .as_str()
+                    .to_owned(),
+                summary: draft.summary.clone(),
+                created_at: now_utc(),
+            };
+            events::insert_artifact(&transaction, &artifact)?;
+            events::record(
+                &transaction,
+                run_id,
+                sequence,
+                artifact.artifact_id.as_str(),
+                events::artifact_created(&artifact),
+            )?;
+            sequence += 1;
+        }
+        let outcome_value = attempt.outcome.expect("ended attempt has an outcome");
+        events::record(
+            &transaction,
+            run_id,
+            sequence,
+            attempt.attempt_id.as_str(),
+            events::attempt_ended(attempt.attempt_id.clone(), outcome_value),
+        )?;
+        sequence += 1;
+        let reason = run.terminal_reason.expect("terminal run has a reason");
+        events::record(
+            &transaction,
+            run_id,
+            sequence,
+            run.run_id.as_str(),
+            events::terminal(reason),
+        )?;
+        commit_tx(transaction, fail)?;
+        Ok(outcome)
+    }
+
+    fn take_fail_prepare(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.shared.fail_prepare.swap(false, Ordering::SeqCst)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    fn take_fail_finish(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.shared.fail_finish.swap(false, Ordering::SeqCst)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, HostError> {
-        self.conn.lock().map_err(|_| HostError::Poisoned)
+        self.shared.conn.lock().map_err(|_| HostError::Poisoned)
+    }
+}
+
+/// 提交一条已经写好状态和 event 的事务。
+///
+/// **作用**：让状态行和 durable event 同时可见。
+/// **边界**：测试可以把 `fail` 设为真，在 COMMIT 前回滚并返回 `Aborted`。生产构建忽略该参数，直接提交。
+fn commit_tx(transaction: rusqlite::Transaction<'_>, fail: bool) -> Result<(), HostError> {
+    #[cfg(test)]
+    if fail {
+        transaction.rollback()?;
+        return Err(HostError::Aborted);
+    }
+    #[cfg(not(test))]
+    let _ = fail;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// 从 blob 引用读回任务文本。
+///
+/// **作用**：库存的是 `sha256:` 引用，Engine 收到的是原文。
+/// **边界**：不持有数据库锁。文件不存在或内容不是 UTF-8 时视为库损坏。
+fn read_task_text(root: &Path, input_ref: &str) -> Result<String, HostError> {
+    let bytes = blob::read(root, &BlobRef::new(input_ref)).map_err(|error| match error {
+        HostError::NotFound => HostError::Corrupt("input blob"),
+        other => other,
+    })?;
+    String::from_utf8(bytes).map_err(|_| HostError::Corrupt("input blob"))
+}
+
+/// 空的产物类型不能收成成功。
+///
+/// **作用**：把这种 Engine 返回改写成 `Failed(engine_error)`，让 Run 离开 `Running`。
+/// **边界**：不保留那份空类型草稿，因此也不会写 Artifact。
+fn normalize_outcome(outcome: EngineOutcome) -> EngineOutcome {
+    if report_draft(&outcome).is_some_and(|draft| draft.artifact_type.is_empty()) {
+        EngineOutcome::Failed {
+            reason: FailureReason::EngineError,
+            partial: None,
+        }
+    } else {
+        outcome
+    }
+}
+
+/// 本进程还没有日志后端时，把 `fluxaxiom_run_host` 的错误写到 stderr。
+struct HostLogger;
+
+impl log::Log for HostLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Error && metadata.target().starts_with("fluxaxiom_run_host")
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            eprintln!("fluxaxiom-run-host: {}", record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+/// 进程还没有日志后端时，把本 crate 的错误打到 stderr。
+///
+/// **作用**：`Storage` 不携带原因，原因必须有地方可见。
+/// **边界**：已经安装过后端时不再替换，也不改全局日志级别。CLI 若要自己接管，需在 `RunHost::open` 之前安装。
+fn install_host_log() {
+    static LOGGER: HostLogger = HostLogger;
+    if log::set_logger(&LOGGER).is_ok() {
+        log::set_max_level(log::LevelFilter::Error);
+    }
+}
+
+/// 从 Engine 的返回值取出要落盘的报告草稿。
+///
+/// **作用**：`Completed` 使用正式报告，失败或取消使用部分报告。
+/// **边界**：没有部分报告时返回空，调用方不写 Artifact。
+fn report_draft(outcome: &EngineOutcome) -> Option<&ArtifactDraft> {
+    match outcome {
+        EngineOutcome::Completed { report } => Some(report),
+        EngineOutcome::Failed { partial, .. } | EngineOutcome::Cancelled { partial } => {
+            partial.as_ref()
+        }
     }
 }
 
@@ -310,15 +608,175 @@ impl RunHost {
 }
 
 #[cfg(test)]
+impl RunHost {
+    fn fail_next_prepare_commit(&self) {
+        self.shared.fail_prepare.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_next_finish_commit(&self) {
+        self.shared.fail_finish.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+    use fluxaxiom_contract::{EventBody, RunStatus};
+    use fluxaxiom_engine_api::{
+        EngineAdapter, EngineDescriptor, EngineOutcome, EngineRunRequest, HostPort,
+    };
+    use std::sync::Arc;
+
     use super::RunHost;
+    use crate::error::HostError;
 
     #[test]
     fn opens_with_wal_and_five_second_busy_timeout() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("host.db");
-        let host = RunHost::open(&path).unwrap();
+        let host = RunHost::open(directory.path()).unwrap();
         assert!(host.journal_mode().unwrap().eq_ignore_ascii_case("wal"));
         assert_eq!(host.busy_timeout_ms().unwrap(), 5_000);
+    }
+
+    /// COMMIT 前失败时，Running 和 `run.started` 都不能留下。
+    #[tokio::test]
+    async fn prepare_commit_failure_rolls_back_status_and_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = RunHost::open(directory.path()).unwrap();
+        let created = host
+            .create_run(crate::host::CreateRun {
+                request_id: "req_abort".to_owned(),
+                session_id: None,
+                input_ref: "analyze runtime".to_owned(),
+                workspace_ref: "workspace:test".to_owned(),
+                budget: fluxaxiom_contract::Budget {
+                    max_model_calls: 1,
+                    max_tool_calls: 1,
+                },
+                engine: EngineDescriptor {
+                    engine_id: "fake".to_owned(),
+                    version: "0.1.0".to_owned(),
+                },
+            })
+            .unwrap();
+        host.fail_next_prepare_commit();
+        let error = host
+            .drive_run(&created.run.run_id, &PanicEngine)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HostError::Aborted));
+        assert_eq!(
+            host.get_run(&created.run.run_id).unwrap().status,
+            RunStatus::Accepted
+        );
+        let events = host.events_after(&created.run.run_id, 0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, 1);
+        assert!(matches!(events[0].body, EventBody::RunAccepted(_)));
+    }
+
+    /// 收尾事务失败时，Run 仍停在 Running，终态 event 不出现。
+    #[tokio::test]
+    async fn finish_commit_failure_rolls_back_terminal_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = RunHost::open(directory.path()).unwrap();
+        let created = host.create_run(sample_request("req_finish_abort")).unwrap();
+        host.fail_next_finish_commit();
+        let error = host
+            .drive_run(&created.run.run_id, &CompleteEngine)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HostError::Aborted));
+        assert_eq!(
+            host.get_run(&created.run.run_id).unwrap().status,
+            RunStatus::Running
+        );
+        let events = host.events_after(&created.run.run_id, 0).unwrap();
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event.body, EventBody::RunCompleted(_))));
+    }
+
+    /// Accepted 的 Run 还不能接收观测。
+    #[test]
+    fn observe_before_start_is_invalid() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = RunHost::open(directory.path()).unwrap();
+        let created = host
+            .create_run(sample_request("req_observe_early"))
+            .unwrap();
+        let reference = host.put_blob(b"body", "text/plain").unwrap();
+        let error = crate::port::observe_durable(
+            host.shared.as_ref(),
+            &created.run.run_id,
+            &fluxaxiom_engine_api::EngineObservation::ToolCall {
+                tool_name: "read_file".to_owned(),
+                normalized_path_or_query: "src/lib.rs".to_owned(),
+                result_ref: reference,
+                byte_count: 4,
+                truncated: false,
+                duration_ms: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, HostError::Invalid(_)));
+        assert_eq!(
+            host.get_run(&created.run.run_id).unwrap().status,
+            RunStatus::Accepted
+        );
+    }
+
+    fn sample_request(request_id: &str) -> crate::host::CreateRun {
+        crate::host::CreateRun {
+            request_id: request_id.to_owned(),
+            session_id: None,
+            input_ref: "analyze runtime".to_owned(),
+            workspace_ref: "workspace:test".to_owned(),
+            budget: fluxaxiom_contract::Budget {
+                max_model_calls: 1,
+                max_tool_calls: 1,
+            },
+            engine: EngineDescriptor {
+                engine_id: "fake".to_owned(),
+                version: "0.1.0".to_owned(),
+            },
+        }
+    }
+
+    struct CompleteEngine;
+
+    #[async_trait]
+    impl EngineAdapter for CompleteEngine {
+        fn descriptor(&self) -> EngineDescriptor {
+            EngineDescriptor {
+                engine_id: "fake".to_owned(),
+                version: "0.1.0".to_owned(),
+            }
+        }
+
+        async fn run(&self, _request: EngineRunRequest, _host: Arc<dyn HostPort>) -> EngineOutcome {
+            EngineOutcome::Completed {
+                report: fluxaxiom_engine_api::ArtifactDraft {
+                    artifact_type: "report".to_owned(),
+                    summary: "done".to_owned(),
+                },
+            }
+        }
+    }
+
+    struct PanicEngine;
+
+    #[async_trait]
+    impl EngineAdapter for PanicEngine {
+        fn descriptor(&self) -> EngineDescriptor {
+            EngineDescriptor {
+                engine_id: "fake".to_owned(),
+                version: "0.1.0".to_owned(),
+            }
+        }
+
+        async fn run(&self, _request: EngineRunRequest, _host: Arc<dyn HostPort>) -> EngineOutcome {
+            panic!("engine must not start when prepare commit is aborted");
+        }
     }
 }

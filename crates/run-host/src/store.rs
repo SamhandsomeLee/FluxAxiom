@@ -5,7 +5,7 @@ use fluxaxiom_contract::{
     Attempt, AttemptId, AttemptOutcome, AttemptStatus, Budget, Run, RunId, RunStatus, Session,
     SessionId, TerminalReason, Timestamp,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::error::HostError;
 use crate::time::now_utc;
@@ -29,6 +29,22 @@ pub(crate) fn configure(connection: &Connection) -> Result<(), HostError> {
     Ok(())
 }
 
+/// 打开一条会写 event 的事务。
+///
+/// **作用**：`BEGIN IMMEDIATE`，先拿 reserved lock，再让调用方读状态和 `MAX(sequence)`。
+/// **边界**：只包 SQLite 里的行。blob 文件的写入发生在事务外面。状态迁移是否允许必须在这条事务里判断。
+pub(crate) fn immediate(connection: &mut Connection) -> Result<Transaction<'_>, HostError> {
+    Ok(connection.transaction_with_behavior(TransactionBehavior::Immediate)?)
+}
+
+/// 打开一条一致的只读事务。
+///
+/// **作用**：让快照里的状态和 `MAX(sequence)` 来自同一时刻。
+/// **边界**：`DEFERRED`，不拿 reserved lock，不用于分配序号或改状态。
+pub(crate) fn deferred(connection: &mut Connection) -> Result<Transaction<'_>, HostError> {
+    Ok(connection.transaction_with_behavior(TransactionBehavior::Deferred)?)
+}
+
 /// 按版本顺序应用迁移。已记录的版本不会重跑，历史行不原地改写。
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), HostError> {
     connection.execute_batch(
@@ -42,7 +58,10 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), HostError> {
         [],
         |row| row.get(0),
     )?;
-    const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
+    const MIGRATIONS: &[&str] = &[
+        include_str!("../migrations/0001_init.sql"),
+        include_str!("../migrations/0002_events.sql"),
+    ];
     for (index, sql) in MIGRATIONS.iter().enumerate() {
         let version = i64::try_from(index + 1).expect("migration count fits i64");
         if version <= current {

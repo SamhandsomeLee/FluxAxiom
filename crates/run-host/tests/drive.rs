@@ -1,7 +1,7 @@
 //! Fake Engine 经 `HostPort` 跑通一次 Run。
 //!
-//! 它不是正式 crate，也不调模型。A1.1 要证明的是：Host 把端口交给 Engine，
-//! 再根据 `EngineOutcome` 自己写 Run / Attempt 终态。事件和 blob 留到 A1.2。
+//! 它不是正式 crate，也不调模型。要证明的是：Host 把端口交给 Engine，
+//! Engine 先 `put_blob` 再 `observe`，Host 再写 Run / Attempt 终态和对应 event。
 
 use std::sync::Arc;
 
@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use fluxaxiom_contract::{AttemptOutcome, AttemptStatus, RunStatus, TerminalReason};
 use fluxaxiom_engine_api::{
-    ArtifactDraft, BlobRef, EngineAdapter, EngineDescriptor, EngineObservation, EngineOutcome,
-    EngineRunRequest, FailureReason, HostPort, HostPortError,
+    ArtifactDraft, EngineAdapter, EngineDescriptor, EngineObservation, EngineOutcome,
+    EngineRunRequest, FailureReason, HostPort,
 };
 use fluxaxiom_run_host::RunHost;
 
@@ -18,8 +18,8 @@ mod common;
 
 /// 测试双：走 `EngineAdapter`，但不调用 Provider。
 ///
-/// `run` 里会碰 `observe` / `put_blob`。A1.1 必须返回 `Unsupported`——
-/// 若这里成功，说明端口假装已经持久，后续事件会指向空事实。
+/// `run` 里先保存工具结果，再提交观测。`byte_count` 等于交给模型的字节数。
+/// `observe` 返回 `Ok` 时，`tool.call_completed` 已经提交。
 struct FakeEngine;
 
 #[async_trait]
@@ -32,18 +32,23 @@ impl EngineAdapter for FakeEngine {
     }
 
     async fn run(&self, request: EngineRunRequest, host: Arc<dyn HostPort>) -> EngineOutcome {
-        // 字段填齐只为匹配端口形状。A11HostPort 不读它们，仍返回 Unsupported。
-        // byte_count 为 0 表示交给模型的内容为空，不是缺字段，也不是截断前长度。
+        let bytes = Bytes::from_static(b"noop-result");
+        let Ok(result_ref) = host.put_blob(bytes.clone(), "text/plain") else {
+            return EngineOutcome::Failed {
+                reason: FailureReason::EngineError,
+                partial: None,
+            };
+        };
+        // byte_count 是返回给模型的长度，必须和刚才写入的 blob 等长。
         let observe = host.observe(EngineObservation::ToolCall {
-            tool_name: "noop".to_owned(),
-            normalized_path_or_query: "noop".to_owned(),
-            result_ref: BlobRef::new("sha256:unused"),
-            byte_count: 0,
+            tool_name: "read_file".to_owned(),
+            normalized_path_or_query: "src/lib.rs".to_owned(),
+            result_ref,
+            byte_count: bytes.len() as u64,
             truncated: false,
-            duration_ms: 0,
+            duration_ms: 1,
         });
-        let blob = host.put_blob(Bytes::from_static(b"x"), "text/plain");
-        if observe != Err(HostPortError::Unsupported) || blob.is_ok() {
+        if observe.is_err() {
             return EngineOutcome::Failed {
                 reason: FailureReason::EngineError,
                 partial: None,
@@ -66,8 +71,8 @@ impl EngineAdapter for FakeEngine {
 #[tokio::test]
 async fn fake_engine_completes_run_and_ends_attempt() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("host.db");
-    let host = RunHost::open(&path).unwrap();
+    let path = directory.path();
+    let host = RunHost::open(path).unwrap();
     let created = host.create_run(common::create_run("req_drive")).unwrap();
 
     let outcome = host
@@ -90,11 +95,11 @@ async fn fake_engine_completes_run_and_ends_attempt() {
 #[tokio::test]
 async fn reopen_after_drive_still_completed() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("host.db");
+    let path = directory.path();
     let run_id;
     let attempt_id;
     {
-        let host = RunHost::open(&path).unwrap();
+        let host = RunHost::open(path).unwrap();
         let created = host
             .create_run(common::create_run("req_reopen_drive"))
             .unwrap();
@@ -103,7 +108,7 @@ async fn reopen_after_drive_still_completed() {
         host.drive_run(&run_id, &FakeEngine).await.unwrap();
     }
 
-    let host = RunHost::open(&path).unwrap();
+    let host = RunHost::open(path).unwrap();
     let run = host.get_run(&run_id).unwrap();
     let attempt = host.get_attempt(&attempt_id).unwrap();
     assert_eq!(run.status, RunStatus::Completed);
@@ -114,8 +119,8 @@ async fn reopen_after_drive_still_completed() {
 #[tokio::test]
 async fn duplicate_request_id_after_drive_keeps_terminal_run() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("host.db");
-    let host = RunHost::open(&path).unwrap();
+    let path = directory.path();
+    let host = RunHost::open(path).unwrap();
     let created = host
         .create_run(common::create_run("req_idempotent_drive"))
         .unwrap();

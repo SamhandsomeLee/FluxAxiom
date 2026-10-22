@@ -12,11 +12,11 @@ mod common;
 #[test]
 fn reopen_reads_same_session_run_and_attempt() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("host.db");
+    let path = directory.path();
     let session;
     let created;
     {
-        let host = RunHost::open(&path).unwrap();
+        let host = RunHost::open(path).unwrap();
         session = host.create_session().unwrap();
         let mut request = common::create_run("req_reopen");
         request.session_id = Some(session.session_id.clone());
@@ -30,7 +30,7 @@ fn reopen_reads_same_session_run_and_attempt() {
         assert!(created.attempt.invariants_hold());
     }
 
-    let host = RunHost::open(&path).unwrap();
+    let host = RunHost::open(path).unwrap();
     assert_eq!(host.get_session(&session.session_id).unwrap(), session);
     assert_eq!(host.get_run(&created.run.run_id).unwrap(), created.run);
     assert_eq!(
@@ -43,8 +43,8 @@ fn reopen_reads_same_session_run_and_attempt() {
 #[test]
 fn duplicate_request_id_returns_same_run() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("host.db");
-    let host = RunHost::open(&path).unwrap();
+    let path = directory.path();
+    let host = RunHost::open(path).unwrap();
     let first = host.create_run(common::create_run("req_001")).unwrap();
     let second = host.create_run(common::create_run("req_001")).unwrap();
     assert_eq!(first, second);
@@ -54,8 +54,8 @@ fn duplicate_request_id_returns_same_run() {
 #[test]
 fn missing_session_is_not_found() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("host.db");
-    let host = RunHost::open(&path).unwrap();
+    let path = directory.path();
+    let host = RunHost::open(path).unwrap();
     let mut request = common::create_run("req_missing_session");
     request.session_id = Some(SessionId::generate());
     let error = host.create_run(request).unwrap_err();

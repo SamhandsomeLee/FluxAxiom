@@ -1,9 +1,11 @@
-//! Run Host：Session、Run、Attempt 的权威存储与 Engine 调度。
+//! Run Host：Session、Run、Attempt、durable event 的权威存储与 Engine 调度。
 //!
-//! Engine 只通过 `HostPort` 提交观测。A1.1 只落三张状态表；
-//! 事件、blob、租约过期扫描不在本 crate 的这一阶段。
+//! **作用**：状态变更和对应 event 在同一个 SQLite 事务里提交。原文放在数据目录的 blob 里。
+//! **边界**：Engine 只通过 `HostPort` 提交观测和 blob。租约过期扫描、预算记账和 Ctrl-C 不在这一阶段。
 
+mod blob;
 mod error;
+mod events;
 mod host;
 mod port;
 mod store;
