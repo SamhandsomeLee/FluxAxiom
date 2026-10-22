@@ -1,4 +1,4 @@
-use fluxaxiom_contract::RunId;
+use fluxaxiom_contract::{ModelUsage, RunId};
 
 /// Engine 身份。Host 用它写入 Attempt 的 `engine_id` / `engine_version`。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,20 +38,45 @@ impl BlobRef {
     }
 }
 
-/// Engine 交给 Host 的可持久观测。Host 校验后写入 durable event。
-/// Engine 不能用它发送 `run.*` 或 `attempt.*`。
+/// Engine 交给 Host 的可持久观测。Host 校验后写成 durable event。
+///
+/// **作用**：把模型或只读工具调用的摘要交给 Host。原文已经由 `put_blob` 存好，这里只带引用和 Host 编不了的数字。
+///
+/// **边界**：不能用来发 `run.*` / `attempt.*`。空字符串和空 `BlobRef` 视为缺字段，Host 返回 `Invalid` 且不写 event。
+/// `latency_ms` 与 `duration_ms` 允许为 0。`byte_count` 为 0 表示交给模型的内容为空，不是未知长度。
+/// `usage` 里缺失的 token 用契约的 `TokenCount::Unknown`，不要填 0 冒充。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineObservation {
-    /// 一次模型调用完成。原文在 `request_ref` / `response_ref` 指向的 blob 里。
+    /// 一次模型调用完成。请求和响应原文在两个 blob 引用里，不在本结构里。
     ModelCall {
+        /// 请求时的模型别名。空字符串是 `Invalid`。
         model_alias: String,
+        /// 用量。缓存命中缺失时用 `Unknown`，不要编造数字。
+        usage: ModelUsage,
+        /// Provider 的 `finish_reason`。空字符串是 `Invalid`。
+        finish_reason: String,
+        /// 本次调用墙钟毫秒。0 合法。
+        latency_ms: u64,
+        /// 完整请求 blob。空引用是 `Invalid`。
         request_ref: BlobRef,
+        /// 完整响应 blob，含 `reasoning_content`。空引用是 `Invalid`。
         response_ref: BlobRef,
     },
-    /// 一次只读工具调用完成。结果原文在 `result_ref` 指向的 blob 里。
+    /// 一次只读工具调用完成。结果原文在 `result_ref`，不在本结构里。
     ToolCall {
+        /// 工具名。空字符串是 `Invalid`。
         tool_name: String,
+        /// 规范化路径或查询。空字符串是 `Invalid`。只读工具才走这里，不是 Effect。
+        normalized_path_or_query: String,
+        /// 工具结果 blob。空引用是 `Invalid`。
         result_ref: BlobRef,
+        /// 返回给模型的字节数，等于 `result_ref` 里那份内容的长度。0 表示这份内容为空。
+        /// 不记录截断前的原始长度。
+        byte_count: u64,
+        /// 为 true 时，工具原始输出大于 `byte_count`；多出来的部分没有交给模型，也不在本事件里。
+        truncated: bool,
+        /// 工具耗时毫秒。0 合法。
+        duration_ms: u64,
     },
 }
 

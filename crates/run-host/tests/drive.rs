@@ -32,9 +32,15 @@ impl EngineAdapter for FakeEngine {
     }
 
     async fn run(&self, request: EngineRunRequest, host: Arc<dyn HostPort>) -> EngineOutcome {
+        // 字段填齐只为匹配端口形状。A11HostPort 不读它们，仍返回 Unsupported。
+        // byte_count 为 0 表示交给模型的内容为空，不是缺字段，也不是截断前长度。
         let observe = host.observe(EngineObservation::ToolCall {
             tool_name: "noop".to_owned(),
-            result_ref: BlobRef::new("unused"),
+            normalized_path_or_query: "noop".to_owned(),
+            result_ref: BlobRef::new("sha256:unused"),
+            byte_count: 0,
+            truncated: false,
+            duration_ms: 0,
         });
         let blob = host.put_blob(Bytes::from_static(b"x"), "text/plain");
         if observe != Err(HostPortError::Unsupported) || blob.is_ok() {

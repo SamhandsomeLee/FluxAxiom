@@ -129,7 +129,9 @@ pub struct ToolCallCompletedPayload {
     pub tool_name: String,
     pub normalized_path_or_query: String,
     pub result_ref: String,
+    /// 返回给模型的字节数，与 `result_ref` 指向的内容等长。不是截断前的原始长度。
     pub byte_count: u64,
+    /// 为 true 时，原始输出比 `byte_count` 更大，超出部分未交给模型。
     pub truncated: bool,
     pub duration_ms: u64,
 }

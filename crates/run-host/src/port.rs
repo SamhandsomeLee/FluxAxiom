@@ -41,6 +41,7 @@ impl HostPort for A11HostPort {
     /// **trait 语义**：校验观测并写入 durable fact（含 sequence），成功才返回 `Ok(())`。
     ///
     /// **A1.1 边界**：无 `events` 表；返回 `Ok` 会误导 Engine。恒 `Err(Unsupported)`，不读写字段。
+    /// `Invalid` / `Storage` 留给已落地存储的实现；本桩还没有存储，不能把「没实现」说成写失败。
     fn observe(&self, _observation: EngineObservation) -> Result<(), HostPortError> {
         Err(HostPortError::Unsupported)
     }
@@ -48,6 +49,7 @@ impl HostPort for A11HostPort {
     /// **trait 语义**：内容寻址保存原文，返回供事件引用的 [`BlobRef`]；失败时不应产出可用引用。
     ///
     /// **A1.1 边界**：无 blob 存储；假引用会导致后续事件指向空内容。恒 `Err(Unsupported)`。
+    /// 磁盘失败才是 `Storage`；本桩还没有目录，不使用那个变体。
     fn put_blob(&self, _bytes: Bytes, _media_type: &str) -> Result<BlobRef, HostPortError> {
         Err(HostPortError::Unsupported)
     }

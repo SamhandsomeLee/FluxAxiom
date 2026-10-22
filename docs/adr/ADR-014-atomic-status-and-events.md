@@ -19,7 +19,7 @@ Blob 按 sha256 存在 Host 数据目录。SQLite 事务包不住文件写入。
 3. Engine 不写库，也不发 `run.*` / `attempt.*`。这两类事件只由 Host 在状态事务里写。Engine 只通过 `HostPort` 提交观测、blob 和预算。
 4. `put_blob` 先把原文写到数据目录，再返回 `BlobRef`。`observe` 返回时，对应 event 已经 COMMIT。调用顺序是先 blob 后 observe。
 5. Blob 是文件，不进入 SQLite 事务。内容地址为 `sha256:` 加小写 hex；相同字节只保留一份。事务回滚后允许磁盘上留下无人引用的孤儿 blob。部分写入用临时文件再 rename 避免。孤儿 blob 的回收（GC）不在 P0 范围，留下它们不是缺陷。
-6. `observe` 必须带齐契约 event payload 里 Host 编造不了的字段（模型的 usage / `finish_reason` / `latency_ms`，工具的路径、字节数、`truncated`、耗时）。缺字段或字段为空时返回 `Invalid`，不写 event。原文仍只在 blob。
+6. `observe` 必须带齐契约 event payload 里 Host 编造不了的字段（模型的 usage / `finish_reason` / `latency_ms`，工具的路径、字节数、`truncated`、耗时）。工具的 `byte_count` 是返回给模型的字节数，与 `result_ref` 的内容等长，不是截断前的原始长度。缺字段或字段为空时返回 `Invalid`，不写 event。原文仍只在 blob。
 7. `HostPortError` 增加无载荷的 `Storage` 与 `Invalid`，并保持 `Copy`。`Unsupported` 表示本阶段没有这个能力；`Invalid` 表示观测未通过校验，尚未写入；`Storage` 表示能力已落地但这次持久化失败。写库或写 blob 失败不得装成不支持。SQLite / 路径等细节只写 Host 日志，不放进错误值，避免把路径带给 Engine。Engine 对 `Invalid` 和 `Storage` 一律收尾并交回失败，不解析错误文本。
 8. A1.2 不实现预算记账、Ctrl-C、租约过期扫描和 CLI 组装。这些仍分别属于 A2、A3。
 

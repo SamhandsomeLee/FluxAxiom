@@ -228,7 +228,11 @@
               "tool_name": { "type": "string", "minLength": 1 },
               "normalized_path_or_query": { "type": "string", "minLength": 1 },
               "result_ref": { "type": "string", "minLength": 1 },
-              "byte_count": { "type": "integer", "minimum": 0 },
+              "byte_count": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Byte length of the tool result returned to the model and stored at result_ref. Not the pre-truncation size."
+              },
               "truncated": { "type": "boolean" },
               "duration_ms": { "type": "integer", "minimum": 0 }
             }

@@ -62,6 +62,22 @@ impl EngineAdapter for ImmediateEngine {
     }
 }
 
+/// 三种失败必须能靠值区分，并且保持 `Copy`：Engine 收尾时不解析文本，也不该被迫克隆字符串。
+#[test]
+fn host_port_errors_stay_copy_and_distinct() {
+    let storage = HostPortError::Storage;
+    let copied = storage;
+    assert_eq!(copied, HostPortError::Storage);
+    assert_ne!(
+        HostPortError::Unsupported.to_string(),
+        HostPortError::Invalid.to_string()
+    );
+    assert_ne!(
+        HostPortError::Invalid.to_string(),
+        HostPortError::Storage.to_string()
+    );
+}
+
 #[tokio::test]
 async fn p0a_effect_and_input_are_unsupported() {
     let host: Arc<dyn HostPort> = Arc::new(StubHost {
