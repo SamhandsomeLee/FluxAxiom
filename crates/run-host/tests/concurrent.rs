@@ -71,8 +71,11 @@ fn two_processes_cannot_both_start_one_run() {
 
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path();
+    let workspace = common::authorized_workspace(path);
     let host = RunHost::open(path).unwrap();
-    let created = host.create_run(common::create_run("req_race")).unwrap();
+    let created = host
+        .create_run(common::create_run("req_race", &workspace))
+        .unwrap();
     let executable = std::env::current_exe().unwrap();
     let mut children = Vec::new();
     for _ in 0..2 {
@@ -155,9 +158,11 @@ impl fluxaxiom_engine_api::EngineAdapter for RaceEngine {
 
 fn write_runs(worker: &str) {
     let path = std::env::var(DB_ENV).expect("worker database path");
+    let path = std::path::Path::new(&path);
+    let workspace = common::authorized_workspace(path);
     let host = RunHost::open(path).unwrap();
     for index in 0..PER_WORKER {
-        host.create_run(common::create_run(format!("{worker}-{index}")))
+        host.create_run(common::create_run(format!("{worker}-{index}"), &workspace))
             .unwrap();
     }
 }

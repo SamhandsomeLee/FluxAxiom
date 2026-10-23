@@ -10,7 +10,7 @@ use fluxaxiom_contract::{
 };
 use fluxaxiom_engine_api::{
     ArtifactDraft, BlobRef, EngineAdapter, EngineDescriptor, EngineOutcome, EngineRunRequest,
-    FailureReason, HostPort,
+    FailureReason, HostPort, WorkspaceRoot,
 };
 use rusqlite::Connection;
 
@@ -42,7 +42,7 @@ pub struct CreateRun {
     pub session_id: Option<SessionId>,
     /// 调用方传入的任务文本。Host 先把它写成 blob，库存的 `Run.input_ref` 是 `sha256:` 引用。
     pub input_ref: String,
-    /// 授权工作区标识。A1.1 只保存字符串，不检查路径。
+    /// 授权工作区目录路径。创建时只要求非空；`prepare_drive` 再 `WorkspaceRoot::open`。
     pub workspace_ref: String,
     /// 写入 Run.budget。A1.1 不按它扣减；端口上的 `reserve` 直接视为耗尽。
     pub budget: Budget,
@@ -237,6 +237,8 @@ impl RunHost {
     ///
     /// **作用**：启动前提交 `run.started` 与 `attempt.started`，结束后把报告、Attempt 和 Run 终态放进同一事务。
     /// **边界**：不持锁越过 `.await`。报告正文先进 blob，事务只写引用和 event。
+    /// **已知缺口（A3 前必须决定，见执行方案 §4.7.4）**：`prepare_drive` 失败时这里直接返回 `Err`，Run 仍是 `Accepted`，没有终态、没有事件。
+    /// 本方法不会把它转成 `Failed`，也没有别的路径会回收它。A3 的 CLI 不能只打印这个错误就退出，否则用户之后看到的是一个永远不结束的 Run。
     pub async fn drive_run(
         &self,
         run_id: &RunId,
@@ -251,14 +253,24 @@ impl RunHost {
 
     /// 在调用 Engine 之前把 Run 标成运行中。
     ///
-    /// **作用**：同一事务写入 `Running`、`run.started` 和 `attempt.started`，并把任务原文交给 Engine。
-    /// **边界**：任务原文在写锁外读取。能否从 `Accepted` 进入 `Running` 在 `IMMEDIATE` 事务内判断，避免两个进程同时启动。任务 blob 缺失或不是 UTF-8 时不改状态。测试可在 COMMIT 前中止。
+    /// **作用**：同一事务写入 `Running`、`run.started` 和 `attempt.started`，并把任务原文与已打开的授权根交给 Engine。
+    /// **边界**：任务原文与工作区打开都在写锁外完成。能否从 `Accepted` 进入 `Running` 在 `IMMEDIATE` 事务内判断，避免两个进程同时启动。任务 blob 缺失、不是 UTF-8、或工作区目录打不开时不改状态。测试可在 COMMIT 前中止。
+    ///
+    /// **失败后 Run 停在 `Accepted`（有意保留的缺口，不是遗漏）**：
+    /// - 上面三种失败发生在事务开始之前，所以既不写 `run.failed`，也不改 Run 或 Attempt 状态。这是 A1.1 为了「失败不留半截状态」选的最保守做法，`missing_workspace_leaves_run_accepted` 测试固定了它。
+    /// - 代价：这个 Run 不再是 `Running` / `Cancelling`，执行方案 §4.8 的启动扫描只处理这两种状态且租约已过期的 Attempt，所以它不会被标成 `Orphaned`，也不会变成 `Failed(host_restart)`。没有任何现有路径会收尾它。
+    /// - 对用户可见的后果：`status` 永远是 `Accepted`，`events` 里没有任何事件解释原因。同一个 `request_id` 重新提交会按幂等返回这个旧 Run，而不是新建，用户无法靠重试摆脱。
+    /// - A3 必须在这三种里选一个并写进 ADR：(1) 失败时同一事务写 `run.failed` 并终态化；(2) 保持 `Accepted` 但提供显式的放弃或重试命令；(3) CLI 在 `create_run` 之前就校验工作区，使这条路径只剩真正的竞态。不能默认留着。
     fn prepare_drive(&self, run_id: &RunId) -> Result<EngineRunRequest, HostError> {
-        let input_ref = {
+        let (input_ref, workspace_ref) = {
             let connection = self.lock()?;
-            store::load_run(&connection, run_id)?.input_ref
+            let run = store::load_run(&connection, run_id)?;
+            (run.input_ref, run.workspace_ref)
         };
         let input = read_task_text(&self.shared.root, &input_ref)?;
+        // 失败时直接返回，Run 保持 `Accepted`。原因与后果见上面的函数注释。
+        let workspace = WorkspaceRoot::open(&workspace_ref)
+            .map_err(|_| HostError::Invalid("workspace root is unavailable"))?;
         let fail = self.take_fail_prepare();
         let mut connection = self.lock()?;
         let transaction = store::immediate(&mut connection)?;
@@ -297,6 +309,7 @@ impl RunHost {
         Ok(EngineRunRequest {
             run_id: run.run_id,
             input,
+            workspace,
         })
     }
 
@@ -642,23 +655,9 @@ mod tests {
     #[tokio::test]
     async fn prepare_commit_failure_rolls_back_status_and_events() {
         let directory = tempfile::tempdir().unwrap();
-        let host = RunHost::open(directory.path()).unwrap();
-        let created = host
-            .create_run(crate::host::CreateRun {
-                request_id: "req_abort".to_owned(),
-                session_id: None,
-                input_ref: "analyze runtime".to_owned(),
-                workspace_ref: "workspace:test".to_owned(),
-                budget: fluxaxiom_contract::Budget {
-                    max_model_calls: 1,
-                    max_tool_calls: 1,
-                },
-                engine: EngineDescriptor {
-                    engine_id: "fake".to_owned(),
-                    version: "0.1.0".to_owned(),
-                },
-            })
-            .unwrap();
+        let path = directory.path();
+        let host = RunHost::open(path).unwrap();
+        let created = host.create_run(sample_request("req_abort", path)).unwrap();
         host.fail_next_prepare_commit();
         let error = host
             .drive_run(&created.run.run_id, &PanicEngine)
@@ -679,8 +678,11 @@ mod tests {
     #[tokio::test]
     async fn finish_commit_failure_rolls_back_terminal_state() {
         let directory = tempfile::tempdir().unwrap();
-        let host = RunHost::open(directory.path()).unwrap();
-        let created = host.create_run(sample_request("req_finish_abort")).unwrap();
+        let path = directory.path();
+        let host = RunHost::open(path).unwrap();
+        let created = host
+            .create_run(sample_request("req_finish_abort", path))
+            .unwrap();
         host.fail_next_finish_commit();
         let error = host
             .drive_run(&created.run.run_id, &CompleteEngine)
@@ -701,9 +703,10 @@ mod tests {
     #[test]
     fn observe_before_start_is_invalid() {
         let directory = tempfile::tempdir().unwrap();
-        let host = RunHost::open(directory.path()).unwrap();
+        let path = directory.path();
+        let host = RunHost::open(path).unwrap();
         let created = host
-            .create_run(sample_request("req_observe_early"))
+            .create_run(sample_request("req_observe_early", path))
             .unwrap();
         let reference = host.put_blob(b"body", "text/plain").unwrap();
         let error = crate::port::observe_durable(
@@ -726,12 +729,15 @@ mod tests {
         );
     }
 
-    fn sample_request(request_id: &str) -> crate::host::CreateRun {
+    /// 测试用创建参数。`parent` 下会建可 `open` 的 `authorized/` 目录。
+    fn sample_request(request_id: &str, parent: &std::path::Path) -> crate::host::CreateRun {
+        let workspace = parent.join("authorized");
+        std::fs::create_dir_all(&workspace).unwrap();
         crate::host::CreateRun {
             request_id: request_id.to_owned(),
             session_id: None,
             input_ref: "analyze runtime".to_owned(),
-            workspace_ref: "workspace:test".to_owned(),
+            workspace_ref: workspace.to_string_lossy().into_owned(),
             budget: fluxaxiom_contract::Budget {
                 max_model_calls: 1,
                 max_tool_calls: 1,

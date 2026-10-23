@@ -57,6 +57,7 @@ impl EngineAdapter for FakeEngine {
         // 令牌存在即可。A1.1 没有 Ctrl-C，不会被 cancel。
         // 不调用 `reserve`：本阶段不记账，调用即视为耗尽。
         let _cancel = host.cancellation();
+        assert!(request.workspace.as_path().is_dir());
         EngineOutcome::Completed {
             report: ArtifactDraft {
                 artifact_type: "report".to_owned(),
@@ -72,8 +73,11 @@ impl EngineAdapter for FakeEngine {
 async fn fake_engine_completes_run_and_ends_attempt() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path();
+    let workspace = common::authorized_workspace(path);
     let host = RunHost::open(path).unwrap();
-    let created = host.create_run(common::create_run("req_drive")).unwrap();
+    let created = host
+        .create_run(common::create_run("req_drive", &workspace))
+        .unwrap();
 
     let outcome = host
         .drive_run(&created.run.run_id, &FakeEngine)
@@ -96,12 +100,13 @@ async fn fake_engine_completes_run_and_ends_attempt() {
 async fn reopen_after_drive_still_completed() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path();
+    let workspace = common::authorized_workspace(path);
     let run_id;
     let attempt_id;
     {
         let host = RunHost::open(path).unwrap();
         let created = host
-            .create_run(common::create_run("req_reopen_drive"))
+            .create_run(common::create_run("req_reopen_drive", &workspace))
             .unwrap();
         run_id = created.run.run_id.clone();
         attempt_id = created.attempt.attempt_id.clone();
@@ -120,18 +125,46 @@ async fn reopen_after_drive_still_completed() {
 async fn duplicate_request_id_after_drive_keeps_terminal_run() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path();
+    let workspace = common::authorized_workspace(path);
     let host = RunHost::open(path).unwrap();
     let created = host
-        .create_run(common::create_run("req_idempotent_drive"))
+        .create_run(common::create_run("req_idempotent_drive", &workspace))
         .unwrap();
     host.drive_run(&created.run.run_id, &FakeEngine)
         .await
         .unwrap();
 
     let again = host
-        .create_run(common::create_run("req_idempotent_drive"))
+        .create_run(common::create_run("req_idempotent_drive", &workspace))
         .unwrap();
     assert_eq!(again.run.run_id, created.run.run_id);
     assert_eq!(again.run.status, RunStatus::Completed);
     assert_eq!(again.attempt.status, AttemptStatus::Ended);
+}
+
+/// 工作区目录打不开时不进入 Running，Engine 不会被调用。
+#[tokio::test]
+async fn missing_workspace_leaves_run_accepted() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let host = RunHost::open(path).unwrap();
+    let mut request = common::create_run("req_missing_ws", path);
+    request.workspace_ref = path.join("does-not-exist").to_string_lossy().into_owned();
+    let created = host.create_run(request).unwrap();
+    let error = host
+        .drive_run(&created.run.run_id, &FakeEngine)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        fluxaxiom_run_host::HostError::Invalid("workspace root is unavailable")
+    ));
+    assert_eq!(
+        host.get_run(&created.run.run_id).unwrap().status,
+        RunStatus::Accepted
+    );
+    let events = host.events_after(&created.run.run_id, 0).unwrap();
+    assert!(events
+        .iter()
+        .all(|event| !matches!(event.body, fluxaxiom_contract::EventBody::RunStarted(_))));
 }

@@ -7,6 +7,7 @@
 mod adapter;
 mod host;
 mod types;
+mod workspace;
 
 pub use adapter::EngineAdapter;
 pub use fluxaxiom_contract::{ModelUsage, TokenCount};
@@ -16,3 +17,4 @@ pub use types::{
     EngineDescriptor, EngineObservation, EngineOutcome, EngineRunRequest, FailureReason,
     InputOutcome, InputRequest, ProposedEffect,
 };
+pub use workspace::{WorkspaceError, WorkspaceRoot};

@@ -27,8 +27,12 @@ fn identical_bytes_share_one_blob() {
 #[tokio::test]
 async fn sequence_is_contiguous_and_snapshot_lists_the_artifact() {
     let directory = tempfile::tempdir().unwrap();
-    let host = RunHost::open(directory.path()).unwrap();
-    let created = host.create_run(common::create_run("req_facts")).unwrap();
+    let path = directory.path();
+    let workspace = common::authorized_workspace(path);
+    let host = RunHost::open(path).unwrap();
+    let created = host
+        .create_run(common::create_run("req_facts", &workspace))
+        .unwrap();
     let input = host
         .read_blob(&BlobRef::new(created.run.input_ref.clone()))
         .unwrap();
@@ -69,8 +73,12 @@ async fn sequence_is_contiguous_and_snapshot_lists_the_artifact() {
 #[tokio::test]
 async fn invalid_observation_writes_no_tool_event() {
     let directory = tempfile::tempdir().unwrap();
-    let host = RunHost::open(directory.path()).unwrap();
-    let created = host.create_run(common::create_run("req_invalid")).unwrap();
+    let path = directory.path();
+    let workspace = common::authorized_workspace(path);
+    let host = RunHost::open(path).unwrap();
+    let created = host
+        .create_run(common::create_run("req_invalid", &workspace))
+        .unwrap();
     host.drive_run(&created.run.run_id, &InvalidEngine)
         .await
         .unwrap();
@@ -97,8 +105,12 @@ fn empty_media_type_is_invalid() {
 #[tokio::test]
 async fn blank_fields_and_mismatched_byte_count_are_invalid() {
     let directory = tempfile::tempdir().unwrap();
-    let host = RunHost::open(directory.path()).unwrap();
-    let created = host.create_run(common::create_run("req_fields")).unwrap();
+    let path = directory.path();
+    let workspace = common::authorized_workspace(path);
+    let host = RunHost::open(path).unwrap();
+    let created = host
+        .create_run(common::create_run("req_fields", &workspace))
+        .unwrap();
     host.drive_run(&created.run.run_id, &RejectingEngine)
         .await
         .unwrap();
@@ -116,9 +128,11 @@ async fn blank_fields_and_mismatched_byte_count_are_invalid() {
 #[tokio::test]
 async fn empty_artifact_type_fails_the_run() {
     let directory = tempfile::tempdir().unwrap();
-    let host = RunHost::open(directory.path()).unwrap();
+    let path = directory.path();
+    let workspace = common::authorized_workspace(path);
+    let host = RunHost::open(path).unwrap();
     let created = host
-        .create_run(common::create_run("req_empty_type"))
+        .create_run(common::create_run("req_empty_type", &workspace))
         .unwrap();
     let outcome = host
         .drive_run(&created.run.run_id, &EmptyTypeEngine)

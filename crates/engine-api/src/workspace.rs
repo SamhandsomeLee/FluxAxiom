@@ -2,8 +2,8 @@ use std::path::{Component, Path, PathBuf};
 
 /// 一次工具调用被允许进入的工作区根。
 ///
-/// **作用**：工具只接受这个类型，不接受模型直接给出的绝对路径。
-/// **边界**：只能由 `open` 从调用方已经选定的目录构造。构造时做规范化。本类型不解释 `workspace_ref`，那是 Host 下一刀的事。
+/// **作用**：Host 在 `prepare_drive` 时打开目录，经 `EngineRunRequest` 交给 Engine。工具只接受这个类型。
+/// **边界**：只能由 `open` 从调用方已经选定的目录构造。构造时做规范化。P0a 的 `workspace_ref` 存的就是这个目录路径，不另建标识登记表。
 #[derive(Clone, PartialEq, Eq)]
 pub struct WorkspaceRoot {
     root: PathBuf,

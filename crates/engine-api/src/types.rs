@@ -1,5 +1,7 @@
 use fluxaxiom_contract::{ModelUsage, RunId};
 
+use crate::workspace::WorkspaceRoot;
+
 /// Engine 身份。Host 用它写入 Attempt 的 `engine_id` / `engine_version`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineDescriptor {
@@ -8,11 +10,14 @@ pub struct EngineDescriptor {
 }
 
 /// Host 启动一次 Engine 执行时传入的任务。
-/// `run_id` 已由 Host 创建；`input` 是用户任务文本，不是 blob 引用。
+///
+/// **作用**：`EngineAdapter::run` 的入参。`run_id` 已由 Host 创建。
+/// **边界**：`input` 是用户任务文本，不是 blob 引用。`workspace` 是 Host 已经 `open` 过的授权根；Engine 不自己解析 `workspace_ref`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineRunRequest {
     pub run_id: RunId,
     pub input: String,
+    pub workspace: WorkspaceRoot,
 }
 
 /// Engine 交回的产物草稿。Host 负责落成 Artifact；Engine 不写存储。

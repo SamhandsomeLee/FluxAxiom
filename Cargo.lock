@@ -353,6 +353,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "fluxaxiom-contract",
+ "tempfile",
  "tokio",
  "tokio-util",
 ]
@@ -363,6 +364,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "fluxaxiom-contract",
+ "fluxaxiom-engine-api",
  "futures-util",
  "grep-regex",
  "grep-searcher",

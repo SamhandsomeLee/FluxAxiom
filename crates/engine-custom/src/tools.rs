@@ -7,7 +7,7 @@ use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, SearcherBuilder, Sink, SinkMatch};
 use ignore::WalkBuilder;
 
-use crate::workspace::{WorkspaceError, WorkspaceRoot};
+use fluxaxiom_engine_api::{WorkspaceError, WorkspaceRoot};
 
 /// `list_files` 单页条目数。暂定值，执行方案只要求有上限。
 pub const LIST_PAGE_LIMIT: usize = 100;
@@ -236,6 +236,13 @@ pub fn list_files(
 /// **作用**：模型用来看文件正文。行号从 `start_line` 起，写在每行前面。
 /// **参数**：`relative_file` 是相对授权根的文件。`start_line` 从 1 开始。
 /// **边界**：最多 `READ_LINE_LIMIT` 行，且纳入的文件字节不超过 `READ_BYTE_LIMIT`。单行超过上限时截断该行并标 `…`，续读从下一行开始，不会停在同一行。遍历看不到的路径、以及 `.git` 下的路径，返回 `Ignored`。文件任意位置有空字节则整次拒绝。
+///
+/// **大文件的成本（已知限制，P0a 接受，见执行方案 §4.7.4）**：
+/// - 每次调用都从文件开头顺序读。`start_line` 之前的行要读过去才能数行号；窗口结束后还要把剩余部分读完，只为确认没有空字节。所以一次调用的 I/O 与**整个文件大小**成正比，不是与返回的 32 KiB 成正比。
+/// - 模型翻页读一个 N 字节的文件，要读 `N × 页数` 字节。没有缓存，没有按字节偏移的游标，也没有文件大小上限，几百 MB 的日志文件会让每一页都很慢。
+/// - 内存是有界的：单行最多留 `READ_BYTE_LIMIT` 字节，超出的部分边读边丢，不会因为没有换行的大文件而撑爆内存。有界的只有内存，时间不是。
+/// - 之所以仍读完剩余部分：这是为了对二进制文件整次拒绝，使同一个文件在任意 `start_line` 下结论一致。如果以后改成只检查窗口，翻到后面才发现二进制就会出现「前几页能读、后几页被拒」。
+/// - 以后要优化时的方向：先在入口按 `metadata().len()` 设上限并返回明确错误；或让续读游标带字节偏移而不是行号，下一页直接 `seek`。两者都会改变 `next_start_line` 的含义，需要同步改渲染和方案。
 pub fn read_file(
     root: &WorkspaceRoot,
     relative_file: &str,
@@ -509,6 +516,7 @@ fn read_capped_line(
 ///
 /// **参数**：`reader` 停在还没交给模型的字节上。
 /// **边界**：发现空字节就返回真。不把这些字节留在内存里。
+/// **成本**：会把文件剩余部分整个读一遍，时间与剩余字节数成正比。这是 `read_file` 大文件变慢的主要来源之一，原因和替代方案写在 `read_file` 的注释里。不要在没有看那段说明的情况下把它改成只扫窗口。
 fn rest_has_nul(reader: &mut impl BufRead) -> Result<bool, ToolError> {
     loop {
         let available = reader.fill_buf().map_err(|_| ToolError::Io)?;

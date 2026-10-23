@@ -6,7 +6,7 @@ use fluxaxiom_contract::RunId;
 use fluxaxiom_engine_api::{
     ArtifactDraft, BlobRef, BudgetExhausted, BudgetLease, BudgetRequest, EffectOutcome,
     EngineAdapter, EngineDescriptor, EngineObservation, EngineOutcome, EngineRunRequest, HostPort,
-    HostPortError, InputOutcome, InputRequest, ProposedEffect,
+    HostPortError, InputOutcome, InputRequest, ProposedEffect, WorkspaceRoot,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -104,11 +104,14 @@ async fn engine_adapter_accepts_host_port_object() {
     let host: Arc<dyn HostPort> = Arc::new(StubHost {
         cancel: CancellationToken::new(),
     });
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = WorkspaceRoot::open(directory.path()).unwrap();
     let outcome = ImmediateEngine
         .run(
             EngineRunRequest {
                 run_id: RunId::generate(),
                 input: "analyze runtime".to_owned(),
+                workspace,
             },
             host,
         )

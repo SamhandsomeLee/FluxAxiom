@@ -12,7 +12,6 @@ mod http;
 mod retry;
 mod sse;
 mod tools;
-mod workspace;
 
 pub use chat::{
     observe_reasoning, replay_reasoning, usage_from_json, ChatCompletion, ChatError, ChatRequest,
@@ -21,6 +20,7 @@ pub use chat::{
 };
 pub use fake::{FakeChat, FakeStep, ScriptedTurn};
 pub use fluxaxiom_contract::{ModelUsage, TokenCount};
+pub use fluxaxiom_engine_api::{WorkspaceError, WorkspaceRoot};
 pub use http::{stream_request_body, DeepSeekClient, DEFAULT_BASE_URL};
 pub use retry::{
     execute, Backoff, ChatTransport, RecordingBackoff, Round, SleepBackoff, RETRY_DELAYS,
@@ -31,4 +31,3 @@ pub use tools::{
     list_files, read_file, search_code, ToolError, ToolOutput, LIST_PAGE_LIMIT, READ_BYTE_LIMIT,
     READ_LINE_LIMIT, SEARCH_MATCH_LIMIT,
 };
-pub use workspace::{WorkspaceError, WorkspaceRoot};
