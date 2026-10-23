@@ -5,8 +5,8 @@
 
 use fluxaxiom_contract::TokenCount;
 use fluxaxiom_engine_custom::{
-    parse_sse, stream_request_body, ChatError, DeepSeekClient, FinishReason, ObservedText,
-    API_KEY_ENV,
+    parse_sse, stream_request_body, CancellationToken, ChatError, DeepSeekClient, FinishReason,
+    ObservedText, API_KEY_ENV,
 };
 
 const COMPLETE_STREAM: &str = "\
@@ -128,10 +128,10 @@ fn empty_api_key_does_not_build_a_client() {
 
 /// 手动核对真实 API。默认 `cargo test` 不跑。
 ///
-/// **边界**：没有密钥时直接返回，不拨号。有密钥时才会访问 DeepSeek。
-#[test]
+/// **边界**：没有密钥时直接返回，不拨号。有密钥时才会访问 DeepSeek。取消令牌默认不触发，退避用真实睡眠。
+#[tokio::test]
 #[ignore = "dials api.deepseek.com when DEEPSEEK_API_KEY is set"]
-fn live_completion_when_key_present() {
+async fn live_completion_when_key_present() {
     if std::env::var(API_KEY_ENV)
         .ok()
         .filter(|key| !key.is_empty())
@@ -146,9 +146,11 @@ fn live_completion_when_key_present() {
             content: "Reply with the single word pong.".to_owned(),
         }],
     );
-    let mut backoff = fluxaxiom_engine_custom::RecordingBackoff::default();
-    let completion =
-        fluxaxiom_engine_custom::execute(&mut client, &request, &mut backoff).expect("live call");
+    let mut backoff = fluxaxiom_engine_custom::SleepBackoff;
+    let cancel = CancellationToken::new();
+    let completion = fluxaxiom_engine_custom::execute(&mut client, &request, &mut backoff, &cancel)
+        .await
+        .expect("live call");
     assert!(matches!(completion.content, ObservedText::Text(_)));
     assert!(
         matches!(completion.usage.prompt_tokens, TokenCount::Known(_)),

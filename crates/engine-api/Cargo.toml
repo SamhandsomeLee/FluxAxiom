@@ -8,7 +8,7 @@ publish = false
 async-trait = "0.1"
 bytes = "1"
 fluxaxiom-contract = { path = "../agent-contract" }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = "0.7"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

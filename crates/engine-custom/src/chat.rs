@@ -294,6 +294,8 @@ pub enum ChatError {
     },
     /// 流在完成前断开。没有可回传的 `reasoning_content`。
     StreamInterrupted,
+    /// 调用方触发了取消令牌。和 `StreamInterrupted` 分开，Host 据此走 `Cancelling → Cancelled`。同样没有可回传的片段。
+    Cancelled,
     InvalidToolArguments,
     /// 请求在离开本进程之前无法序列化。这不是 Provider 返回的 HTTP 状态。
     NotEncodable,
@@ -318,6 +320,7 @@ impl std::fmt::Display for ChatError {
                 write_status(formatter, "unavailable", *status, summary)
             }
             Self::StreamInterrupted => formatter.write_str("chat stream interrupted"),
+            Self::Cancelled => formatter.write_str("chat cancelled"),
             Self::InvalidToolArguments => formatter.write_str("tool call arguments are not json"),
             Self::NotEncodable => formatter.write_str("chat request could not be encoded"),
             Self::MissingCredential => formatter.write_str("deepseek api key is missing"),

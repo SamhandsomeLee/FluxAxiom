@@ -7,11 +7,17 @@ use std::time::Duration;
 
 use fluxaxiom_contract::{ModelUsage, TokenCount};
 use fluxaxiom_engine_custom::{
-    execute, observe_reasoning, replay_reasoning, usage_from_json, ChatError, ChatRequest,
-    ChatTransport, FakeChat, FakeStep, FinishReason, Message, ObservedText, RecordingBackoff,
-    Round, ScriptedTurn, ToolCall, ToolSpec, API_KEY_ENV, DEFAULT_MODEL, RETRY_DELAYS,
+    execute, observe_reasoning, replay_reasoning, usage_from_json, Backoff, CancellationToken,
+    ChatError, ChatRequest, ChatTransport, FakeChat, FakeStep, FinishReason, Message, ObservedText,
+    RecordingBackoff, Round, ScriptedTurn, SleepBackoff, ToolCall, ToolSpec, API_KEY_ENV,
+    DEFAULT_MODEL, RETRY_DELAYS,
 };
 use serde_json::json;
+
+/// 未触发的取消令牌。测试默认不取消。
+fn open_cancel() -> CancellationToken {
+    CancellationToken::new()
+}
 
 /// 一份固定用量。缓存命中保持未知，用来确认成功响应不会把未知写成 0。
 fn usage() -> ModelUsage {
@@ -63,11 +69,18 @@ fn request(messages: Vec<Message>) -> ChatRequest {
 /// 空的 `reasoning_content` 是合法请求，delta 要拼成完整文本。
 ///
 /// **边界**：不发生重试。响应的 Debug 输出里不出现密钥环境变量名。
-#[test]
-fn empty_reasoning_field_is_accepted_and_deltas_are_joined() {
+#[tokio::test]
+async fn empty_reasoning_field_is_accepted_and_deltas_are_joined() {
     let mut fake = FakeChat::script([turn(FinishReason::Stop)]);
     let mut backoff = RecordingBackoff::default();
-    let completion = execute(&mut fake, &request(vec![assistant("")]), &mut backoff).unwrap();
+    let completion = execute(
+        &mut fake,
+        &request(vec![assistant("")]),
+        &mut backoff,
+        &open_cancel(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         completion.reasoning,
         ObservedText::Text("think more".to_owned())
@@ -91,37 +104,48 @@ fn empty_reasoning_is_serialized_as_an_empty_string() {
 ///
 /// **边界**：类型化请求写不出这种报文，所以直接把 JSON 交给 `round`。不消耗后续脚本。
 /// 这只验证 Fake 的假设，不证明真实 DeepSeek。依据写在 ADR-020。
-#[test]
-fn raw_json_without_reasoning_and_with_tools_is_400() {
+#[tokio::test]
+async fn raw_json_without_reasoning_and_with_tools_is_400() {
     let mut fake = FakeChat::script([turn(FinishReason::Stop)]);
     let raw = json!({
         "model": DEFAULT_MODEL,
         "messages": [{ "role": "assistant", "content": "prior" }],
         "tools": [{ "name": "read_file", "parameters": {} }]
     });
+    let cancel = open_cancel();
     assert_eq!(
-        fake.round(&raw).unwrap(),
+        fake.round(&raw, &cancel).await.unwrap(),
         Round::Status {
             status: 400,
             summary: String::new(),
         }
     );
     let mut backoff = RecordingBackoff::default();
-    let completion = execute(&mut fake, &request(vec![assistant("")]), &mut backoff).unwrap();
+    let completion = execute(
+        &mut fake,
+        &request(vec![assistant("")]),
+        &mut backoff,
+        &cancel,
+    )
+    .await
+    .unwrap();
     assert_eq!(completion.finish_reason, FinishReason::Stop);
 }
 
 /// 不带 `tools` 时，省略思维链不拒绝。
 ///
 /// **边界**：官方文档说此时即使传入也会被忽略。Fake 消耗脚本并返回成功。
-#[test]
-fn raw_json_without_tools_may_omit_reasoning() {
+#[tokio::test]
+async fn raw_json_without_tools_may_omit_reasoning() {
     let mut fake = FakeChat::script([turn(FinishReason::Stop)]);
     let raw = json!({
         "model": DEFAULT_MODEL,
         "messages": [{ "role": "assistant", "content": "prior" }]
     });
-    assert!(matches!(fake.round(&raw).unwrap(), Round::Completed(_)));
+    assert!(matches!(
+        fake.round(&raw, &open_cancel()).await.unwrap(),
+        Round::Completed(_)
+    ));
 }
 
 /// 不带工具的请求不写出 `tools` 键。空列表也不写成 `[]`。
@@ -152,11 +176,18 @@ fn tools_key_is_omitted_unless_a_tool_is_declared() {
 /// 一次 429 之后重试，下一次成功。
 ///
 /// **边界**：只等待第一档 200ms。`finish_reason = length` 仍是成功响应。
-#[test]
-fn status_429_retries_then_succeeds() {
+#[tokio::test]
+async fn status_429_retries_then_succeeds() {
     let mut fake = FakeChat::script([FakeStep::Status(429), turn(FinishReason::Length)]);
     let mut backoff = RecordingBackoff::default();
-    let completion = execute(&mut fake, &request(vec![assistant("")]), &mut backoff).unwrap();
+    let completion = execute(
+        &mut fake,
+        &request(vec![assistant("")]),
+        &mut backoff,
+        &open_cancel(),
+    )
+    .await
+    .unwrap();
     assert_eq!(completion.finish_reason, FinishReason::Length);
     assert_eq!(backoff.waits, vec![RETRY_DELAYS[0]]);
 }
@@ -164,8 +195,8 @@ fn status_429_retries_then_succeeds() {
 /// 5xx 连续失败时最多重试 3 次。
 ///
 /// **边界**：第四次仍失败后返回 `Unavailable`。间隔是 200ms、400ms、800ms，测试不真正睡眠。
-#[test]
-fn status_503_stops_after_three_retries() {
+#[tokio::test]
+async fn status_503_stops_after_three_retries() {
     let mut fake = FakeChat::script([
         FakeStep::Status(503),
         FakeStep::Status(503),
@@ -173,7 +204,14 @@ fn status_503_stops_after_three_retries() {
         FakeStep::Status(503),
     ]);
     let mut backoff = RecordingBackoff::default();
-    let error = execute(&mut fake, &request(vec![assistant("kept")]), &mut backoff).unwrap_err();
+    let error = execute(
+        &mut fake,
+        &request(vec![assistant("kept")]),
+        &mut backoff,
+        &open_cancel(),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(
         error,
         ChatError::Unavailable {
@@ -194,11 +232,18 @@ fn status_503_stops_after_three_retries() {
 /// Provider 返回的 400 不进入退避。
 ///
 /// **边界**：脚本里后面的成功步不会被取走。
-#[test]
-fn status_400_from_provider_does_not_retry() {
+#[tokio::test]
+async fn status_400_from_provider_does_not_retry() {
     let mut fake = FakeChat::script([FakeStep::Status(400), turn(FinishReason::Stop)]);
     let mut backoff = RecordingBackoff::default();
-    let error = execute(&mut fake, &request(vec![assistant("")]), &mut backoff).unwrap_err();
+    let error = execute(
+        &mut fake,
+        &request(vec![assistant("")]),
+        &mut backoff,
+        &open_cancel(),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(
         error,
         ChatError::Rejected {
@@ -212,20 +257,152 @@ fn status_400_from_provider_does_not_retry() {
 /// 流中断视为这一次调用失败。
 ///
 /// **边界**：不重试，也不把中断当成 5xx。
-#[test]
-fn stream_interrupt_does_not_retry() {
+#[tokio::test]
+async fn stream_interrupt_does_not_retry() {
     let mut fake = FakeChat::script([FakeStep::Interrupt, turn(FinishReason::Stop)]);
     let mut backoff = RecordingBackoff::default();
-    let error = execute(&mut fake, &request(vec![assistant("")]), &mut backoff).unwrap_err();
+    let error = execute(
+        &mut fake,
+        &request(vec![assistant("")]),
+        &mut backoff,
+        &open_cancel(),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error, ChatError::StreamInterrupted);
     assert!(backoff.waits.is_empty());
+}
+
+/// 退避期间令牌被触发后，`execute` 不再进入下一次 `round`。
+///
+/// **边界**：429 之后 `wait` 先记下间隔再触发令牌并返回 `Ok`，所以停下的是 `execute` 自己的下一次 `round`，不是 `wait` 的错误传播。
+/// 返回 `Cancelled`，不是 `StreamInterrupted`。脚本里的成功步没被取走。
+#[tokio::test]
+async fn cancel_during_backoff_stops_before_the_next_round() {
+    let mut fake = FakeChat::script([FakeStep::Status(429), turn(FinishReason::Stop)]);
+    let cancel = open_cancel();
+    let mut backoff = CancelAfterWait { waits: Vec::new() };
+    let error = execute(
+        &mut fake,
+        &request(vec![assistant("")]),
+        &mut backoff,
+        &cancel,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, ChatError::Cancelled);
+    assert_eq!(backoff.waits, vec![RETRY_DELAYS[0]]);
+    let mut leftover = RecordingBackoff::default();
+    let completion = execute(
+        &mut fake,
+        &request(vec![assistant("")]),
+        &mut leftover,
+        &open_cancel(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(completion.finish_reason, FinishReason::Stop);
+}
+
+/// 记下间隔、触发令牌，然后照常返回 `Ok`，模拟取消恰好发生在等待结束的瞬间。
+struct CancelAfterWait {
+    waits: Vec<Duration>,
+}
+
+#[async_trait::async_trait]
+impl fluxaxiom_engine_custom::Backoff for CancelAfterWait {
+    /// **作用**：把间隔记入 `waits`，再取消传入的令牌，让 `execute` 靠下一次 `round` 发现取消。
+    /// **参数**：`delay` 记入 `waits`。`cancel` 是 `execute` 手里的同一个令牌。
+    /// **边界**：不睡眠，永远返回 `Ok`。
+    async fn wait(&mut self, delay: Duration, cancel: &CancellationToken) -> Result<(), ChatError> {
+        self.waits.push(delay);
+        cancel.cancel();
+        Ok(())
+    }
+}
+
+/// 令牌在 `round` 之前触发时，立刻返回 `Cancelled` 且不消耗脚本。
+///
+/// **边界**：不访问网络。后面的成功步仍在脚本里。
+#[tokio::test]
+async fn cancelled_round_does_not_consume_the_script() {
+    let mut fake = FakeChat::script([turn(FinishReason::Stop)]);
+    let cancel = open_cancel();
+    cancel.cancel();
+    let mut backoff = RecordingBackoff::default();
+    let error = execute(
+        &mut fake,
+        &request(vec![assistant("")]),
+        &mut backoff,
+        &cancel,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, ChatError::Cancelled);
+    assert!(backoff.waits.is_empty());
+    let open = open_cancel();
+    let completion = execute(
+        &mut fake,
+        &request(vec![assistant("")]),
+        &mut backoff,
+        &open,
+    )
+    .await
+    .unwrap();
+    assert_eq!(completion.finish_reason, FinishReason::Stop);
+}
+
+/// `RecordingBackoff` 在令牌已触发时不记录间隔。
+///
+/// **边界**：返回 `Cancelled`，`waits` 保持为空。
+#[tokio::test]
+async fn recording_backoff_refuses_a_cancelled_token() {
+    let cancel = open_cancel();
+    cancel.cancel();
+    let mut backoff = RecordingBackoff::default();
+    let result = backoff.wait(RETRY_DELAYS[0], &cancel).await;
+    assert_eq!(result, Err(ChatError::Cancelled));
+    assert!(backoff.waits.is_empty());
+}
+
+/// `SleepBackoff` 睡满后返回 `Ok`，令牌触发时提前返回 `Cancelled`。
+///
+/// **边界**：睡眠用 1ms 的真实计时器。取消分支用 1 小时的间隔，如果没有提前返回，测试会超时。
+#[tokio::test]
+async fn sleep_backoff_waits_and_is_interruptible() {
+    let mut backoff = SleepBackoff;
+    assert_eq!(
+        backoff.wait(Duration::from_millis(1), &open_cancel()).await,
+        Ok(())
+    );
+    let cancel = open_cancel();
+    let trigger = cancel.clone();
+    tokio::spawn(async move { trigger.cancel() });
+    assert_eq!(
+        backoff.wait(Duration::from_secs(3600), &cancel).await,
+        Err(ChatError::Cancelled)
+    );
+}
+
+/// `execute` 的 future 必须是 `Send`，否则放不进 `EngineAdapter::run`。
+///
+/// **边界**：只在编译期检查，不运行。`ChatTransport` 与 `Backoff` 少了 `Send` 约束时这里编译失败。
+#[test]
+fn execute_future_is_send() {
+    fn assert_send<T: Send>(_: &T) {}
+    let mut fake = FakeChat::script([]);
+    let mut backoff = RecordingBackoff::default();
+    let request = request(vec![assistant("")]);
+    let cancel = open_cancel();
+    let future = execute(&mut fake, &request, &mut backoff, &cancel);
+    assert_send(&future);
 }
 
 /// 工具参数不是 JSON 时立即失败。
 ///
 /// **边界**：不重试。`arguments` 使用 `"{"`，它不是完整 JSON。
-#[test]
-fn invalid_tool_arguments_do_not_retry() {
+#[tokio::test]
+async fn invalid_tool_arguments_do_not_retry() {
     let mut fake = FakeChat::script([FakeStep::Turn(ScriptedTurn {
         reasoning_deltas: vec![String::new()],
         content_deltas: vec![String::new()],
@@ -238,7 +415,14 @@ fn invalid_tool_arguments_do_not_retry() {
         usage: usage(),
     })]);
     let mut backoff = RecordingBackoff::default();
-    let error = execute(&mut fake, &request(vec![assistant("")]), &mut backoff).unwrap_err();
+    let error = execute(
+        &mut fake,
+        &request(vec![assistant("")]),
+        &mut backoff,
+        &open_cancel(),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error, ChatError::InvalidToolArguments);
     assert!(backoff.waits.is_empty());
 }

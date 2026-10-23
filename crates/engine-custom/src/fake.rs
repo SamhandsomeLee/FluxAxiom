@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
 
+use async_trait::async_trait;
 use fluxaxiom_contract::ModelUsage;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::chat::{ChatCompletion, ChatError, FinishReason, ObservedText, ToolCall};
 use crate::retry::{ChatTransport, Round};
@@ -42,8 +44,8 @@ pub struct FakeChat {
 impl FakeChat {
     /// 按给定顺序构造 Fake。
     ///
-    /// **作用**：每个 `round` 取走一步，除非请求本身就会 400。
-    /// **参数**：`steps` 按调用顺序消耗。请求因缺少 `reasoning_content` 被拒绝时不消耗。
+    /// **作用**：每个 `round` 取走一步，除非请求本身就会 400，或取消令牌已触发。
+    /// **参数**：`steps` 按调用顺序消耗。请求因缺少 `reasoning_content` 被拒绝时不消耗。取消时也不消耗。
     /// **边界**：空脚本在第一次真正取步时 panic。
     #[must_use]
     pub fn script(steps: impl IntoIterator<Item = FakeStep>) -> Self {
@@ -53,11 +55,19 @@ impl FakeChat {
     }
 }
 
+#[async_trait]
 impl ChatTransport for FakeChat {
     /// **作用**：按脚本交回下一步，供重试测试使用。
-    /// **参数**：`request_json` 用来判断带 `tools` 的请求是否漏了 `reasoning_content`。
-    /// **边界**：这种 400 不消耗脚本，也不访问网络。空脚本在真正取步时 panic。
-    fn round(&mut self, request_json: &Value) -> Result<Round, ChatError> {
+    /// **参数**：`request_json` 用来判断带 `tools` 的请求是否漏了 `reasoning_content`。`cancel` 已触发时返回 `Cancelled`。
+    /// **边界**：400 与取消都不消耗脚本，也不访问网络。空脚本在真正取步时 panic。
+    async fn round(
+        &mut self,
+        request_json: &Value,
+        cancel: &CancellationToken,
+    ) -> Result<Round, ChatError> {
+        if cancel.is_cancelled() {
+            return Ok(Round::Cancelled);
+        }
         if request_rejected(request_json) {
             return Ok(Round::Status {
                 status: 400,
