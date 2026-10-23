@@ -12,7 +12,7 @@
 
 1. P0a 的 `workspace_ref` 存调用方给出的目录路径。不另建标识到路径的登记表。
 2. `WorkspaceRoot` 放在 `engine-api`。`run-host` 与 `engine-custom` 都依赖它，互不依赖。
-3. Host 在 `prepare_drive` 里用 `WorkspaceRoot::open(workspace_ref)` 打开目录，再放入 `EngineRunRequest`。打开失败时不进入 `Running`，与任务 blob 缺失同一类处理。
+3. Host 在 `create_run` 里用 `WorkspaceRoot::open` 打开调用方给的目录，把**规范化后的绝对路径**存进 `workspace_ref`；目录打不开时不建 Run。`prepare_drive` 再打开一次存下的路径放入 `EngineRunRequest`，并要求重新规范化的结果与库存一致。打开失败或不一致时不进入 `Running`，与任务 blob 缺失同一类处理。
 4. Engine 不读库，不自己解析 `workspace_ref`。模型路径仍只经 `WorkspaceRoot::resolve`。
 
 ## 后果
@@ -49,8 +49,8 @@
 
 ### 已知缺口
 
-1. **路径在创建时没有规范化。** `create_run` 原样存下字符串，`prepare_drive` 才调用 `WorkspaceRoot::open`。传相对路径时，它按**驱动那一刻的进程当前目录**解析。如果创建 Run 和驱动 Run 不在同一个目录，打开的会是另一个目录，授权发生在创建时，读取却对着别的目录。A3 之前要么让 `create_run` 就 `open` 一次并存规范化后的绝对路径，要么让 CLI 保证只传绝对路径。
-2. **打不开时 Run 停在 `Accepted`。** 工作区目录打不开会让 `prepare_drive` 失败，Run 没有终态也没有事件。同一个 `request_id` 重新提交会返回旧 Run，连同旧的错误路径，所以用修正后的路径重试也无效。这一条已写入执行方案 §4.7.4，A3 开始前必须决定处理方式。
+1. **（已修复）路径在创建时没有规范化。** 原先 `create_run` 原样存字符串，相对路径会按驱动时的当前目录解析，授权和读取可能对着不同目录。现在 `create_run` 就规范化并存绝对路径，`prepare_drive` 还要核对重新规范化的结果没变（路径中间被换成符号链接会被拒绝）。测试：`relative_workspace_is_stored_as_an_absolute_path`、`workspace_swapped_for_a_symlink_is_rejected_at_drive`。
+2. **创建之后目录消失或被替换时，Run 停在 `Accepted`。** 创建时打不开的目录已经在 `create_run` 被拒绝，不再建 Run，所以用修正后的路径重试同一个 `request_id` 是可行的。但 Run 建好之后目录被删除或换掉，`prepare_drive` 仍会失败，Run 没有终态也没有事件，重试同一个 `request_id` 只会拿回这个旧 Run。这一条已写入执行方案 §4.7.4，A3 开始前必须决定处理方式。
 3. **驱动时才打开，打开后到读取之间仍有窗口。** 规范化只在 `open` 与每次 `resolve` 时做一次，随后 `File::open` 用的是路径而不是句柄。符号链接在这个窗口里被替换，不会被发现。执行方案已把路径 TOCTOU 归入 B6，P0a 不处理。
 
 ## 复审触发器（追加）

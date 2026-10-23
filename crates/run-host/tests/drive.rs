@@ -142,15 +142,20 @@ async fn duplicate_request_id_after_drive_keeps_terminal_run() {
     assert_eq!(again.attempt.status, AttemptStatus::Ended);
 }
 
-/// 工作区目录打不开时不进入 Running，Engine 不会被调用。
+/// 创建之后目录被删掉，驱动时不进入 Running，Engine 不会被调用。
+///
+/// **边界**：Run 停在 `Accepted`，没有 `run.started`。这条路径是有意保留的缺口，见执行方案 §4.7.4；测试固定的是当前行为，A3 决定终态后要改这条断言。
 #[tokio::test]
-async fn missing_workspace_leaves_run_accepted() {
+async fn workspace_removed_after_create_leaves_run_accepted() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path();
+    let workspace = path.join("vanishing");
+    std::fs::create_dir(&workspace).unwrap();
     let host = RunHost::open(path).unwrap();
-    let mut request = common::create_run("req_missing_ws", path);
-    request.workspace_ref = path.join("does-not-exist").to_string_lossy().into_owned();
-    let created = host.create_run(request).unwrap();
+    let created = host
+        .create_run(common::create_run("req_missing_ws", &workspace))
+        .unwrap();
+    std::fs::remove_dir(&workspace).unwrap();
     let error = host
         .drive_run(&created.run.run_id, &FakeEngine)
         .await
@@ -167,4 +172,87 @@ async fn missing_workspace_leaves_run_accepted() {
     assert!(events
         .iter()
         .all(|event| !matches!(event.body, fluxaxiom_contract::EventBody::RunStarted(_))));
+}
+
+/// 创建时工作区不存在，就不建 Run。
+///
+/// **边界**：返回 `Invalid`；按 `request_id` 查不到任何记录，也就不会有重试时拿回旧 Run 的问题。
+#[test]
+fn create_run_rejects_a_missing_workspace() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let host = RunHost::open(path).unwrap();
+    let missing = path.join("does-not-exist");
+    let error = host
+        .create_run(common::create_run("req_no_ws", &missing))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        fluxaxiom_run_host::HostError::Invalid("workspace root is unavailable")
+    ));
+    assert!(matches!(
+        host.get_by_request_id("req_no_ws"),
+        Err(fluxaxiom_run_host::HostError::NotFound)
+    ));
+    let corrected = common::authorized_workspace(path);
+    let created = host
+        .create_run(common::create_run("req_no_ws", &corrected))
+        .unwrap();
+    assert_eq!(created.run.status, RunStatus::Accepted);
+}
+
+/// 相对路径在创建时就变成绝对路径存下来。
+///
+/// **边界**：用 `.` 当输入，不改进程当前目录（它是全进程共享的）。存下的值必须是绝对路径，并等于当前目录的规范化结果。
+#[test]
+fn relative_workspace_is_stored_as_an_absolute_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let host = RunHost::open(directory.path()).unwrap();
+    let created = host
+        .create_run(common::create_run(
+            "req_relative",
+            std::path::Path::new("."),
+        ))
+        .unwrap();
+    let stored = std::path::PathBuf::from(&created.run.workspace_ref);
+    assert!(stored.is_absolute());
+    assert_eq!(stored, std::fs::canonicalize(".").unwrap());
+}
+
+/// 创建之后路径被换成指向别处的符号链接，驱动时必须拒绝。
+///
+/// **边界**：不进入 Running。当前进程建不了符号链接时打印原因并跳过，不当作通过。
+#[tokio::test]
+async fn workspace_swapped_for_a_symlink_is_rejected_at_drive() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let workspace = path.join("swappable");
+    let elsewhere = path.join("elsewhere");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(&elsewhere).unwrap();
+    let host = RunHost::open(path).unwrap();
+    let created = host
+        .create_run(common::create_run("req_swap", &workspace))
+        .unwrap();
+    std::fs::remove_dir(&workspace).unwrap();
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_dir(&elsewhere, &workspace).is_ok();
+    #[cfg(not(windows))]
+    let linked = std::os::unix::fs::symlink(&elsewhere, &workspace).is_ok();
+    if !linked {
+        eprintln!("skipped: this process cannot create directory symlinks");
+        return;
+    }
+    let error = host
+        .drive_run(&created.run.run_id, &FakeEngine)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        fluxaxiom_run_host::HostError::Invalid("workspace root changed since creation")
+    ));
+    assert_eq!(
+        host.get_run(&created.run.run_id).unwrap().status,
+        RunStatus::Accepted
+    );
 }

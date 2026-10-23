@@ -42,7 +42,8 @@ pub struct CreateRun {
     pub session_id: Option<SessionId>,
     /// 调用方传入的任务文本。Host 先把它写成 blob，库存的 `Run.input_ref` 是 `sha256:` 引用。
     pub input_ref: String,
-    /// 授权工作区目录路径。创建时只要求非空；`prepare_drive` 再 `WorkspaceRoot::open`。
+    /// 授权工作区目录路径，可以是相对路径。`create_run` 会 `WorkspaceRoot::open` 它并把**规范化后的绝对路径**存进 `Run.workspace_ref`，所以这里的相对路径只按创建时的进程当前目录解析一次。
+    /// 目录不存在、不是目录或路径不是 UTF-8 时 `create_run` 返回 `Invalid`，不建 Run。
     pub workspace_ref: String,
     /// 写入 Run.budget。A1.1 不按它扣减；端口上的 `reserve` 直接视为耗尽。
     pub budget: Budget,
@@ -104,7 +105,8 @@ impl RunHost {
     /// 创建 Accepted 的 Run、Starting 的 Attempt，并写入 `run.accepted`。
     ///
     /// **作用**：同一 `BEGIN IMMEDIATE` 事务提交状态行和 event。任务文本先落成 blob。
-    /// **边界**：blob 的 fsync 发生在连接锁之外。租约此刻写入，但不续期、不扫描过期。重复 `request_id` 返回已有 Run。
+    /// **边界**：blob 的 fsync 发生在连接锁之外。租约此刻写入，但不续期、不扫描过期。重复 `request_id` 返回已有 Run，此时不重新检查工作区，也不采用这次传入的 `workspace_ref`。
+    /// 工作区在这里就被打开并规范化：授权发生在创建时，库存的路径是绝对路径，`prepare_drive` 不会因为驱动进程的当前目录不同而打开另一个目录。目录打不开时不建 Run，也不写 blob。
     pub fn create_run(&self, mut request: CreateRun) -> Result<CreatedRun, HostError> {
         validate_create(&request)?;
         {
@@ -116,6 +118,7 @@ impl RunHost {
                 store::load_session(&connection, session_id)?;
             }
         }
+        request.workspace_ref = canonical_workspace_ref(&request.workspace_ref)?;
         let text = std::mem::take(&mut request.input_ref);
         let stored = blob::put(&self.shared.root, text.as_bytes(), "text/plain")?;
         request.input_ref = stored.as_str().to_owned();
@@ -257,10 +260,11 @@ impl RunHost {
     /// **边界**：任务原文与工作区打开都在写锁外完成。能否从 `Accepted` 进入 `Running` 在 `IMMEDIATE` 事务内判断，避免两个进程同时启动。任务 blob 缺失、不是 UTF-8、或工作区目录打不开时不改状态。测试可在 COMMIT 前中止。
     ///
     /// **失败后 Run 停在 `Accepted`（有意保留的缺口，不是遗漏）**：
+    /// - 工作区在 `create_run` 已经校验并规范化过，所以现在这条路径剩下的是创建**之后**目录被删除、被替换成指向别处的符号链接等情况，不再包含「相对路径按另一个当前目录解析」。
     /// - 上面三种失败发生在事务开始之前，所以既不写 `run.failed`，也不改 Run 或 Attempt 状态。这是 A1.1 为了「失败不留半截状态」选的最保守做法，`missing_workspace_leaves_run_accepted` 测试固定了它。
     /// - 代价：这个 Run 不再是 `Running` / `Cancelling`，执行方案 §4.8 的启动扫描只处理这两种状态且租约已过期的 Attempt，所以它不会被标成 `Orphaned`，也不会变成 `Failed(host_restart)`。没有任何现有路径会收尾它。
     /// - 对用户可见的后果：`status` 永远是 `Accepted`，`events` 里没有任何事件解释原因。同一个 `request_id` 重新提交会按幂等返回这个旧 Run，而不是新建，用户无法靠重试摆脱。
-    /// - A3 必须在这三种里选一个并写进 ADR：(1) 失败时同一事务写 `run.failed` 并终态化；(2) 保持 `Accepted` 但提供显式的放弃或重试命令；(3) CLI 在 `create_run` 之前就校验工作区，使这条路径只剩真正的竞态。不能默认留着。
+    /// - A3 必须在这两种里选一个并写进 ADR：(1) 失败时同一事务写 `run.failed` 并终态化；(2) 保持 `Accepted` 但提供显式的放弃或重试命令。原先的第三种（创建前校验）已由 `create_run` 完成，它缩小了这条路径但不能消除它。不能默认留着。
     fn prepare_drive(&self, run_id: &RunId) -> Result<EngineRunRequest, HostError> {
         let (input_ref, workspace_ref) = {
             let connection = self.lock()?;
@@ -271,6 +275,10 @@ impl RunHost {
         // 失败时直接返回，Run 保持 `Accepted`。原因与后果见上面的函数注释。
         let workspace = WorkspaceRoot::open(&workspace_ref)
             .map_err(|_| HostError::Invalid("workspace root is unavailable"))?;
+        // 库存的是创建时规范化的路径。重新规范化后不同，说明路径中间被换成了符号链接或挂载点，授权的不再是这个目录。
+        if workspace.as_path().to_str() != Some(workspace_ref.as_str()) {
+            return Err(HostError::Invalid("workspace root changed since creation"));
+        }
         let fail = self.take_fail_prepare();
         let mut connection = self.lock()?;
         let transaction = store::immediate(&mut connection)?;
@@ -510,6 +518,20 @@ fn validate_create(request: &CreateRun) -> Result<(), HostError> {
         return Err(HostError::Invalid("engine identity must not be empty"));
     }
     Ok(())
+}
+
+/// 把调用方给的工作区路径收成库存用的规范化绝对路径。
+///
+/// **作用**：`create_run` 在写任何东西之前调用，让授权在创建时一次确定。
+/// **参数**：`raw` 是调用方给的目录，可以是相对路径，按当前进程的当前目录解析这一次。
+/// **边界**：目录不存在、不是目录、无法规范化返回 `Invalid("workspace root is unavailable")`。规范化结果不是 UTF-8 返回 `Invalid("workspace path is not utf-8")`，因为库存是字符串，用有损转换会让后面的相等比较失效。
+fn canonical_workspace_ref(raw: &str) -> Result<String, HostError> {
+    let root = WorkspaceRoot::open(raw)
+        .map_err(|_| HostError::Invalid("workspace root is unavailable"))?;
+    root.as_path()
+        .to_str()
+        .map(str::to_owned)
+        .ok_or(HostError::Invalid("workspace path is not utf-8"))
 }
 
 fn build_created(request: CreateRun) -> Result<PreparedCreate, HostError> {
