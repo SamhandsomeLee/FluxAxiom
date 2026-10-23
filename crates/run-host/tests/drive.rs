@@ -55,7 +55,7 @@ impl EngineAdapter for FakeEngine {
             };
         }
         // 令牌存在即可。A1.1 没有 Ctrl-C，不会被 cancel。
-        // 不调用 `reserve`：本阶段不记账，调用即视为耗尽。
+        // 本 Fake 不调用 `reserve`；记账验收见 `budget.rs`。
         let _cancel = host.cancellation();
         assert!(request.workspace.as_path().is_dir());
         EngineOutcome::Completed {

@@ -45,7 +45,7 @@ pub struct CreateRun {
     /// 授权工作区目录路径，可以是相对路径。`create_run` 会 `WorkspaceRoot::open` 它并把**规范化后的绝对路径**存进 `Run.workspace_ref`，所以这里的相对路径只按创建时的进程当前目录解析一次。
     /// 目录不存在、不是目录或路径不是 UTF-8 时 `create_run` 返回 `Invalid`，不建 Run。
     pub workspace_ref: String,
-    /// 写入 Run.budget。A1.1 不按它扣减；端口上的 `reserve` 直接视为耗尽。
+    /// 写入 Run.budget。`prepare_drive` 把它拷进本次 `DrivePort` 的内存计数上限；已用量不入库。
     pub budget: Budget,
     /// 写入 Attempt 的 `engine_id` / `engine_version`。
     pub engine: EngineDescriptor,
@@ -247,10 +247,13 @@ impl RunHost {
         run_id: &RunId,
         engine: &dyn EngineAdapter,
     ) -> Result<EngineOutcome, HostError> {
-        let request = self.prepare_drive(run_id)?;
-        let host: Arc<dyn HostPort> =
-            Arc::new(DrivePort::new(Arc::clone(&self.shared), run_id.clone()));
-        let outcome = engine.run(request, host).await;
+        let prepared = self.prepare_drive(run_id)?;
+        let host: Arc<dyn HostPort> = Arc::new(DrivePort::new(
+            Arc::clone(&self.shared),
+            run_id.clone(),
+            prepared.budget,
+        ));
+        let outcome = engine.run(prepared.request, host).await;
         self.finish_drive(run_id, outcome)
     }
 
@@ -265,7 +268,7 @@ impl RunHost {
     /// - 代价：这个 Run 不再是 `Running` / `Cancelling`，执行方案 §4.8 的启动扫描只处理这两种状态且租约已过期的 Attempt，所以它不会被标成 `Orphaned`，也不会变成 `Failed(host_restart)`。没有任何现有路径会收尾它。
     /// - 对用户可见的后果：`status` 永远是 `Accepted`，`events` 里没有任何事件解释原因。同一个 `request_id` 重新提交会按幂等返回这个旧 Run，而不是新建，用户无法靠重试摆脱。
     /// - A3 必须在这两种里选一个并写进 ADR：(1) 失败时同一事务写 `run.failed` 并终态化；(2) 保持 `Accepted` 但提供显式的放弃或重试命令。原先的第三种（创建前校验）已由 `create_run` 完成，它缩小了这条路径但不能消除它。不能默认留着。
-    fn prepare_drive(&self, run_id: &RunId) -> Result<EngineRunRequest, HostError> {
+    fn prepare_drive(&self, run_id: &RunId) -> Result<PreparedDrive, HostError> {
         let (input_ref, workspace_ref) = {
             let connection = self.lock()?;
             let run = store::load_run(&connection, run_id)?;
@@ -313,11 +316,15 @@ impl RunHost {
                 attempt.lease_expires_at.clone(),
             ),
         )?;
+        let budget = run.budget;
         commit_tx(transaction, fail)?;
-        Ok(EngineRunRequest {
-            run_id: run.run_id,
-            input,
-            workspace,
+        Ok(PreparedDrive {
+            request: EngineRunRequest {
+                run_id: run.run_id,
+                input,
+                workspace,
+            },
+            budget,
         })
     }
 
@@ -441,6 +448,15 @@ fn read_task_text(root: &Path, input_ref: &str) -> Result<String, HostError> {
         other => other,
     })?;
     String::from_utf8(bytes).map_err(|_| HostError::Corrupt("input blob"))
+}
+
+/// `prepare_drive` 交给 `drive_run` 的任务与预算上限。
+///
+/// **作用**：一次打开工作区并进入 `Running` 后，把 `EngineRunRequest` 与本次 drive 的预算上限一起交出。
+/// **边界**：`budget` 只用于构造 `DrivePort` 的内存计数器，不表示已用量。
+struct PreparedDrive {
+    request: EngineRunRequest,
+    budget: Budget,
 }
 
 /// 空的产物类型不能收成成功。
@@ -651,6 +667,11 @@ impl RunHost {
     fn fail_next_finish_commit(&self) {
         self.shared.fail_finish.store(true, Ordering::SeqCst);
     }
+
+    /// 测试用：在不经过 `prepare_drive` 时构造端口，用来验证非 `Running` 的 `reserve`。
+    pub(crate) fn drive_port_for_test(&self, run_id: &RunId, budget: Budget) -> DrivePort {
+        DrivePort::new(Arc::clone(&self.shared), run_id.clone(), budget)
+    }
 }
 
 #[cfg(test)]
@@ -658,7 +679,8 @@ mod tests {
     use async_trait::async_trait;
     use fluxaxiom_contract::{EventBody, RunStatus};
     use fluxaxiom_engine_api::{
-        EngineAdapter, EngineDescriptor, EngineOutcome, EngineRunRequest, HostPort,
+        BudgetExhausted, BudgetRequest, EngineAdapter, EngineDescriptor, EngineOutcome,
+        EngineRunRequest, HostPort,
     };
     use std::sync::Arc;
 
@@ -719,6 +741,64 @@ mod tests {
         assert!(events
             .iter()
             .all(|event| !matches!(event.body, EventBody::RunCompleted(_))));
+    }
+
+    /// Accepted 的 Run 上 `reserve` 返回 `BudgetExhausted`，不发 lease。
+    ///
+    /// **边界**：包括 `{0,0}`。错误类型不区分「没额度」和「未在 Running」。
+    #[test]
+    fn reserve_before_running_is_exhausted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        let host = RunHost::open(path).unwrap();
+        let created = host
+            .create_run(sample_request("req_reserve_early", path))
+            .unwrap();
+        let port = host.drive_port_for_test(&created.run.run_id, created.run.budget);
+        assert_eq!(
+            port.reserve(BudgetRequest {
+                model_calls: 0,
+                tool_calls: 0,
+            }),
+            Err(BudgetExhausted)
+        );
+        assert_eq!(
+            port.reserve(BudgetRequest {
+                model_calls: 1,
+                tool_calls: 0,
+            }),
+            Err(BudgetExhausted)
+        );
+        assert_eq!(
+            host.get_run(&created.run.run_id).unwrap().status,
+            RunStatus::Accepted
+        );
+    }
+
+    /// Completed 之后再拿端口 `reserve`，同样是 `BudgetExhausted`。
+    #[tokio::test]
+    async fn reserve_after_completed_is_exhausted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        let host = RunHost::open(path).unwrap();
+        let created = host
+            .create_run(sample_request("req_reserve_done", path))
+            .unwrap();
+        host.drive_run(&created.run.run_id, &CompleteEngine)
+            .await
+            .unwrap();
+        let port = host.drive_port_for_test(&created.run.run_id, created.run.budget);
+        assert_eq!(
+            port.reserve(BudgetRequest {
+                model_calls: 1,
+                tool_calls: 0,
+            }),
+            Err(BudgetExhausted)
+        );
+        assert_eq!(
+            host.get_run(&created.run.run_id).unwrap().status,
+            RunStatus::Completed
+        );
     }
 
     /// Accepted 的 Run 还不能接收观测。

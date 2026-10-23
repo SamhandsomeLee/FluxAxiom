@@ -56,7 +56,11 @@ pub trait HostPort: Send + Sync {
     /// 目录还没落地的实现返回 `Unsupported`。blob 不在 SQLite 事务里。
     fn put_blob(&self, bytes: Bytes, media_type: &str) -> Result<BlobRef, HostPortError>;
 
-    /// 在调用模型或工具前预留额度。耗尽时返回 `BudgetExhausted`，Engine 应收尾并交回部分结果。
+    /// 在调用模型或工具前预留额度。
+    ///
+    /// **作用**：成功时返回与请求字段相等的 `BudgetLease`。`{0, 0}` 允许且不改计数。
+    /// **边界**：`BudgetExhausted` 表示额度不够，或 Run / Attempt 已不在 `Running`、不再发 lease。
+    /// Engine 对这两种情况都收尾并交回部分结果。Host 不做部分批准。
     fn reserve(&self, request: BudgetRequest) -> Result<BudgetLease, BudgetExhausted>;
 
     /// 本次 Run 的取消令牌。Engine 在下一个 await 点检查；Ctrl-C 由 Host 触发。
