@@ -150,7 +150,7 @@ async fn raw_json_without_tools_may_omit_reasoning() {
 
 /// 不带工具的请求不写出 `tools` 键。空列表也不写成 `[]`。
 ///
-/// **边界**：默认思考强度是 `high`。这条测试不调用传输层。
+/// **边界**：默认思考强度是 `high`。`new` 默认带 `max_tokens: 32768`。这条测试不调用传输层。
 #[test]
 fn tools_key_is_omitted_unless_a_tool_is_declared() {
     let bare = request(vec![Message::User {
@@ -159,6 +159,7 @@ fn tools_key_is_omitted_unless_a_tool_is_declared() {
     let bare_text = serde_json::to_string(&bare).unwrap();
     assert!(!bare_text.contains("\"tools\""));
     assert!(bare_text.contains("\"reasoning_effort\":\"high\""));
+    assert!(bare_text.contains("\"max_tokens\":32768"));
     let still_bare = bare.with_tools(Vec::new());
     assert!(!serde_json::to_string(&still_bare)
         .unwrap()
@@ -171,6 +172,119 @@ fn tools_key_is_omitted_unless_a_tool_is_declared() {
     assert!(serde_json::to_string(&with_tool)
         .unwrap()
         .contains("\"tools\""));
+}
+
+/// 请求体的完整序列化形状。
+///
+/// **作用**：这是发给 DeepSeek 的协议对象，按 `review-sweep.mdc` 断言完整 `serde_json::to_value`，不只看单个字段。
+/// **边界**：覆盖四种形状：默认（带 `max_tokens: 32768`，没有 `tools`）、带工具和历史工具调用、`without_max_tokens` 省略该键、自定义上限。不调用传输层。
+#[test]
+fn request_wire_format_is_complete() {
+    let user = || Message::User {
+        content: "analyze".to_owned(),
+    };
+
+    assert_eq!(
+        serde_json::to_value(request(vec![user()])).unwrap(),
+        json!({
+            "model": "deepseek-flash",
+            "reasoning_effort": "high",
+            "messages": [{"role": "user", "content": "analyze"}],
+            "max_tokens": 32768
+        })
+    );
+
+    let with_tools = request(vec![
+        user(),
+        Message::Assistant {
+            content: String::new(),
+            reasoning_content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            }],
+        },
+        Message::Tool {
+            content: "file body".to_owned(),
+            tool_call_id: "call_1".to_owned(),
+        },
+    ])
+    .with_tools(vec![ToolSpec {
+        name: "read_file".to_owned(),
+        description: "Read a file".to_owned(),
+        parameters: json!({"type": "object", "properties": {}}),
+    }]);
+    assert_eq!(
+        serde_json::to_value(&with_tools).unwrap(),
+        json!({
+            "model": "deepseek-flash",
+            "reasoning_effort": "high",
+            "messages": [
+                {"role": "user", "content": "analyze"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "content": "file body", "tool_call_id": "call_1"}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }],
+            "max_tokens": 32768
+        })
+    );
+
+    assert_eq!(
+        serde_json::to_value(request(vec![user()]).without_max_tokens()).unwrap(),
+        json!({
+            "model": "deepseek-flash",
+            "reasoning_effort": "high",
+            "messages": [{"role": "user", "content": "analyze"}]
+        })
+    );
+
+    assert_eq!(
+        serde_json::to_value(request(vec![user()]).with_max_tokens(1).unwrap()).unwrap(),
+        json!({
+            "model": "deepseek-flash",
+            "reasoning_effort": "high",
+            "messages": [{"role": "user", "content": "analyze"}],
+            "max_tokens": 1
+        })
+    );
+}
+
+/// `with_max_tokens` 只接受官方文档给出的 1 到 393216。
+///
+/// **边界**：越界是本地的 `NotEncodable`，请求不会发出；边界值本身合法。
+#[test]
+fn max_tokens_bounds_are_enforced_locally() {
+    let base = || request(vec![assistant("")]);
+    assert_eq!(
+        base().with_max_tokens(0).unwrap_err(),
+        ChatError::NotEncodable
+    );
+    assert_eq!(
+        base()
+            .with_max_tokens(fluxaxiom_engine_custom::MAX_TOKENS_LIMIT + 1)
+            .unwrap_err(),
+        ChatError::NotEncodable
+    );
+    assert!(base()
+        .with_max_tokens(fluxaxiom_engine_custom::MAX_TOKENS_LIMIT)
+        .is_ok());
 }
 
 /// 一次 429 之后重试，下一次成功。
@@ -425,6 +539,36 @@ async fn invalid_tool_arguments_do_not_retry() {
     .unwrap_err();
     assert_eq!(error, ChatError::InvalidToolArguments);
     assert!(backoff.waits.is_empty());
+}
+
+/// 输出触顶的响应不检查工具调用，也不交出工具调用。
+///
+/// **边界**：脚本里带一个 `arguments` 为 `"{"` 的调用，但结束原因是 `Length`。Fake 与 `parse_sse` 一致：仍是 `Completed`，`tool_calls` 为空，不是 `InvalidToolArguments`。
+#[tokio::test]
+async fn length_turn_drops_tool_calls_instead_of_failing() {
+    let mut fake = FakeChat::script([FakeStep::Turn(ScriptedTurn {
+        reasoning_deltas: vec!["think".to_owned()],
+        content_deltas: vec!["partial".to_owned()],
+        tool_calls: vec![ToolCall {
+            id: "call_1".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: "{".to_owned(),
+        }],
+        finish_reason: FinishReason::Length,
+        usage: usage(),
+    })]);
+    let mut backoff = RecordingBackoff::default();
+    let completion = execute(
+        &mut fake,
+        &request(vec![assistant("")]),
+        &mut backoff,
+        &open_cancel(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(completion.finish_reason, FinishReason::Length);
+    assert!(completion.tool_calls.is_empty());
+    assert_eq!(completion.content, ObservedText::Text("partial".to_owned()));
 }
 
 /// 用量缺字段是未知，数字 0 仍是已知的 0。

@@ -32,6 +32,15 @@ P0 需要一个云端模型完成只读仓库分析。执行方案已经排除 A
 - 空字符串能通过，来自 2026-04-24 对真实 API 的社区核对，不是官方条文：没有该键会 400，`"reasoning_content": ""` 能通过。`null` 没有这份核对。
 - Fake 按上述假设拒绝“带 tools 且 assistant 没有该键”的原始 JSON。Fake 通过不证明当前 DeepSeek 版本也这样。真实端到端仍需覆盖：带 tools / 不带 tools，以及字段缺失 / 空串。
 
+## API 观察（2026-10-23）
+
+实际读取的页面（英文站，由子代理抓取后逐字转述，我方没有再复读）：[Create Chat Completion](https://api-docs.deepseek.com/api/create-chat-completion)、[思考模式](https://api-docs.deepseek.com/guides/thinking_mode)、[Pricing](https://api-docs.deepseek.com/quick_start/pricing)。`guides/function_calling` 这个地址返回的是无关页面（标题为 Your First API Call），没有工具调用内容，所以**没有**核对。没有调用真实 API。
+
+- `max_tokens` 已写明的：合法范围 1 到 393216；不设置时默认 8K（非思考模式）、64K（思考模式）、128K（思考模式且 `reasoning_effort` 为 `max`）。默认档位按**模式**和 `reasoning_effort` 区分，不是按型号。Pricing 页的最大输出为 384K。触顶时 `finish_reason` 为 `length`，`response_format` 说明里写到 `content` 可能被截断。客户端默认写入未校准的暂定值 32768，显式省略键才用服务端默认。
+- `max_tokens` **文档没有写**的（对 32768 这个暂定值影响最大）：思考模式下 `max_tokens` 是否把思维链与最终回答合计（64K 的默认值只是暗示）；触顶时 `reasoning_content` 如何处理；触顶时被截断的 `tool_calls` 是什么状态；是否存在 `max_completion_tokens`（请求参数表里没有）。因此 32768 可能被思维链耗尽而得到空的 `content`，必须用真实调用的 `completion_tokens` 与 `reasoning_tokens` 校准。
+- 流式 chunk schema：每个 `tool_calls` 元素的 `index` 为 required；`id`、`type`、`function.name`、`function.arguments` 无 required 标记。页面说明首块常带 id/type/function，后续块常只带 arguments 片段。页面没有给出真实工具分片字节样例，也没有写明 `finish_reason: tool_calls` 落在哪一块。客户端按 index 累积的规则标「待真实响应替换」。
+- 非流式 schema 里工具调用的 `id` 与 `name` 为 required。流拼完后仍缺 id 或 name 为空，按服务端违约处理为 `MalformedToolCall`，不用 `StreamInterrupted`。
+
 ## 后果
 
 A2.1 再实现薄客户端、流式响应和 Fake Provider。本 ADR 不包含 HTTP 客户端、密钥存放或真实 API 调用。

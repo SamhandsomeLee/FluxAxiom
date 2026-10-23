@@ -1,7 +1,7 @@
 //! 三个只读工具的路径边界、分页和截断。
 //!
 //! **作用**：证明工具只读授权根，超页或超字节会标 `truncated` 并给出续读。
-//! **边界**：不接 Engine Loop，不记账，不解析流式 `tool_calls`。样本是测试临时目录，不是真实仓库。
+//! **边界**：不接 Engine Loop，不记账。这里的工具不碰模型输出；流式 `tool_calls` 的解析在 `tests/sse.rs`。样本是测试临时目录，不是真实仓库。
 
 use std::fs;
 use std::path::{Path, PathBuf};

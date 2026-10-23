@@ -115,14 +115,20 @@ fn assistant_missing_reasoning(message: &Value) -> bool {
 /// 把脚本里的 delta 收成一次完成结果。
 ///
 /// **参数**：`turn` 携带分段文本、工具调用和用量。
-/// **边界**：任一 `arguments` 不是 JSON 时返回非法工具参数，不产生 `Completed`。
-fn assemble(turn: ScriptedTurn) -> Round {
-    if turn
-        .tool_calls
-        .iter()
-        .any(|call| serde_json::from_str::<Value>(&call.arguments).is_err())
-    {
-        return Round::InvalidToolArguments;
+/// **边界**：先查畸形（空 id、空 name、id 重复），再查 `arguments` 是否为 JSON。任一失败不产生 `Completed`，不重试。
+/// `finish_reason` 是 `Length` 时与 `parse_sse` 一致：不检查工具调用，`tool_calls` 一律为空，响应仍是 `Completed`。
+fn assemble(mut turn: ScriptedTurn) -> Round {
+    if turn.finish_reason == FinishReason::Length {
+        turn.tool_calls.clear();
+    }
+    let mut seen_ids = std::collections::HashSet::new();
+    for call in &turn.tool_calls {
+        if call.id.is_empty() || call.name.is_empty() || !seen_ids.insert(call.id.as_str()) {
+            return Round::MalformedToolCall;
+        }
+        if serde_json::from_str::<Value>(&call.arguments).is_err() {
+            return Round::InvalidToolArguments;
+        }
     }
     Round::Completed(ChatCompletion {
         reasoning: observed_from_deltas(&turn.reasoning_deltas),

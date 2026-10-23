@@ -11,6 +11,12 @@ pub const API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 /// P0 默认模型别名。运行时不猜测“最新”。
 pub const DEFAULT_MODEL: &str = "deepseek-flash";
 
+/// `ChatRequest::new` 写入的输出上限。未校准的暂定值，见执行方案 §4.7.5。
+pub const DEFAULT_MAX_TOKENS: u32 = 32_768;
+
+/// DeepSeek 文档给出的 `max_tokens` 上限。超出时 `with_max_tokens` 返回 `NotEncodable`。
+pub const MAX_TOKENS_LIMIT: u32 = 393_216;
+
 /// 思考强度。序列化为 `low` / `high` / `max`。
 ///
 /// **作用**：放进 Chat Completions 请求。
@@ -181,6 +187,7 @@ impl Serialize for ToolSpec {
 /// **作用**：序列化后交给传输层。
 /// **边界**：不包含密钥。不把 `reasoning_content` 写入日志或 event。
 /// `tools` 为 `None` 时不出现这个键。空列表也不会写成 `[]`，因为官方文档没有定义空数组算不算“携带 tools”。
+/// `max_tokens` 为 `None` 时不出现这个键，才会落到服务端默认档位；`new` 默认写入 [`DEFAULT_MAX_TOKENS`]，避免调用方忘了设上限。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChatRequest {
     pub model: String,
@@ -188,14 +195,16 @@ pub struct ChatRequest {
     pub messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolSpec>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
 }
 
 impl ChatRequest {
-    /// 用默认思考强度组装请求，不带工具。
+    /// 用默认思考强度和输出上限组装请求，不带工具。
     ///
     /// **作用**：调用方只提供模型和消息。
     /// **参数**：`model` 是请求的模型别名。`messages` 按顺序成为对话历史。
-    /// **边界**：不写入 `tools` 键。Engine A 需要工具时再调用 `with_tools`。
+    /// **边界**：不写入 `tools` 键。`max_tokens` 为 [`DEFAULT_MAX_TOKENS`]。Engine A 需要工具时再调用 `with_tools`。要用服务端默认上限时调用 `without_max_tokens`。
     #[must_use]
     pub fn new(model: impl Into<String>, messages: Vec<Message>) -> Self {
         Self {
@@ -203,6 +212,7 @@ impl ChatRequest {
             reasoning_effort: ReasoningEffort::default(),
             messages,
             tools: None,
+            max_tokens: Some(DEFAULT_MAX_TOKENS),
         }
     }
 
@@ -216,11 +226,36 @@ impl ChatRequest {
         self.tools = if tools.is_empty() { None } else { Some(tools) };
         self
     }
+
+    /// 覆盖输出 token 上限。
+    ///
+    /// **作用**：让序列化结果带上调用方选定的 `max_tokens`。
+    /// **参数**：`max_tokens` 必须在 `1..=MAX_TOKENS_LIMIT`（393216）。
+    /// **边界**：超出范围返回 `NotEncodable`，请求不会发出。这是本地校验，不是 HTTP 状态。
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Result<Self, ChatError> {
+        if !(1..=MAX_TOKENS_LIMIT).contains(&max_tokens) {
+            return Err(ChatError::NotEncodable);
+        }
+        self.max_tokens = Some(max_tokens);
+        Ok(self)
+    }
+
+    /// 去掉请求里的 `max_tokens` 键。
+    ///
+    /// **作用**：显式使用服务端默认档位。官方文档记载的默认值按模式区分：非思考模式 8K，思考模式 64K，`reasoning_effort` 为 `max` 时 128K；不是按型号区分。
+    /// 思维链是否计入 `max_tokens`、触顶时 `reasoning_content` 与半截工具调用怎么处理，文档没写，见 ADR-020 的 API 观察。
+    /// **边界**：A2.2 要求上限生效时不要默认走这条路径；`new` 已经写入暂定值。
+    #[must_use]
+    pub fn without_max_tokens(mut self) -> Self {
+        self.max_tokens = None;
+        self
+    }
 }
 
 /// 模型结束原因。`length` 表示输出被截断，但仍是一次成功响应。
 ///
-/// **边界**：未知原因放在 `Other` 里，原文要留给 `EngineObservation` 的非空 `finish_reason`。`Debug` 不打印这段原文。
+/// **边界**：`Length` 的响应里 `tool_calls` 一律为空：被截断的调用不能执行，也不能写进历史。`content` 可能是半截文本。Run 的终态由 Loop 决定，见执行方案 §4.7.5。
+/// 未知原因放在 `Other` 里，原文要留给 `EngineObservation` 的非空 `finish_reason`。`Debug` 不打印这段原文。
 #[derive(Clone, PartialEq, Eq)]
 pub enum FinishReason {
     Stop,
@@ -250,6 +285,7 @@ impl std::fmt::Debug for FinishReason {
 /// **边界**：只有成功结束才产生这个值。流中断或 400 不返回半截 `reasoning_content`，调用方也不能把它写入下一轮历史。
 /// 本 crate 不写 blob，也不写 durable event。`Debug` 只打印长度，不打印正文。
 /// `reasoning` 与 `content` 用观测值：字段没出现是 `Absent`，不用空串填上。
+/// `finish_reason` 是 `Length` 时 `tool_calls` 为空，其余情况下每个调用的 `id`、`name` 非空、`arguments` 是合法 JSON。
 #[derive(Clone, PartialEq, Eq)]
 pub struct ChatCompletion {
     pub reasoning: ObservedText,
@@ -296,13 +332,15 @@ pub enum ChatError {
     StreamInterrupted,
     /// 调用方触发了取消令牌。和 `StreamInterrupted` 分开，Host 据此走 `Cancelling → Cancelled`。同样没有可回传的片段。
     Cancelled,
+    /// 工具调用的 `arguments` 拼完后不是合法 JSON（含空串）。不重试。
     InvalidToolArguments,
-    /// 请求在离开本进程之前无法序列化。这不是 Provider 返回的 HTTP 状态。
+    /// 流完整收尾，但工具调用形状违约：缺 `index`、缺 `id`、名字为空、同 index 冲突、同响应 id 重复、或 `type` 不是 `function`。
+    /// 不能产出半截 `ToolCall` 交给 Loop，否则空 `tool_call_id` 会让下一轮 400。
+    MalformedToolCall,
+    /// 请求在离开本进程之前无法序列化，或本地参数越界。这不是 Provider 返回的 HTTP 状态。
     NotEncodable,
     /// 没有 `DEEPSEEK_API_KEY`，因此没有发出请求。
     MissingCredential,
-    /// 流里出现了这一刀还不解析的 delta，例如 `tool_calls`。
-    UnsupportedDelta,
     /// 还没拿到 HTTP 状态就失败了，例如无法连接。不是超时。
     Transport,
 }
@@ -322,11 +360,9 @@ impl std::fmt::Display for ChatError {
             Self::StreamInterrupted => formatter.write_str("chat stream interrupted"),
             Self::Cancelled => formatter.write_str("chat cancelled"),
             Self::InvalidToolArguments => formatter.write_str("tool call arguments are not json"),
+            Self::MalformedToolCall => formatter.write_str("tool call stream was malformed"),
             Self::NotEncodable => formatter.write_str("chat request could not be encoded"),
             Self::MissingCredential => formatter.write_str("deepseek api key is missing"),
-            Self::UnsupportedDelta => {
-                formatter.write_str("chat stream delta is not parsed in this slice")
-            }
             Self::Transport => formatter.write_str("chat transport failed before a status"),
         }
     }

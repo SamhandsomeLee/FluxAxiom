@@ -30,6 +30,8 @@ pub enum Round {
     /// 取消令牌已触发。不附带半截文本。
     Cancelled,
     InvalidToolArguments,
+    /// 工具调用形状违约。与非法 JSON 一样不重试。
+    MalformedToolCall,
 }
 
 /// 发送一次已序列化的请求。
@@ -108,7 +110,7 @@ impl Backoff for SleepBackoff {
 ///
 /// **作用**：把 Chat Completions 请求交给 `ChatTransport`。
 /// **参数**：`transport` 执行一次已序列化的请求。`request` 是要发送的消息和工具。`backoff` 只负责按给定间隔等待，测试里可以不睡眠。`cancel` 在发送、读块和退避时都会检查。
-/// **边界**：最多 1 次初始调用加 3 次重试。400、流中断、取消、非法工具参数立刻返回。取消返回 `Cancelled`，流中断返回 `StreamInterrupted`。
+/// **边界**：最多 1 次初始调用加 3 次重试。400、流中断、取消、非法工具参数、畸形工具调用立刻返回。取消返回 `Cancelled`，流中断返回 `StreamInterrupted`。
 /// 返回的 future 是 `Send`，由 `ChatTransport` / `Backoff` 的 `Send` 约束保证。
 /// `Transport`（DNS、连接在拿到状态码前失败）也立刻返回。P0 不把这类抖动当成可退避错误，以后可以再加重试。
 /// 流中断与取消都不附带已拼接的片段，调用方不得把它写入下一轮历史。不读取 `DEEPSEEK_API_KEY`。
@@ -126,6 +128,7 @@ pub async fn execute(
             Round::Interrupted => return Err(ChatError::StreamInterrupted),
             Round::Cancelled => return Err(ChatError::Cancelled),
             Round::InvalidToolArguments => return Err(ChatError::InvalidToolArguments),
+            Round::MalformedToolCall => return Err(ChatError::MalformedToolCall),
             Round::Status { status, summary } if is_retryable(status) => {
                 if retries == RETRY_DELAYS.len() {
                     return Err(ChatError::Unavailable { status, summary });

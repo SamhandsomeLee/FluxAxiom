@@ -29,8 +29,7 @@ const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// **作用**：实现 `ChatTransport`，把已序列化的请求用 SSE 发到 `/chat/completions`。
 /// **边界**：`Debug` 只保留密钥长度。不记录请求正文和思维链。
 /// 不设整次请求的总超时。连接超过 10 秒，或两个数据块之间空闲超过 60 秒，才是流中断，并且不重试。
-/// 这一刀不解析 `delta.tool_calls`。
-/// `round` 是异步的：按块读取 SSE，块与块之间检查取消令牌。取消、超时或 `[DONE]` 前断开都不返回半截文本。
+/// `round` 是异步的：按块读取 SSE，块与块之间检查取消令牌。取消、超时或 `[DONE]` 前断开都不返回半截文本。工具分片由 `parse_sse` 按 index 拼接。
 pub struct DeepSeekClient {
     http: reqwest::Client,
     api_key: String,
