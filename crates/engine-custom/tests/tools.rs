@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fluxaxiom_engine_custom::{
     list_files, read_file, search_code, ToolError, WorkspaceError, WorkspaceRoot, LIST_PAGE_LIMIT,
-    READ_BYTE_LIMIT, SEARCH_MATCH_LIMIT,
+    READ_BYTE_LIMIT, READ_LINE_LIMIT, SEARCH_MATCH_LIMIT,
 };
 
 /// 每个测试一个临时目录，避免互相看见文件。
@@ -337,6 +337,82 @@ fn overlong_first_line_advances_to_the_next_line() {
     let next = read_file(&root, "wide.txt", 2).unwrap();
     assert!(next.render().contains("2|second"));
     assert!(!next.truncated);
+}
+
+/// 渲染文本里带行号的正文行。
+///
+/// **参数**：`rendered` 是 `ToolOutput::render` 的结果。
+/// **边界**：只认 `数字|` 开头的行，头部和最后一行不算。
+fn numbered_lines(rendered: &str) -> Vec<&str> {
+    rendered
+        .lines()
+        .filter(|line| {
+            line.split_once('|')
+                .is_some_and(|(number, _)| number.parse::<u32>().is_ok())
+        })
+        .collect()
+}
+
+/// 被截断的长行前面已有内容时，不能把正文推过字节上限。
+///
+/// **边界**：30 行各 1023 字节后面跟一行 40 KiB。第一次只返回那 30 行，`next_start_line` 指向长行；
+/// 第二次长行作为首行被截断；第三次读到后面的短行。纳入的文件字节始终不超过 `READ_BYTE_LIMIT`。
+#[test]
+fn clipped_line_after_content_waits_for_the_next_call() {
+    let root_path = fresh_dir();
+    let mut file = String::new();
+    for _ in 0..30 {
+        file.push_str(&"a".repeat(1023));
+        file.push('\n');
+    }
+    file.push_str(&"b".repeat(40 * 1024));
+    file.push_str("\nend\n");
+    fs::write(root_path.join("mixed.txt"), file).unwrap();
+    let root = WorkspaceRoot::open(&root_path).unwrap();
+
+    let first = read_file(&root, "mixed.txt", 1).unwrap();
+    let rendered = first.render();
+    let lines = numbered_lines(&rendered);
+    assert_eq!(lines.len(), 30);
+    let kept: usize = lines
+        .iter()
+        .filter_map(|line| line.split_once('|').map(|(_, text)| text.len()))
+        .sum();
+    assert!(kept <= READ_BYTE_LIMIT);
+    assert!(!rendered.contains('b'));
+    assert_eq!(first.continuation, Some(31));
+
+    let second = read_file(&root, "mixed.txt", 31).unwrap();
+    let rendered = second.render();
+    let lines = numbered_lines(&rendered);
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].starts_with("31|b") && lines[0].ends_with('…'));
+    assert_eq!(second.continuation, Some(32));
+
+    let third = read_file(&root, "mixed.txt", 32).unwrap();
+    assert!(third.render().contains("32|end"));
+    assert!(!third.truncated);
+}
+
+/// 行数已满时，被截断的长行同样留给下一次调用。
+///
+/// **边界**：`READ_LINE_LIMIT` 行短行后面跟一行 40 KiB，第一次恰好返回 `READ_LINE_LIMIT` 行。
+#[test]
+fn clipped_line_does_not_exceed_the_line_limit() {
+    let root_path = fresh_dir();
+    let mut file = String::new();
+    for _ in 0..READ_LINE_LIMIT {
+        file.push_str("x\n");
+    }
+    file.push_str(&"b".repeat(40 * 1024));
+    file.push('\n');
+    fs::write(root_path.join("lines.txt"), file).unwrap();
+    let root = WorkspaceRoot::open(&root_path).unwrap();
+    let first = read_file(&root, "lines.txt", 1).unwrap();
+    let rendered = first.render();
+    assert_eq!(numbered_lines(&rendered).len(), READ_LINE_LIMIT);
+    assert!(!rendered.contains('b'));
+    assert_eq!(first.continuation, Some(READ_LINE_LIMIT as u32 + 1));
 }
 
 /// 起始行大于 1 时，续读行号继续向前。

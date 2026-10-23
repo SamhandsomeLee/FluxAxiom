@@ -235,7 +235,8 @@ pub fn list_files(
 ///
 /// **作用**：模型用来看文件正文。行号从 `start_line` 起，写在每行前面。
 /// **参数**：`relative_file` 是相对授权根的文件。`start_line` 从 1 开始。
-/// **边界**：最多 `READ_LINE_LIMIT` 行，且纳入的文件字节不超过 `READ_BYTE_LIMIT`。单行超过上限时截断该行并标 `…`，续读从下一行开始，不会停在同一行。遍历看不到的路径、以及 `.git` 下的路径，返回 `Ignored`。文件任意位置有空字节则整次拒绝。
+/// **边界**：最多 `READ_LINE_LIMIT` 行，且纳入的文件字节不超过 `READ_BYTE_LIMIT`。单行超过上限时截断该行并标 `…`，续读从下一行开始，不会停在同一行。
+/// 被截断的行和普通行一样占额度：前面已经有内容、剩余额度放不下它时，这一行整个留给下一次调用，作为那次的首行再被截断。被截断行被丢掉的尾部不会再出现。遍历看不到的路径、以及 `.git` 下的路径，返回 `Ignored`。文件任意位置有空字节则整次拒绝。
 ///
 /// **大文件的成本（已知限制，P0a 接受，见执行方案 §4.7.4）**：
 /// - 每次调用都从文件开头顺序读。`start_line` 之前的行要读过去才能数行号；窗口结束后还要把剩余部分读完，只为确认没有空字节。所以一次调用的 I/O 与**整个文件大小**成正比，不是与返回的 32 KiB 成正比。
@@ -271,6 +272,14 @@ pub fn read_file(
         }
         let line_len = line.bytes.len();
         let fits = kept_lines < READ_LINE_LIMIT && kept_bytes + line_len <= READ_BYTE_LIMIT;
+        // 先判额度，再看是否被截断：被截断的行同样要占额度。放不下就整行留给下一次调用，让它作为首行再被截断，
+        // 否则前面已有内容时，这一行会把正文推过 `READ_BYTE_LIMIT` 或 `READ_LINE_LIMIT`。
+        // 首行总是放得下（被截断的行最长就是 `READ_BYTE_LIMIT`），所以续读一定前进。
+        if !fits {
+            truncated = true;
+            next_line = Some(line_number);
+            break;
+        }
         if line.clipped {
             let mut bytes = line.bytes;
             trim_utf8_boundary(&mut bytes);
@@ -284,11 +293,6 @@ pub fn read_file(
             body.push('…');
             truncated = true;
             next_line = Some(line_number + 1);
-            break;
-        }
-        if !fits {
-            truncated = true;
-            next_line = Some(line_number);
             break;
         }
         let text = std::str::from_utf8(&line.bytes).map_err(|_| ToolError::NotUtf8)?;
