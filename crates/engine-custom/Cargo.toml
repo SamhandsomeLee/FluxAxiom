@@ -8,6 +8,9 @@ publish = false
 async-trait = "0.1"
 fluxaxiom-contract = { path = "../agent-contract" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

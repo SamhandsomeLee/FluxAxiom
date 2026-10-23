@@ -11,6 +11,8 @@ mod fake;
 mod http;
 mod retry;
 mod sse;
+mod tools;
+mod workspace;
 
 pub use chat::{
     observe_reasoning, replay_reasoning, usage_from_json, ChatCompletion, ChatError, ChatRequest,
@@ -25,3 +27,8 @@ pub use retry::{
 };
 pub use sse::parse_sse;
 pub use tokio_util::sync::CancellationToken;
+pub use tools::{
+    list_files, read_file, search_code, ToolError, ToolOutput, LIST_PAGE_LIMIT, READ_BYTE_LIMIT,
+    READ_LINE_LIMIT, SEARCH_MATCH_LIMIT,
+};
+pub use workspace::{WorkspaceError, WorkspaceRoot};
