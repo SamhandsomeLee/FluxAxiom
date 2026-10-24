@@ -124,10 +124,14 @@ fn assemble(mut turn: ScriptedTurn) -> Round {
     let mut seen_ids = std::collections::HashSet::new();
     for call in &turn.tool_calls {
         if call.id.is_empty() || call.name.is_empty() || !seen_ids.insert(call.id.as_str()) {
-            return Round::MalformedToolCall;
+            return Round::MalformedToolCall {
+                usage: turn.usage.clone(),
+            };
         }
         if serde_json::from_str::<Value>(&call.arguments).is_err() {
-            return Round::InvalidToolArguments;
+            return Round::InvalidToolArguments {
+                usage: turn.usage.clone(),
+            };
         }
     }
     Round::Completed(ChatCompletion {

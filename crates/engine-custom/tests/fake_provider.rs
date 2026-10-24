@@ -537,7 +537,12 @@ async fn invalid_tool_arguments_do_not_retry() {
     )
     .await
     .unwrap_err();
-    assert_eq!(error, ChatError::InvalidToolArguments);
+    match error {
+        ChatError::InvalidToolArguments { usage: recorded } => {
+            assert_eq!(recorded, usage());
+        }
+        other => panic!("expected InvalidToolArguments, got {other:?}"),
+    }
     assert!(backoff.waits.is_empty());
 }
 

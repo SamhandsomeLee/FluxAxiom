@@ -2,9 +2,19 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde_json::Value;
 
+use fluxaxiom_contract::ModelUsage;
+
 use crate::chat::{
-    observe_reasoning_text, ChatCompletion, ChatError, FinishReason, ObservedText, ToolCall,
+    observe_reasoning_text, usage_from_json, ChatCompletion, ChatError, FinishReason, ObservedText,
+    ToolCall,
 };
+
+/// 流式拼接过程中记下的工具错误，用量在收尾时再挂上。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingToolError {
+    Malformed,
+    InvalidArguments,
+}
 
 /// 解析一段已经读完的 Chat Completions SSE 正文。
 ///
@@ -19,7 +29,7 @@ pub fn parse_sse(body: &str) -> Result<ChatCompletion, ChatError> {
     let mut content = Accumulator::default();
     let mut tool_calls = BTreeMap::<u64, ToolCallBuilder>::new();
     // 第一处分片错误。先记下，读到 `finish_reason` 后再决定是否报告，见上面的 `length` 说明。
-    let mut tool_error: Option<ChatError> = None;
+    let mut tool_error: Option<PendingToolError> = None;
     let mut finish_reason = None;
     let mut usage = None;
     let mut saw_done = false;
@@ -71,24 +81,37 @@ pub fn parse_sse(body: &str) -> Result<ChatCompletion, ChatError> {
     if !saw_done {
         return Err(ChatError::StreamInterrupted);
     }
+    let resolved_usage = usage
+        .as_ref()
+        .map(usage_from_json)
+        .unwrap_or_else(|| usage_from_json(&Value::Null));
     let tool_calls = if finish_reason == FinishReason::Length {
         Vec::new()
+    } else if let Some(error) = tool_error {
+        return Err(pending_to_chat_error(error, resolved_usage));
     } else {
-        if let Some(error) = tool_error {
-            return Err(error);
+        match finish_tool_calls(tool_calls) {
+            Ok(calls) => calls,
+            Err(error) => return Err(pending_to_chat_error(error, resolved_usage)),
         }
-        finish_tool_calls(tool_calls)?
     };
     Ok(ChatCompletion {
         reasoning: reasoning.finish(),
         content: content.finish(),
         tool_calls,
         finish_reason,
-        usage: usage
-            .as_ref()
-            .map(crate::chat::usage_from_json)
-            .unwrap_or_else(|| crate::chat::usage_from_json(&Value::Null)),
+        usage: resolved_usage,
     })
+}
+
+/// 把拼接期错误挂上本次用量，供 Loop 在失败前 observe。
+///
+/// **参数**：`error` 是畸形或非法 arguments。`usage` 来自流末块（缺失则为全部 Unknown）。
+fn pending_to_chat_error(error: PendingToolError, usage: ModelUsage) -> ChatError {
+    match error {
+        PendingToolError::Malformed => ChatError::MalformedToolCall { usage },
+        PendingToolError::InvalidArguments => ChatError::InvalidToolArguments { usage },
+    }
 }
 
 /// 流式工具调用按 `index` 累积的中间状态。
@@ -109,7 +132,7 @@ struct ToolCallBuilder {
 fn apply_tool_call_deltas(
     tool_calls: &mut BTreeMap<u64, ToolCallBuilder>,
     value: Option<&Value>,
-) -> Result<(), ChatError> {
+) -> Result<(), PendingToolError> {
     let Some(value) = value else {
         return Ok(());
     };
@@ -117,16 +140,16 @@ fn apply_tool_call_deltas(
         return Ok(());
     }
     let Some(items) = value.as_array() else {
-        return Err(ChatError::MalformedToolCall);
+        return Err(PendingToolError::Malformed);
     };
     for item in items {
         let Some(index) = item.get("index").and_then(Value::as_u64) else {
-            return Err(ChatError::MalformedToolCall);
+            return Err(PendingToolError::Malformed);
         };
         let entry = tool_calls.entry(index).or_default();
         if let Some(kind) = item.get("type").and_then(Value::as_str) {
             if kind != "function" {
-                return Err(ChatError::MalformedToolCall);
+                return Err(PendingToolError::Malformed);
             }
         }
         if let Some(id) = item
@@ -137,7 +160,7 @@ fn apply_tool_call_deltas(
             match &entry.id {
                 None => entry.id = Some(id.to_owned()),
                 Some(existing) if existing == id => {}
-                Some(_) => return Err(ChatError::MalformedToolCall),
+                Some(_) => return Err(PendingToolError::Malformed),
             }
         }
         if let Some(function) = item.get("function") {
@@ -149,7 +172,7 @@ fn apply_tool_call_deltas(
                 match &entry.name {
                     None => entry.name = Some(name.to_owned()),
                     Some(existing) if existing == name => {}
-                    Some(_) => return Err(ChatError::MalformedToolCall),
+                    Some(_) => return Err(PendingToolError::Malformed),
                 }
             }
             if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
@@ -166,21 +189,21 @@ fn apply_tool_call_deltas(
 /// **边界**：先查畸形（缺 id、空 name、id 重复），再查 `arguments` 是否为 JSON。空串 `""` 不是合法 JSON，是 `InvalidToolArguments`。
 fn finish_tool_calls(
     tool_calls: BTreeMap<u64, ToolCallBuilder>,
-) -> Result<Vec<ToolCall>, ChatError> {
+) -> Result<Vec<ToolCall>, PendingToolError> {
     let mut seen_ids = HashSet::new();
     let mut finished = Vec::with_capacity(tool_calls.len());
     for (_, entry) in tool_calls {
         let Some(id) = entry.id.filter(|id| !id.is_empty()) else {
-            return Err(ChatError::MalformedToolCall);
+            return Err(PendingToolError::Malformed);
         };
         let Some(name) = entry.name.filter(|name| !name.is_empty()) else {
-            return Err(ChatError::MalformedToolCall);
+            return Err(PendingToolError::Malformed);
         };
         if !seen_ids.insert(id.clone()) {
-            return Err(ChatError::MalformedToolCall);
+            return Err(PendingToolError::Malformed);
         }
         if serde_json::from_str::<Value>(&entry.arguments).is_err() {
-            return Err(ChatError::InvalidToolArguments);
+            return Err(PendingToolError::InvalidArguments);
         }
         finished.push(ToolCall {
             id,

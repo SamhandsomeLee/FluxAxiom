@@ -10,6 +10,24 @@ use fluxaxiom_engine_custom::{
 };
 use serde_json::json;
 
+/// **作用**：断言错误是畸形工具调用（形状违约）。
+/// **边界**：只看变体，不看携带的用量。
+fn assert_malformed(error: ChatError) {
+    assert!(
+        matches!(error, ChatError::MalformedToolCall { .. }),
+        "{error:?}"
+    );
+}
+
+/// **作用**：断言错误是非法工具 arguments（不是合法 JSON）。
+/// **边界**：只看变体，不看携带的用量。
+fn assert_invalid_args(error: ChatError) {
+    assert!(
+        matches!(error, ChatError::InvalidToolArguments { .. }),
+        "{error:?}"
+    );
+}
+
 const COMPLETE_STREAM: &str = "\
 data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"},\"finish_reason\":null}]}\n\n\
 data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" more\"},\"finish_reason\":null}]}\n\n\
@@ -151,10 +169,7 @@ fn tool_fragment_errors_wait_for_the_end_of_the_stream() {
         parse_sse(&sse_body(&chunks, false)).unwrap_err(),
         ChatError::StreamInterrupted
     );
-    assert_eq!(
-        parse_sse(&sse_body(&chunks, true)).unwrap_err(),
-        ChatError::MalformedToolCall
-    );
+    assert_malformed(parse_sse(&sse_body(&chunks, true)).unwrap_err());
 }
 
 /// 流式工具分片按 index 拼接成完整调用。
@@ -213,53 +228,35 @@ fn malformed_tool_calls_are_not_stream_interruptions() {
     let missing_index = "\
 data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\
 data: [DONE]\n";
-    assert_eq!(
-        parse_sse(missing_index).unwrap_err(),
-        ChatError::MalformedToolCall
-    );
+    assert_malformed(parse_sse(missing_index).unwrap_err());
 
     let missing_id = "\
 data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\
 data: [DONE]\n";
-    assert_eq!(
-        parse_sse(missing_id).unwrap_err(),
-        ChatError::MalformedToolCall
-    );
+    assert_malformed(parse_sse(missing_id).unwrap_err());
 
     let empty_name = "\
 data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\
 data: [DONE]\n";
-    assert_eq!(
-        parse_sse(empty_name).unwrap_err(),
-        ChatError::MalformedToolCall
-    );
+    assert_malformed(parse_sse(empty_name).unwrap_err());
 
     let conflict = "\
 data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\
 data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_2\",\"function\":{\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\
 data: [DONE]\n";
-    assert_eq!(
-        parse_sse(conflict).unwrap_err(),
-        ChatError::MalformedToolCall
-    );
+    assert_malformed(parse_sse(conflict).unwrap_err());
 
     let duplicate_id = "\
 data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"call_1\",\"function\":{\"name\":\"list_files\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\
 data: [DONE]\n";
-    assert_eq!(
-        parse_sse(duplicate_id).unwrap_err(),
-        ChatError::MalformedToolCall
-    );
+    assert_malformed(parse_sse(duplicate_id).unwrap_err());
 
     let bad_type = concat!(
         r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"custom","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
         "\n",
         "data: [DONE]\n",
     );
-    assert_eq!(
-        parse_sse(bad_type).unwrap_err(),
-        ChatError::MalformedToolCall
-    );
+    assert_malformed(parse_sse(bad_type).unwrap_err());
 }
 
 /// 拼完后的 arguments 不是 JSON（含空串）是 `InvalidToolArguments`，先过畸形检查。
@@ -270,18 +267,12 @@ fn invalid_tool_arguments_after_join_fail_the_stream() {
     let empty_args = "\
 data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\
 data: [DONE]\n";
-    assert_eq!(
-        parse_sse(empty_args).unwrap_err(),
-        ChatError::InvalidToolArguments
-    );
+    assert_invalid_args(parse_sse(empty_args).unwrap_err());
 
     let broken = "\
 data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\
 data: [DONE]\n";
-    assert_eq!(
-        parse_sse(broken).unwrap_err(),
-        ChatError::InvalidToolArguments
-    );
+    assert_invalid_args(parse_sse(broken).unwrap_err());
 }
 
 /// 未知结束原因保留原文，但 `Debug` 不打印它。

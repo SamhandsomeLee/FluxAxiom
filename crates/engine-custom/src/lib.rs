@@ -1,13 +1,12 @@
-//! DeepSeek Chat Completions 的薄客户端契约。
+//! DeepSeek Chat Completions 客户端与 Engine A 只读 Loop。
 //!
-//! **作用**：固定请求里的 `reasoning_content`、缓存用量和流式 `tool_calls` 字段，并用 Fake 覆盖失败场景。
-//! **边界**：不实现 `EngineAdapter`，不写 Host 的 event 或 blob。
-//! 只有 `DeepSeekClient::from_env` 读取 `DEEPSEEK_API_KEY`。默认测试不访问网络。
-//! `ChatTransport::round` 与 `execute` 是异步的，取消令牌与 `HostPort::cancellation` 使用同一类型。
-//! 取消返回 `ChatError::Cancelled`，与网络中断 `StreamInterrupted` 分开。
+//! **作用**：固定请求里的 `reasoning_content`、缓存用量和流式 `tool_calls` 字段；`EngineA` 经 `HostPort` 跑最小 Agent Loop。
+//! **边界**：不写 Host 的 event 或 blob（由 `HostPort` 实现负责）。只有 `DeepSeekClient::from_env` 读取 `DEEPSEEK_API_KEY`。
+//! 默认测试用 Fake，不访问网络。`ChatTransport::round` 与 `execute` 是异步的，取消令牌与 `HostPort::cancellation` 使用同一类型。
 //! `ChatRequest::new` 默认带未校准的 `max_tokens: 32768`。
 
 mod chat;
+mod engine;
 mod fake;
 mod http;
 mod retry;
@@ -19,6 +18,7 @@ pub use chat::{
     FinishReason, Message, ObservedText, ReasoningEffort, ReplayReasoning, ToolCall, ToolSpec,
     API_KEY_ENV, DEFAULT_MAX_TOKENS, DEFAULT_MODEL, MAX_TOKENS_LIMIT,
 };
+pub use engine::{EngineA, PROMPT_LAYOUT_VERSION};
 pub use fake::{FakeChat, FakeStep, ScriptedTurn};
 pub use fluxaxiom_contract::{ModelUsage, TokenCount};
 pub use fluxaxiom_engine_api::{WorkspaceError, WorkspaceRoot};

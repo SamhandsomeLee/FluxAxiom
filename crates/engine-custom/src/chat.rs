@@ -333,10 +333,12 @@ pub enum ChatError {
     /// 调用方触发了取消令牌。和 `StreamInterrupted` 分开，Host 据此走 `Cancelling → Cancelled`。同样没有可回传的片段。
     Cancelled,
     /// 工具调用的 `arguments` 拼完后不是合法 JSON（含空串）。不重试。
-    InvalidToolArguments,
+    /// `usage` 是这次已计费调用的用量，供 Loop 在失败前 `observe`。
+    InvalidToolArguments { usage: ModelUsage },
     /// 流完整收尾，但工具调用形状违约：缺 `index`、缺 `id`、名字为空、同 index 冲突、同响应 id 重复、或 `type` 不是 `function`。
     /// 不能产出半截 `ToolCall` 交给 Loop，否则空 `tool_call_id` 会让下一轮 400。
-    MalformedToolCall,
+    /// `usage` 是这次已计费调用的用量，供 Loop 在失败前 `observe`。
+    MalformedToolCall { usage: ModelUsage },
     /// 请求在离开本进程之前无法序列化，或本地参数越界。这不是 Provider 返回的 HTTP 状态。
     NotEncodable,
     /// 没有 `DEEPSEEK_API_KEY`，因此没有发出请求。
@@ -359,8 +361,10 @@ impl std::fmt::Display for ChatError {
             }
             Self::StreamInterrupted => formatter.write_str("chat stream interrupted"),
             Self::Cancelled => formatter.write_str("chat cancelled"),
-            Self::InvalidToolArguments => formatter.write_str("tool call arguments are not json"),
-            Self::MalformedToolCall => formatter.write_str("tool call stream was malformed"),
+            Self::InvalidToolArguments { .. } => {
+                formatter.write_str("tool call arguments are not json")
+            }
+            Self::MalformedToolCall { .. } => formatter.write_str("tool call stream was malformed"),
             Self::NotEncodable => formatter.write_str("chat request could not be encoded"),
             Self::MissingCredential => formatter.write_str("deepseek api key is missing"),
             Self::Transport => formatter.write_str("chat transport failed before a status"),

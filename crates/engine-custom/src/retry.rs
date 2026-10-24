@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use fluxaxiom_contract::ModelUsage;
+
 use crate::chat::{ChatCompletion, ChatError, ChatRequest};
 
 /// 429 / 5xx 的三次重试间隔。第一次失败后等 200ms，然后 400ms，然后 800ms。
@@ -29,9 +31,14 @@ pub enum Round {
     Interrupted,
     /// 取消令牌已触发。不附带半截文本。
     Cancelled,
-    InvalidToolArguments,
-    /// 工具调用形状违约。与非法 JSON 一样不重试。
-    MalformedToolCall,
+    /// 非法工具参数。携带用量供 Loop 在失败前 observe。
+    InvalidToolArguments {
+        usage: ModelUsage,
+    },
+    /// 工具调用形状违约。与非法 JSON 一样不重试。携带用量供 Loop 在失败前 observe。
+    MalformedToolCall {
+        usage: ModelUsage,
+    },
 }
 
 /// 发送一次已序列化的请求。
@@ -127,8 +134,12 @@ pub async fn execute(
             Round::Completed(completion) => return Ok(completion),
             Round::Interrupted => return Err(ChatError::StreamInterrupted),
             Round::Cancelled => return Err(ChatError::Cancelled),
-            Round::InvalidToolArguments => return Err(ChatError::InvalidToolArguments),
-            Round::MalformedToolCall => return Err(ChatError::MalformedToolCall),
+            Round::InvalidToolArguments { usage } => {
+                return Err(ChatError::InvalidToolArguments { usage })
+            }
+            Round::MalformedToolCall { usage } => {
+                return Err(ChatError::MalformedToolCall { usage })
+            }
             Round::Status { status, summary } if is_retryable(status) => {
                 if retries == RETRY_DELAYS.len() {
                     return Err(ChatError::Unavailable { status, summary });
