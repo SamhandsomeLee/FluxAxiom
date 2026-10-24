@@ -7,3 +7,16 @@ publish = false
 [[bin]]
 name = "flux"
 path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+fluxaxiom-contract = { path = "../../crates/agent-contract" }
+fluxaxiom-engine-api = { path = "../../crates/engine-api" }
+fluxaxiom-engine-custom = { path = "../../crates/engine-custom" }
+fluxaxiom-run-host = { path = "../../crates/run-host" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"

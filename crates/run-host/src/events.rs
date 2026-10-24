@@ -139,6 +139,45 @@ pub(crate) fn artifact_ids(
         .collect()
 }
 
+/// 列出该 Run 的全部 Artifact 行。
+///
+/// **作用**：CLI `artifacts` 用；与 `artifact_ids` 排序一致。快照只要 id，走窄查询。
+/// **边界**：只读索引表；`summary` 是短摘要，正文在 `storage_ref` 指向的 blob。
+pub(crate) fn list_artifacts(
+    connection: &Connection,
+    run_id: &RunId,
+) -> Result<Vec<Artifact>, HostError> {
+    let mut statement = connection.prepare(
+        "SELECT artifact_id, run_id, artifact_type, storage_ref, summary, created_at
+         FROM artifacts WHERE run_id = ?1 ORDER BY created_at, artifact_id",
+    )?;
+    let rows = statement.query_map(params![run_id.as_str()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+        ))
+    })?;
+    let mut artifacts = Vec::new();
+    for row in rows {
+        let (artifact_id, run_id_value, artifact_type, storage_ref, summary, created_at) = row?;
+        artifacts.push(Artifact {
+            artifact_id: ArtifactId::parse(artifact_id)
+                .map_err(|_| HostError::Corrupt("artifact_id"))?,
+            run_id: RunId::parse(run_id_value).map_err(|_| HostError::Corrupt("run_id"))?,
+            artifact_type,
+            storage_ref,
+            summary,
+            created_at: fluxaxiom_contract::Timestamp::parse(created_at)
+                .map_err(|_| HostError::Corrupt("artifact created_at"))?,
+        });
+    }
+    Ok(artifacts)
+}
+
 /// 把观测变成契约 payload。
 ///
 /// **作用**：确认字段和 blob 都齐，再交给 `record` 写入。本函数不写库。

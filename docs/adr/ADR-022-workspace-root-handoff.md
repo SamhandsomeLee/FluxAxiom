@@ -50,7 +50,7 @@
 ### 已知缺口
 
 1. **（已修复）路径在创建时没有规范化。** 原先 `create_run` 原样存字符串，相对路径会按驱动时的当前目录解析，授权和读取可能对着不同目录。现在 `create_run` 就规范化并存绝对路径，`prepare_drive` 还要核对重新规范化的结果没变（路径中间被换成符号链接会被拒绝）。测试：`relative_workspace_is_stored_as_an_absolute_path`、`workspace_swapped_for_a_symlink_is_rejected_at_drive`。
-2. **创建之后目录消失或被替换时，Run 停在 `Accepted`。** 创建时打不开的目录已经在 `create_run` 被拒绝，不再建 Run，所以用修正后的路径重试同一个 `request_id` 是可行的。但 Run 建好之后目录被删除或换掉，`prepare_drive` 仍会失败，Run 没有终态也没有事件，重试同一个 `request_id` 只会拿回这个旧 Run。这一条已写入执行方案 §4.7.4，A3 开始前必须决定处理方式。
+2. **（已由 ADR-021 关闭）创建之后目录消失或被替换。** `prepare_drive` 失败时同事务写成 `Failed(engine_error)`，不再停在 `Accepted`。
 3. **驱动时才打开，打开后到读取之间仍有窗口。** 规范化只在 `open` 与每次 `resolve` 时做一次，随后 `File::open` 用的是路径而不是句柄。符号链接在这个窗口里被替换，不会被发现。执行方案已把路径 TOCTOU 归入 B6，P0a 不处理。
 
 ## 复审触发器（追加）

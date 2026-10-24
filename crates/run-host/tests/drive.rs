@@ -142,11 +142,11 @@ async fn duplicate_request_id_after_drive_keeps_terminal_run() {
     assert_eq!(again.attempt.status, AttemptStatus::Ended);
 }
 
-/// 创建之后目录被删掉，驱动时不进入 Running，Engine 不会被调用。
+/// 创建之后目录被删掉：不进入 Running，按 ADR-021 收成 `Failed(engine_error)`。
 ///
-/// **边界**：Run 停在 `Accepted`，没有 `run.started`。这条路径是有意保留的缺口，见执行方案 §4.7.4；测试固定的是当前行为，A3 决定终态后要改这条断言。
+/// **边界**：没有 `run.started`；有 `attempt.ended` 与 `run.failed`。Engine 不会被调用。
 #[tokio::test]
-async fn workspace_removed_after_create_leaves_run_accepted() {
+async fn workspace_removed_after_create_fails_the_run() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path();
     let workspace = path.join("vanishing");
@@ -156,22 +156,36 @@ async fn workspace_removed_after_create_leaves_run_accepted() {
         .create_run(common::create_run("req_missing_ws", &workspace))
         .unwrap();
     std::fs::remove_dir(&workspace).unwrap();
-    let error = host
+    let outcome = host
         .drive_run(&created.run.run_id, &FakeEngine)
         .await
-        .unwrap_err();
+        .unwrap();
     assert!(matches!(
-        error,
-        fluxaxiom_run_host::HostError::Invalid("workspace root is unavailable")
+        outcome,
+        EngineOutcome::Failed {
+            reason: FailureReason::EngineError,
+            partial: None,
+        }
     ));
+    let run = host.get_run(&created.run.run_id).unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
     assert_eq!(
-        host.get_run(&created.run.run_id).unwrap().status,
-        RunStatus::Accepted
+        run.terminal_reason,
+        Some(fluxaxiom_contract::TerminalReason::EngineError)
+    );
+    let attempt = host.get_attempt(&created.attempt.attempt_id).unwrap();
+    assert_eq!(attempt.status, AttemptStatus::Ended);
+    assert_eq!(
+        attempt.error_reason.as_deref(),
+        Some("workspace root is unavailable")
     );
     let events = host.events_after(&created.run.run_id, 0).unwrap();
     assert!(events
         .iter()
         .all(|event| !matches!(event.body, fluxaxiom_contract::EventBody::RunStarted(_))));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event.body, fluxaxiom_contract::EventBody::RunFailed(_))));
 }
 
 /// 创建时工作区不存在，就不建 Run。
@@ -243,16 +257,60 @@ async fn workspace_swapped_for_a_symlink_is_rejected_at_drive() {
         eprintln!("skipped: this process cannot create directory symlinks");
         return;
     }
+    let outcome = host
+        .drive_run(&created.run.run_id, &FakeEngine)
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        EngineOutcome::Failed {
+            reason: FailureReason::EngineError,
+            ..
+        }
+    ));
+    let run = host.get_run(&created.run.run_id).unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(run.terminal_reason, Some(TerminalReason::EngineError));
+    assert_eq!(
+        host.get_attempt(&created.attempt.attempt_id)
+            .unwrap()
+            .error_reason
+            .as_deref(),
+        Some("workspace root changed since creation")
+    );
+}
+
+/// 已终态的 Run 再 drive，即使工作区已被删，也只得到 `not startable`，库里的终态不动。
+///
+/// **边界**：不能把 Completed 的 Run 改写成 Failed，也不能向调用方报告 `Ok(Failed)`。
+#[tokio::test]
+async fn driving_a_terminal_run_does_not_rewrite_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let workspace = common::authorized_workspace(path);
+    let host = RunHost::open(path).unwrap();
+    let created = host
+        .create_run(common::create_run("req_redrive", &workspace))
+        .unwrap();
+    host.drive_run(&created.run.run_id, &FakeEngine)
+        .await
+        .unwrap();
+    let last_sequence = host.snapshot(&created.run.run_id).unwrap().last_sequence;
+    std::fs::remove_dir_all(&workspace).unwrap();
+
     let error = host
         .drive_run(&created.run.run_id, &FakeEngine)
         .await
         .unwrap_err();
     assert!(matches!(
         error,
-        fluxaxiom_run_host::HostError::Invalid("workspace root changed since creation")
+        fluxaxiom_run_host::HostError::Invalid("run is not startable")
     ));
+    let run = host.get_run(&created.run.run_id).unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(run.terminal_reason, Some(TerminalReason::Completed));
     assert_eq!(
-        host.get_run(&created.run.run_id).unwrap().status,
-        RunStatus::Accepted
+        host.snapshot(&created.run.run_id).unwrap().last_sequence,
+        last_sequence
     );
 }

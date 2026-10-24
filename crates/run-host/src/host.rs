@@ -181,6 +181,16 @@ impl RunHost {
         events::load_after(&connection, run_id, after)
     }
 
+    /// 列出该 Run 已持久化的 Artifact。
+    ///
+    /// **作用**：供 CLI `artifacts` 打印类型、摘要与 blob 引用。
+    /// **边界**：按创建时间排序。不打开 blob 文件；正文用 `read_blob` 另取。
+    pub fn list_artifacts(&self, run_id: &RunId) -> Result<Vec<Artifact>, HostError> {
+        let connection = self.lock()?;
+        store::load_run(&connection, run_id)?;
+        events::list_artifacts(&connection, run_id)
+    }
+
     /// 从权威表组装快照。
     ///
     /// **作用**：在一条 `DEFERRED` 读事务里带上当前状态、`MAX(sequence)` 和 Artifact 列表。
@@ -240,14 +250,23 @@ impl RunHost {
     ///
     /// **作用**：启动前提交 `run.started` 与 `attempt.started`，结束后把报告、Attempt 和 Run 终态放进同一事务。
     /// **边界**：不持锁越过 `.await`。报告正文先进 blob，事务只写引用和 event。
-    /// **已知缺口（A3 前必须决定，见执行方案 §4.7.4）**：`prepare_drive` 失败时这里直接返回 `Err`，Run 仍是 `Accepted`，没有终态、没有事件。
-    /// 本方法不会把它转成 `Failed`，也没有别的路径会回收它。A3 的 CLI 不能只打印这个错误就退出，否则用户之后看到的是一个永远不结束的 Run。
+    /// `prepare_drive` 在进入 `Running` 之前失败时，按 ADR-021 先写成 `Failed(engine_error)`，再返回
+    /// `Ok(EngineOutcome::Failed { .. })`，不调用 Engine。
     pub async fn drive_run(
         &self,
         run_id: &RunId,
         engine: &dyn EngineAdapter,
     ) -> Result<EngineOutcome, HostError> {
-        let prepared = self.prepare_drive(run_id)?;
+        let prepared = match self.prepare_drive(run_id) {
+            Ok(prepared) => prepared,
+            Err(PrepareDriveError::UnstartedFailed) => {
+                return Ok(EngineOutcome::Failed {
+                    reason: FailureReason::EngineError,
+                    partial: None,
+                });
+            }
+            Err(PrepareDriveError::Host(error)) => return Err(error),
+        };
         let host: Arc<dyn HostPort> = Arc::new(DrivePort::new(
             Arc::clone(&self.shared),
             run_id.clone(),
@@ -260,50 +279,73 @@ impl RunHost {
     /// 在调用 Engine 之前把 Run 标成运行中。
     ///
     /// **作用**：同一事务写入 `Running`、`run.started` 和 `attempt.started`，并把任务原文与已打开的授权根交给 Engine。
-    /// **边界**：任务原文与工作区打开都在写锁外完成。能否从 `Accepted` 进入 `Running` 在 `IMMEDIATE` 事务内判断，避免两个进程同时启动。任务 blob 缺失、不是 UTF-8、或工作区目录打不开时不改状态。测试可在 COMMIT 前中止。
-    ///
-    /// **失败后 Run 停在 `Accepted`（有意保留的缺口，不是遗漏）**：
-    /// - 工作区在 `create_run` 已经校验并规范化过，所以现在这条路径剩下的是创建**之后**目录被删除、被替换成指向别处的符号链接等情况，不再包含「相对路径按另一个当前目录解析」。
-    /// - 上面三种失败发生在事务开始之前，所以既不写 `run.failed`，也不改 Run 或 Attempt 状态。这是 A1.1 为了「失败不留半截状态」选的最保守做法，`missing_workspace_leaves_run_accepted` 测试固定了它。
-    /// - 代价：这个 Run 不再是 `Running` / `Cancelling`，执行方案 §4.8 的启动扫描只处理这两种状态且租约已过期的 Attempt，所以它不会被标成 `Orphaned`，也不会变成 `Failed(host_restart)`。没有任何现有路径会收尾它。
-    /// - 对用户可见的后果：`status` 永远是 `Accepted`，`events` 里没有任何事件解释原因。同一个 `request_id` 重新提交会按幂等返回这个旧 Run，而不是新建，用户无法靠重试摆脱。
-    /// - A3 必须在这两种里选一个并写进 ADR：(1) 失败时同一事务写 `run.failed` 并终态化；(2) 保持 `Accepted` 但提供显式的放弃或重试命令。原先的第三种（创建前校验）已由 `create_run` 完成，它缩小了这条路径但不能消除它。不能默认留着。
-    fn prepare_drive(&self, run_id: &RunId) -> Result<PreparedDrive, HostError> {
+    /// **边界**：任务原文与工作区打开都在写锁外完成。能否从 `Accepted` 进入 `Running` 在 `IMMEDIATE` 事务内判断，避免两个进程同时启动。
+    /// 任务 blob 缺失 / 非 UTF-8、工作区打不开或规范化后与库存不一致时：调用 [`abort_unstarted`]，返回 `UnstartedFailed`（见 ADR-021）。
+    /// 「不能启动」（已非 Accepted / Starting）返回 `Host(Invalid)`，不改状态。测试可在进入 Running 的 COMMIT 前中止。
+    fn prepare_drive(&self, run_id: &RunId) -> Result<PreparedDrive, PrepareDriveError> {
         let (input_ref, workspace_ref) = {
-            let connection = self.lock()?;
-            let run = store::load_run(&connection, run_id)?;
+            let connection = self.lock().map_err(PrepareDriveError::Host)?;
+            let run = store::load_run(&connection, run_id).map_err(PrepareDriveError::Host)?;
+            let attempt =
+                store::latest_attempt(&connection, run_id).map_err(PrepareDriveError::Host)?;
+            // 先看状态再碰 blob / 工作区：非 Accepted 的 Run 不归本次 drive，不能因为 IO 失败被改写。
+            if run.status != RunStatus::Accepted || attempt.status != AttemptStatus::Starting {
+                return Err(PrepareDriveError::Host(HostError::Invalid(
+                    "run is not startable",
+                )));
+            }
             (run.input_ref, run.workspace_ref)
         };
-        let input = read_task_text(&self.shared.root, &input_ref)?;
-        // 失败时直接返回，Run 保持 `Accepted`。原因与后果见上面的函数注释。
-        let workspace = WorkspaceRoot::open(&workspace_ref)
-            .map_err(|_| HostError::Invalid("workspace root is unavailable"))?;
-        // 库存的是创建时规范化的路径。重新规范化后不同，说明路径中间被换成了符号链接或挂载点，授权的不再是这个目录。
+        let input = match read_task_text(&self.shared.root, &input_ref) {
+            Ok(text) => text,
+            Err(_) => {
+                self.abort_unstarted(run_id, "input_blob")
+                    .map_err(PrepareDriveError::Host)?;
+                return Err(PrepareDriveError::UnstartedFailed);
+            }
+        };
+        let workspace = match WorkspaceRoot::open(&workspace_ref) {
+            Ok(root) => root,
+            Err(_) => {
+                self.abort_unstarted(run_id, "workspace root is unavailable")
+                    .map_err(PrepareDriveError::Host)?;
+                return Err(PrepareDriveError::UnstartedFailed);
+            }
+        };
+        // 库存的是创建时规范化的路径。重新规范化后不同，说明路径中间被换成了符号链接或挂载点。
         if workspace.as_path().to_str() != Some(workspace_ref.as_str()) {
-            return Err(HostError::Invalid("workspace root changed since creation"));
+            self.abort_unstarted(run_id, "workspace root changed since creation")
+                .map_err(PrepareDriveError::Host)?;
+            return Err(PrepareDriveError::UnstartedFailed);
         }
         let fail = self.take_fail_prepare();
-        let mut connection = self.lock()?;
-        let transaction = store::immediate(&mut connection)?;
-        let mut run = store::load_run(&transaction, run_id)?;
-        let mut attempt = store::latest_attempt(&transaction, run_id)?;
+        let mut connection = self.lock().map_err(PrepareDriveError::Host)?;
+        let transaction = store::immediate(&mut connection).map_err(PrepareDriveError::Host)?;
+        let mut run = store::load_run(&transaction, run_id).map_err(PrepareDriveError::Host)?;
+        let mut attempt =
+            store::latest_attempt(&transaction, run_id).map_err(PrepareDriveError::Host)?;
         if !run_transition_allowed(run.status, RunStatus::Running)
             || !attempt_transition_allowed(attempt.status, AttemptStatus::Running)
         {
-            return Err(HostError::Invalid("run is not startable"));
+            return Err(PrepareDriveError::Host(HostError::Invalid(
+                "run is not startable",
+            )));
         }
         run.status = RunStatus::Running;
         run.updated_at = now_utc();
         attempt.status = AttemptStatus::Running;
-        store::update_run_and_attempt(&transaction, &run, &attempt)?;
-        let mut sequence = events::max_sequence(&transaction, run_id)? + 1;
+        store::update_run_and_attempt(&transaction, &run, &attempt)
+            .map_err(PrepareDriveError::Host)?;
+        let mut sequence =
+            events::max_sequence(&transaction, run_id).map_err(PrepareDriveError::Host)? + 1;
         events::record(
             &transaction,
             run_id,
             sequence,
             run.run_id.as_str(),
             events::started(),
-        )?;
+        )
+        .map_err(PrepareDriveError::Host)?;
         sequence += 1;
         events::record(
             &transaction,
@@ -315,9 +357,10 @@ impl RunHost {
                 attempt.owner.clone(),
                 attempt.lease_expires_at.clone(),
             ),
-        )?;
+        )
+        .map_err(PrepareDriveError::Host)?;
         let budget = run.budget;
-        commit_tx(transaction, fail)?;
+        commit_tx(transaction, fail).map_err(PrepareDriveError::Host)?;
         Ok(PreparedDrive {
             request: EngineRunRequest {
                 run_id: run.run_id,
@@ -326,6 +369,53 @@ impl RunHost {
             },
             budget,
         })
+    }
+
+    /// 从未进入 `Running` 时把 Run / Attempt 收成失败终态。
+    ///
+    /// **作用**：§4.7.4 / ADR-021：任务或工作区在 drive 前不可用时，同事务写 `attempt.ended` 与 `run.failed`。
+    /// **参数**：`error_reason` 写入 Attempt，须非空；也用作日志线索，不进 event payload 的敏感字段。
+    /// **边界**：仅当事务内仍是 `Accepted` + `Starting` 时改写；否则返回 `Invalid("run is not startable")`，不改任何行。
+    /// 这样别的进程已把 Run 推进到 `Running` 或终态时，本路径不会覆盖它。不写 Artifact。
+    fn abort_unstarted(&self, run_id: &RunId, error_reason: &str) -> Result<(), HostError> {
+        if error_reason.is_empty() {
+            return Err(HostError::Invalid("error_reason must not be empty"));
+        }
+        let mut connection = self.lock()?;
+        let transaction = store::immediate(&mut connection)?;
+        let mut run = store::load_run(&transaction, run_id)?;
+        let mut attempt = store::latest_attempt(&transaction, run_id)?;
+        if run.status != RunStatus::Accepted || attempt.status != AttemptStatus::Starting {
+            return Err(HostError::Invalid("run is not startable"));
+        }
+        run.status = RunStatus::Failed;
+        run.terminal_reason = Some(TerminalReason::EngineError);
+        run.updated_at = now_utc();
+        attempt.status = AttemptStatus::Ended;
+        attempt.outcome = Some(AttemptOutcome::Failed);
+        attempt.error_reason = Some(error_reason.to_owned());
+        if !run.invariants_hold() || !attempt.invariants_hold() {
+            return Err(HostError::Invalid("abort records violate invariants"));
+        }
+        store::update_run_and_attempt(&transaction, &run, &attempt)?;
+        let mut sequence = events::max_sequence(&transaction, run_id)? + 1;
+        events::record(
+            &transaction,
+            run_id,
+            sequence,
+            attempt.attempt_id.as_str(),
+            events::attempt_ended(attempt.attempt_id.clone(), AttemptOutcome::Failed),
+        )?;
+        sequence += 1;
+        events::record(
+            &transaction,
+            run_id,
+            sequence,
+            run.run_id.as_str(),
+            events::terminal(TerminalReason::EngineError),
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// 按 `EngineOutcome` 写入终态。
@@ -457,6 +547,15 @@ fn read_task_text(root: &Path, input_ref: &str) -> Result<String, HostError> {
 struct PreparedDrive {
     request: EngineRunRequest,
     budget: Budget,
+}
+
+/// `prepare_drive` 的内部失败分类。
+///
+/// **作用**：把「已写成 Failed 终态」与「普通 Host 错误」分开，供 `drive_run` 映射返回值。
+enum PrepareDriveError {
+    /// 已调用 `abort_unstarted`，Run 为 `Failed(engine_error)`。
+    UnstartedFailed,
+    Host(HostError),
 }
 
 /// 空的产物类型不能收成成功。
