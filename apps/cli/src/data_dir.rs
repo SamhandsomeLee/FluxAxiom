@@ -19,6 +19,10 @@ pub fn resolve(override_dir: Option<PathBuf>) -> PathBuf {
 }
 
 /// 同 [`resolve`]，环境变量查找由调用方给，测试不必改进程环境。
+///
+/// **作用**：把「显式覆盖 → 环境变量 → 平台默认」收成一条路径。
+/// **参数**：`lookup` 模拟 `std::env::var`；返回 `None` 表示未设置。
+/// **边界**：空串经 [`non_empty`] 视为未设置。
 fn resolve_with(override_dir: Option<PathBuf>, lookup: impl Fn(&str) -> Option<String>) -> PathBuf {
     if let Some(path) = override_dir {
         return path;
@@ -30,6 +34,9 @@ fn resolve_with(override_dir: Option<PathBuf>, lookup: impl Fn(&str) -> Option<S
 }
 
 /// 取非空的环境变量值。
+///
+/// **作用**：统一「未设置」与「设成空串」两种缺省。
+/// **边界**：只过滤空串，不 trim 空白。
 fn non_empty(lookup: &impl Fn(&str) -> Option<String>, name: &str) -> Option<String> {
     lookup(name).filter(|value| !value.is_empty())
 }
@@ -64,6 +71,9 @@ mod tests {
     use std::path::PathBuf;
 
     /// 用固定表代替进程环境。
+    ///
+    /// **作用**：构造传给 [`super::resolve_with`] 的 `lookup`。
+    /// **参数**：`pairs` 是 `(变量名, 值)`；同名后者覆盖前者。
     fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let table: HashMap<String, String> = pairs
             .iter()
@@ -72,6 +82,7 @@ mod tests {
         move |name| table.get(name).cloned()
     }
 
+    /// `--data-dir` 优先于 `FLUXAXIOM_DATA_DIR`。
     #[test]
     fn override_beats_environment() {
         let lookup = env_of(&[(DATA_DIR_ENV, "from-env")]);
@@ -79,12 +90,14 @@ mod tests {
         assert_eq!(path, PathBuf::from("explicit-data"));
     }
 
+    /// 有环境变量时不走平台默认。
     #[test]
     fn environment_beats_platform_default() {
         let lookup = env_of(&[(DATA_DIR_ENV, "from-env")]);
         assert_eq!(resolve_with(None, lookup), PathBuf::from("from-env"));
     }
 
+    /// 空串与未设置等价。
     #[test]
     fn empty_environment_value_counts_as_unset() {
         let with_empty = resolve_with(None, env_of(&[(DATA_DIR_ENV, "")]));
@@ -92,6 +105,7 @@ mod tests {
         assert_eq!(with_empty, unset);
     }
 
+    /// Windows 默认落在 `%LOCALAPPDATA%\FluxAxiom`；拿不到则 `.fluxaxiom`。
     #[cfg(windows)]
     #[test]
     fn windows_default_uses_local_app_data() {
@@ -101,6 +115,7 @@ mod tests {
         assert_eq!(resolve_with(None, env_of(&[])), PathBuf::from(".fluxaxiom"));
     }
 
+    /// Unix：`XDG_DATA_HOME` 优先于 `HOME`，都没有则 `.fluxaxiom`。
     #[cfg(not(windows))]
     #[test]
     fn unix_default_prefers_xdg_then_home() {

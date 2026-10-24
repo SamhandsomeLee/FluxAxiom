@@ -1,7 +1,7 @@
 use fluxaxiom_contract::{
     Artifact, ArtifactCreatedPayload, ArtifactId, AttemptEndedPayload, AttemptId,
-    AttemptStartedPayload, EmptyPayload, Event, EventBody, EventId, ModelCallCompletedPayload,
-    RunId, RunTerminalPayload, ToolCallCompletedPayload, SCHEMA_VERSION,
+    AttemptOrphanedPayload, AttemptStartedPayload, EmptyPayload, Event, EventBody, EventId,
+    ModelCallCompletedPayload, RunId, RunTerminalPayload, ToolCallCompletedPayload, SCHEMA_VERSION,
 };
 use fluxaxiom_engine_api::{BlobRef, EngineObservation};
 use rusqlite::{params, Connection, Transaction};
@@ -237,14 +237,44 @@ pub(crate) fn observation_body(
     }
 }
 
+/// `run.accepted`：Run 刚创建、尚未 drive。
+///
+/// **作用**：供 `create_run` 与状态变更同事务写入。
+/// **边界**：空 payload；不携带密钥或任务原文。
 pub(crate) fn accepted() -> EventBody {
     EventBody::RunAccepted(EmptyPayload {})
 }
 
+/// `run.started`：已进入 `Running`。
+///
+/// **作用**：供 `prepare_drive` 与 Attempt 启动同事务写入。
+/// **边界**：空 payload。
 pub(crate) fn started() -> EventBody {
     EventBody::RunStarted(EmptyPayload {})
 }
 
+/// `run.cancelling`：取消意图已落库。
+///
+/// **作用**：供 `request_cancel` 在 `Running → Cancelling` 时写入（A3b）。
+/// **边界**：空 payload；不表示已经终态。
+pub(crate) fn cancelling() -> EventBody {
+    EventBody::RunCancelling(EmptyPayload {})
+}
+
+/// `attempt.orphaned`：租约过期收尸。
+///
+/// **作用**：供 `orphan_drive` 与 `run.failed(host_restart)` 同事务写入。
+/// **参数**：`attempt_id` 是被标成 `Orphaned` 的那一行。
+/// **边界**：不携带租约时间戳；时间在 Attempt 行上。
+pub(crate) fn attempt_orphaned(attempt_id: AttemptId) -> EventBody {
+    EventBody::AttemptOrphaned(AttemptOrphanedPayload { attempt_id })
+}
+
+/// `attempt.started`：Attempt 进入 `Running`。
+///
+/// **作用**：供 `prepare_drive` 写入 owner 与首次租约截止时间。
+/// **参数**：`owner` 是本进程标识；`lease_expires_at` 为 `now + TTL`。
+/// **边界**：续期只改 Attempt 行，不再发本事件。
 pub(crate) fn attempt_started(
     attempt_id: AttemptId,
     owner: String,
@@ -257,6 +287,11 @@ pub(crate) fn attempt_started(
     })
 }
 
+/// `attempt.ended`：Attempt 离开 `Running` 进入正常终态。
+///
+/// **作用**：供 `finish_drive` 与 Run 终态同事务写入。
+/// **参数**：`outcome` 是 Attempt 契约 outcome，不是 Engine 原始枚举。
+/// **边界**：孤儿收尸走 [`attempt_orphaned`]，不走本函数。
 pub(crate) fn attempt_ended(
     attempt_id: AttemptId,
     outcome: fluxaxiom_contract::AttemptOutcome,
@@ -267,6 +302,11 @@ pub(crate) fn attempt_ended(
     })
 }
 
+/// 按 `TerminalReason` 选出 `run.completed` / `run.cancelled` / `run.failed`。
+///
+/// **作用**：让 Host 只传原因，不必在每个调用点重复 match。
+/// **参数**：`reason` 写入 payload 的 `terminal_reason`。
+/// **边界**：`HostRestart` / `EngineError` / `ProviderError` / `BudgetExhausted` 都映射到 `run.failed`。
 pub(crate) fn terminal(reason: fluxaxiom_contract::TerminalReason) -> EventBody {
     let payload = RunTerminalPayload {
         terminal_reason: reason,
@@ -281,6 +321,11 @@ pub(crate) fn terminal(reason: fluxaxiom_contract::TerminalReason) -> EventBody 
     }
 }
 
+/// `artifact.created`：索引行已写入。
+///
+/// **作用**：供 `finish_drive` 在落 Artifact 后追加。
+/// **参数**：`artifact` 的摘要字段进入 payload；正文仍只在 blob。
+/// **边界**：不打开 `storage_ref` 指向的文件。
 pub(crate) fn artifact_created(artifact: &Artifact) -> EventBody {
     EventBody::ArtifactCreated(ArtifactCreatedPayload {
         artifact_id: artifact.artifact_id.clone(),
@@ -290,6 +335,11 @@ pub(crate) fn artifact_created(artifact: &Artifact) -> EventBody {
     })
 }
 
+/// 观测字段非空校验。
+///
+/// **作用**：把空串收成带字段名的 `Invalid`，供 `observation_body` 使用。
+/// **参数**：`label` 是错误消息里的字段名。
+/// **边界**：只查空串，不查空白字符。
 fn require_text(value: &str, label: &'static str) -> Result<(), HostError> {
     if value.is_empty() {
         Err(HostError::Invalid(label))
@@ -298,10 +348,15 @@ fn require_text(value: &str, label: &'static str) -> Result<(), HostError> {
     }
 }
 
+/// 确认 blob 引用在磁盘上存在。
+///
+/// **作用**：观测里的 `request_ref` / `response_ref` 必须先 `put_blob`。
+/// **边界**：不存在或路径非法时透传 `blob::stored_len` 的错误。
 fn require_stored(root: &std::path::Path, blob_ref: &BlobRef) -> Result<(), HostError> {
     blob::stored_len(root, blob_ref).map(|_| ())
 }
 
+/// events 表一行的原始列，尚未校验契约。
 struct EventRow {
     event_id: String,
     schema_version: String,
@@ -313,6 +368,10 @@ struct EventRow {
     payload: String,
 }
 
+/// 把 SQLite 行收成 [`EventRow`]。
+///
+/// **作用**：供 `load_after` 的 `query_map` 使用。
+/// **边界**：不做契约校验；非法内容留给 [`event_from_raw`]。
 fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
     Ok(EventRow {
         event_id: row.get(0)?,
@@ -326,6 +385,10 @@ fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
     })
 }
 
+/// 把原始行收成契约 `Event`。
+///
+/// **作用**：校验 schema、id、时间戳与 `EventBody` 反序列化，再跑 `invariants_hold`。
+/// **边界**：任一字段不合法返回 `Corrupt`，不尝试修复。
 fn event_from_raw(row: EventRow) -> Result<Event, HostError> {
     if row.schema_version != SCHEMA_VERSION {
         return Err(HostError::Corrupt("schema_version"));

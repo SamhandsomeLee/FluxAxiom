@@ -225,6 +225,11 @@ pub(crate) fn latest_attempt(
     attempt_from_raw(raw)
 }
 
+/// 在同一事务里更新 Run 与 Attempt 行。
+///
+/// **作用**：状态变更、续期、取消、收尸共用；Attempt 的 `lease_expires_at` 一并写入。
+/// **参数**：`run` / `attempt` 是调用方已改好的内存快照，本函数不做转移校验。
+/// **边界**：任一行影响行数不是 1 返回 `NotFound`。不写 durable event。
 pub(crate) fn update_run_and_attempt(
     transaction: &Transaction<'_>,
     run: &Run,
@@ -246,12 +251,13 @@ pub(crate) fn update_run_and_attempt(
     }
     let changed = transaction.execute(
         "UPDATE attempts
-         SET status = ?1, outcome = ?2, error_reason = ?3
-         WHERE attempt_id = ?4",
+         SET status = ?1, outcome = ?2, error_reason = ?3, lease_expires_at = ?4
+         WHERE attempt_id = ?5",
         params![
             encode_attempt_status(attempt.status),
             attempt.outcome.map(encode_attempt_outcome),
             attempt.error_reason,
+            attempt.lease_expires_at.as_str(),
             attempt.attempt_id.as_str(),
         ],
     )?;
@@ -259,6 +265,59 @@ pub(crate) fn update_run_and_attempt(
         return Err(HostError::NotFound);
     }
     Ok(())
+}
+
+/// 列出可能需要收孤儿的 Attempt：所属 Run 为 `Running` / `Cancelling`，Attempt 仍为 `Running`。
+///
+/// **作用**：启动扫描的候选集；调用方再按 `lease_expires_at` 过滤。
+/// **边界**：不在 SQL 里比时间，避免时区/格式分歧；调用方用 [`crate::time::lease_is_expired`]。
+pub(crate) fn list_active_drive_attempts(
+    connection: &Connection,
+) -> Result<Vec<(Run, Attempt)>, HostError> {
+    let mut statement = connection.prepare(
+        "SELECT r.run_id, r.session_id, r.status, r.terminal_reason, r.input_ref, r.workspace_ref,
+                r.max_model_calls, r.max_tool_calls, r.created_at, r.updated_at,
+                a.attempt_id, a.run_id, a.engine_id, a.engine_version, a.owner, a.lease_expires_at,
+                a.status, a.outcome, a.error_reason
+         FROM runs r
+         INNER JOIN attempts a ON a.run_id = r.run_id
+         WHERE r.status IN ('Running', 'Cancelling')
+           AND a.status = 'Running'
+         ORDER BY r.run_id, a.attempt_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            RunRow {
+                run_id: row.get(0)?,
+                session_id: row.get(1)?,
+                status: row.get(2)?,
+                terminal_reason: row.get(3)?,
+                input_ref: row.get(4)?,
+                workspace_ref: row.get(5)?,
+                max_model_calls: row.get(6)?,
+                max_tool_calls: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            },
+            AttemptRow {
+                attempt_id: row.get(10)?,
+                run_id: row.get(11)?,
+                engine_id: row.get(12)?,
+                engine_version: row.get(13)?,
+                owner: row.get(14)?,
+                lease_expires_at: row.get(15)?,
+                status: row.get(16)?,
+                outcome: row.get(17)?,
+                error_reason: row.get(18)?,
+            },
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (run_raw, attempt_raw) = row?;
+        out.push((run_from_raw(run_raw)?, attempt_from_raw(attempt_raw)?));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

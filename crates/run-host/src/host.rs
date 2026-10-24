@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use fluxaxiom_contract::{
     attempt_transition_allowed, run_transition_allowed, Artifact, ArtifactId, Attempt, AttemptId,
@@ -13,21 +15,24 @@ use fluxaxiom_engine_api::{
     FailureReason, HostPort, WorkspaceRoot,
 };
 use rusqlite::Connection;
+use tokio_util::sync::CancellationToken;
 
 use crate::blob;
 use crate::error::{is_constraint_violation, HostError};
 use crate::events;
 use crate::port::DrivePort;
 use crate::store;
-use crate::time::{lease_expires_at, now_utc};
+use crate::time::{lease_expires_at, lease_is_expired, now_utc, LEASE_RENEW_INTERVAL_SECS};
 
 /// 进程内共享的库连接和数据目录。
 ///
 /// **作用**：`RunHost` 与 `DrivePort` 共用同一把锁和同一个 blob 根目录。
 /// **边界**：锁只串行化本进程。跨进程仍靠 SQLite 的 WAL 和 `busy_timeout`。
+/// `active_cancels` 只登记本进程正在 `drive_run` 的令牌，供 `request_cancel` / `orphan_drive` 触发。
 pub(crate) struct Shared {
     pub(crate) conn: Mutex<Connection>,
     pub(crate) root: PathBuf,
+    pub(crate) active_cancels: Mutex<HashMap<String, CancellationToken>>,
     #[cfg(test)]
     fail_prepare: AtomicBool,
     #[cfg(test)]
@@ -62,6 +67,8 @@ pub struct CreatedRun {
 ///
 /// **作用**：进程内用互斥锁串行化同一连接；跨进程靠 WAL 与 `busy_timeout` 等待写锁。
 /// **边界**：写 event 的事务使用 `BEGIN IMMEDIATE`。blob 文件不在这些事务里。
+/// `Clone` 只增加 `Arc` 计数，供 CLI 在 drive 同时监听 Ctrl-C。
+#[derive(Clone)]
 pub struct RunHost {
     shared: Arc<Shared>,
 }
@@ -69,24 +76,125 @@ pub struct RunHost {
 impl RunHost {
     /// 打开或创建 Host 数据目录。
     ///
-    /// **作用**：在目录里建 `host.db`，启用 WAL，跑完迁移，并准备 `blobs/`。
+    /// **作用**：在目录里建 `host.db`，启用 WAL，跑完迁移，并准备 `blobs/`。打开后扫描租约已过期的 drive（A3b）。
     /// **边界**：参数是目录，不是数据库文件。blob 放在 `blobs/ab/cd/<hex>`。
+    /// 取舍：扫描挂在 `open` 上，这样任一 `flux` 子命令（含只读 `status`）都会收尸，符合 §4.8「任何 flux 命令启动时」。
     pub fn open(directory: impl AsRef<Path>) -> Result<Self, HostError> {
         install_host_log();
         let root = directory.as_ref();
         std::fs::create_dir_all(root.join("blobs").join("tmp"))?;
         let mut connection = store::connect(&root.join("host.db"))?;
         store::migrate(&mut connection)?;
-        Ok(Self {
+        let host = Self {
             shared: Arc::new(Shared {
                 conn: Mutex::new(connection),
                 root: root.to_path_buf(),
+                active_cancels: Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 fail_prepare: AtomicBool::new(false),
                 #[cfg(test)]
                 fail_finish: AtomicBool::new(false),
             }),
-        })
+        };
+        // 收尸失败不能让只读命令（如 `status`）也打不开库：记日志，下次 open 再试。
+        if let Err(error) = host.reap_expired_leases() {
+            log::error!("reaping expired leases failed: {error}");
+        }
+        Ok(host)
+    }
+
+    /// CLI 请求取消正在 drive 的 Run。
+    ///
+    /// **作用**：若仍为 `Running`，同事务写入 `Cancelling` 与 `run.cancelling`，并触发本进程登记的取消令牌。
+    /// **参数**：`run_id` 必须已存在；不存在时下层返回 `NotFound`。
+    /// **边界**：`Accepted` 且本进程的 `drive_run` 已登记令牌（正在进入 `Running`）时，只触发令牌：Engine 第一次检查就会交回 `Cancelled`。
+    /// `Accepted` 但没有本进程的 drive 返回 `Invalid`（尚未 drive）。已是 `Cancelling` 或终态时不改库，但仍触发本进程令牌，
+    /// 以便别的 `RunHost` 已收尸后本进程 drive 能从 await 醒来。后到的 cancel 不覆盖先提交的终态。
+    pub fn request_cancel(&self, run_id: &RunId) -> Result<(), HostError> {
+        let mut connection = self.lock()?;
+        let transaction = store::immediate(&mut connection)?;
+        let mut run = store::load_run(&transaction, run_id)?;
+        match run.status {
+            // 仍触发本进程令牌：扫描可能已在别的 `RunHost` 上收尸，本进程 drive 还在 await。
+            RunStatus::Completed
+            | RunStatus::Failed
+            | RunStatus::Cancelled
+            | RunStatus::Cancelling => {
+                drop(transaction);
+                self.trigger_cancel_token(run_id);
+                return Ok(());
+            }
+            RunStatus::Accepted => {
+                drop(transaction);
+                return if self.trigger_cancel_token(run_id) {
+                    Ok(())
+                } else {
+                    Err(HostError::Invalid("run has not started"))
+                };
+            }
+            RunStatus::Running => {}
+        }
+        if !run_transition_allowed(run.status, RunStatus::Cancelling) {
+            return Err(HostError::Invalid("run is not cancellable"));
+        }
+        run.status = RunStatus::Cancelling;
+        run.updated_at = now_utc();
+        let attempt = store::latest_attempt(&transaction, run_id)?;
+        store::update_run_and_attempt(&transaction, &run, &attempt)?;
+        let sequence = events::max_sequence(&transaction, run_id)? + 1;
+        events::record(
+            &transaction,
+            run_id,
+            sequence,
+            run.run_id.as_str(),
+            events::cancelling(),
+        )?;
+        transaction.commit()?;
+        self.trigger_cancel_token(run_id);
+        Ok(())
+    }
+
+    /// 扫描并收尾租约已过期的 `Running` / `Cancelling` drive。
+    ///
+    /// **作用**：对每个过期候选调用 [`Self::orphan_drive`]；返回成功收尸的个数。`RunHost::open` 会调用一次。
+    /// **边界**：只处理 `lease_expires_at <= now` 的 Attempt。未过期的 Running 不动，避免误杀仍在跑的进程。
+    /// 单个 Run 收尸失败只记日志并继续，不中断扫描；只有列候选失败才返回 `Err`。
+    pub fn reap_expired_leases(&self) -> Result<u32, HostError> {
+        let now = now_utc();
+        let candidates = {
+            let connection = self.lock()?;
+            store::list_active_drive_attempts(&connection)?
+        };
+        let mut reaped = 0u32;
+        for (run, attempt) in candidates {
+            if !lease_is_expired(&attempt.lease_expires_at, &now) {
+                continue;
+            }
+            // 一个坏 Run 不能挡住后面的过期 Run：记日志，继续。
+            match self.orphan_drive(&run.run_id) {
+                Ok(true) => reaped += 1,
+                Ok(false) => {}
+                Err(error) => log::error!("orphaning {} failed: {error}", run.run_id.as_str()),
+            }
+        }
+        Ok(reaped)
+    }
+
+    /// 把租约改到过去（集成测试用），便于断言孤儿扫描。
+    ///
+    /// **作用**：供 `tests/interrupt.rs` 构造「租约已过期仍 Running」的局面。
+    /// **参数**：`run_id` 的最新 Attempt 会被写成 `2000-01-01T00:00:00Z`。
+    /// **边界**：不是生产路径；正式续期只经 `drive_run` 内的定时器。
+    pub fn expire_lease_for_test(&self, run_id: &RunId) -> Result<(), HostError> {
+        let mut connection = self.lock()?;
+        let transaction = store::immediate(&mut connection)?;
+        let run = store::load_run(&transaction, run_id)?;
+        let mut attempt = store::latest_attempt(&transaction, run_id)?;
+        attempt.lease_expires_at = fluxaxiom_contract::Timestamp::parse("2000-01-01T00:00:00Z")
+            .map_err(|_| HostError::Corrupt("test timestamp"))?;
+        store::update_run_and_attempt(&transaction, &run, &attempt)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// 由 Host 创建 Session。Engine 看不到这张表。
@@ -249,14 +357,23 @@ impl RunHost {
     /// 经 `HostPort` 跑一次 Engine，再根据 `EngineOutcome` 写入终态。
     ///
     /// **作用**：启动前提交 `run.started` 与 `attempt.started`，结束后把报告、Attempt 和 Run 终态放进同一事务。
+    /// **参数**：`engine` 由 CLI 组装；其 `descriptor` 须与 Attempt 已存身份一致（本阶段 create 时写入）。
     /// **边界**：不持锁越过 `.await`。报告正文先进 blob，事务只写引用和 event。
     /// `prepare_drive` 在进入 `Running` 之前失败时，按 ADR-021 先写成 `Failed(engine_error)`，再返回
     /// `Ok(EngineOutcome::Failed { .. })`，不调用 Engine。
+    /// 取消令牌在 `prepare_drive` **之前**登记，所以 `Running` 提交之后的取消不会落在登记窗口里；同一进程内同一 Run 已有
+    /// drive 时返回 `Invalid`。租约每 [`LEASE_RENEW_INTERVAL_SECS`] 续约一次，**直到 `engine.run` 返回**才停，
+    /// 取消触发不会停掉续期（Engine 收尾可能很慢）。续期任务与令牌登记由 [`DriveGuard`] 托底：panic 或 future 被丢弃都会清理。
+    /// 若收尾时 Run 已是 `Cancelling`，无论 Engine 交回什么都写成 `Cancelled`（先提交的取消意图优先）。
+    /// 若收尾时已是终态（例如扫描写成 `host_restart`），不再用 Engine 结果改写。
     pub async fn drive_run(
         &self,
         run_id: &RunId,
         engine: &dyn EngineAdapter,
     ) -> Result<EngineOutcome, HostError> {
+        let cancel = CancellationToken::new();
+        self.register_cancel(run_id, cancel.clone())?;
+        let mut guard = DriveGuard::new(self.clone(), run_id.clone());
         let prepared = match self.prepare_drive(run_id) {
             Ok(prepared) => prepared,
             Err(PrepareDriveError::UnstartedFailed) => {
@@ -267,12 +384,15 @@ impl RunHost {
             }
             Err(PrepareDriveError::Host(error)) => return Err(error),
         };
+        guard.start_renewal();
         let host: Arc<dyn HostPort> = Arc::new(DrivePort::new(
             Arc::clone(&self.shared),
             run_id.clone(),
             prepared.budget,
+            cancel.clone(),
         ));
         let outcome = engine.run(prepared.request, host).await;
+        drop(guard);
         self.finish_drive(run_id, outcome)
     }
 
@@ -421,13 +541,18 @@ impl RunHost {
     /// 按 `EngineOutcome` 写入终态。
     ///
     /// **作用**：有报告时先把摘要正文写成 blob，再在同一事务写入 Artifact、`artifact.created`、`attempt.ended` 和 Run 终态事件。
-    /// **边界**：状态是否还能收尾，在 `IMMEDIATE` 事务内判断。`artifact_type` 为空时改记 `Failed(engine_error)`，不把 Run 留在 `Running`。没有报告则不写 Artifact。blob 在写锁外落盘，回滚后允许留下孤儿文件。
+    /// **参数**：`outcome` 是 Engine 交回值；若库中已是 `Cancelling`，会先经 [`force_cancelled`] 再落库。
+    /// **边界**：状态是否还能收尾，在 `IMMEDIATE` 事务内判断。`artifact_type` 为空时改记 `Failed(engine_error)`。
+    /// 没有报告则不写 Artifact。blob 在写锁外落盘，回滚后允许留下孤儿文件。
+    /// 若事务内已是终态（例如扫描写成 `host_restart`），不再用 Engine 结果改写，直接返回传入的 `outcome`。
     fn finish_drive(
         &self,
         run_id: &RunId,
         outcome: EngineOutcome,
     ) -> Result<EngineOutcome, HostError> {
-        let outcome = normalize_outcome(outcome);
+        let mut outcome = normalize_outcome(outcome);
+        // `force_cancelled` 只把 Completed 的报告降为 partial，草稿内容不变，所以 blob 可以先写；
+        // 是否 Cancelling 只在事务内判断一次。
         let draft = report_draft(&outcome).cloned();
         let stored = draft
             .as_ref()
@@ -438,6 +563,17 @@ impl RunHost {
         let transaction = store::immediate(&mut connection)?;
         let mut run = store::load_run(&transaction, run_id)?;
         let mut attempt = store::latest_attempt(&transaction, run_id)?;
+        // 扫描已把 Run 收成终态（如 host_restart）时，不再用 Engine 结果改写。
+        if matches!(
+            run.status,
+            RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+        ) {
+            transaction.commit()?;
+            return Ok(outcome);
+        }
+        if run.status == RunStatus::Cancelling {
+            outcome = force_cancelled(outcome);
+        }
         apply_outcome(&mut run, &mut attempt, &outcome)?;
         store::update_run_and_attempt(&transaction, &run, &attempt)?;
         let mut sequence = events::max_sequence(&transaction, run_id)? + 1;
@@ -485,6 +621,136 @@ impl RunHost {
         Ok(outcome)
     }
 
+    /// 登记本进程 drive 的取消令牌。
+    ///
+    /// **作用**：让同进程上的 [`Self::request_cancel`] / [`Self::orphan_drive`] 能叫醒 Engine。
+    /// **参数**：`token` 与交给 `DrivePort` 的是同一把。
+    /// **边界**：同 `run_id` 已有登记（本进程另一个 drive 在跑）返回 `Invalid`，不覆盖。锁毒化返回 `Poisoned`。
+    fn register_cancel(&self, run_id: &RunId, token: CancellationToken) -> Result<(), HostError> {
+        let mut map = self
+            .shared
+            .active_cancels
+            .lock()
+            .map_err(|_| HostError::Poisoned)?;
+        match map.entry(run_id.as_str().to_owned()) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                Err(HostError::Invalid("run is already being driven"))
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(token);
+                Ok(())
+            }
+        }
+    }
+
+    /// 去掉登记，避免误触已结束的 drive。
+    ///
+    /// **作用**：[`DriveGuard`] 析构时调用，防止迟到的 `request_cancel` 点到已复用的令牌槽。
+    /// **边界**：锁毒化或键不存在时无操作。
+    fn unregister_cancel(&self, run_id: &RunId) {
+        if let Ok(mut map) = self.shared.active_cancels.lock() {
+            map.remove(run_id.as_str());
+        }
+    }
+
+    /// 触发已登记的取消令牌。
+    ///
+    /// **作用**：打断本进程正在 `await` 的 Engine。由 `request_cancel` 与 `orphan_drive` 调用。
+    /// **边界**：本 `RunHost` 未登记该 `run_id` 时无操作并返回 `false`（跨进程只改库，令牌在原进程的 map 里）。
+    fn trigger_cancel_token(&self, run_id: &RunId) -> bool {
+        let Ok(map) = self.shared.active_cancels.lock() else {
+            return false;
+        };
+        match map.get(run_id.as_str()) {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 把最新 Attempt 的租约延长到 `now + TTL`。
+    ///
+    /// **作用**：`drive_run` 内定时任务每 [`LEASE_RENEW_INTERVAL_SECS`] 调用，防止扫描误杀仍在跑的 Attempt。
+    /// **边界**：仅当 Run 为 `Running` 或 `Cancelling` 且 Attempt 为 `Running` 时续期。其它状态返回 `Invalid`，调用方应停止续期循环。
+    fn renew_lease(&self, run_id: &RunId) -> Result<(), HostError> {
+        let mut connection = self.lock()?;
+        let transaction = store::immediate(&mut connection)?;
+        let run = store::load_run(&transaction, run_id)?;
+        let mut attempt = store::latest_attempt(&transaction, run_id)?;
+        if !matches!(run.status, RunStatus::Running | RunStatus::Cancelling)
+            || attempt.status != AttemptStatus::Running
+        {
+            return Err(HostError::Invalid("run is not renewable"));
+        }
+        attempt.lease_expires_at = lease_expires_at();
+        store::update_run_and_attempt(&transaction, &run, &attempt)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// 租约过期：Attempt `Orphaned`，Run `Failed(host_restart)`。
+    ///
+    /// **作用**：由 [`Self::reap_expired_leases`] 调用；同事务写 `attempt.orphaned` 与 `run.failed`。
+    /// **参数**：`run_id` 应对应仍非终态、Attempt 仍为 `Running` 的 drive。
+    /// **边界**：返回 `Ok(true)` 表示本次确实收了尸。候选列表是事务外的旧快照，所以在 `IMMEDIATE` 事务里重新读 Attempt：
+    /// 已终态、Attempt 不再是 `Running`、或租约已被续期（不再过期）都返回 `Ok(false)` 且不改库，避免误杀刚续期的活进程。
+    /// 成功后触发本进程取消令牌，避免仍在 await 的 `drive_run` 挂死。
+    fn orphan_drive(&self, run_id: &RunId) -> Result<bool, HostError> {
+        let mut connection = self.lock()?;
+        let transaction = store::immediate(&mut connection)?;
+        let mut run = store::load_run(&transaction, run_id)?;
+        let mut attempt = store::latest_attempt(&transaction, run_id)?;
+        if matches!(
+            run.status,
+            RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+        ) || attempt.status != AttemptStatus::Running
+            || !lease_is_expired(&attempt.lease_expires_at, &now_utc())
+        {
+            return Ok(false);
+        }
+        if !run_transition_allowed(run.status, RunStatus::Failed)
+            || !attempt_transition_allowed(attempt.status, AttemptStatus::Orphaned)
+        {
+            return Err(HostError::Invalid("run is not orphanable"));
+        }
+        run.status = RunStatus::Failed;
+        run.terminal_reason = Some(TerminalReason::HostRestart);
+        run.updated_at = now_utc();
+        attempt.status = AttemptStatus::Orphaned;
+        attempt.outcome = None;
+        attempt.error_reason = Some("host_restart".to_owned());
+        if !run.invariants_hold() || !attempt.invariants_hold() {
+            return Err(HostError::Invalid("orphan records violate invariants"));
+        }
+        store::update_run_and_attempt(&transaction, &run, &attempt)?;
+        let mut sequence = events::max_sequence(&transaction, run_id)? + 1;
+        events::record(
+            &transaction,
+            run_id,
+            sequence,
+            attempt.attempt_id.as_str(),
+            events::attempt_orphaned(attempt.attempt_id.clone()),
+        )?;
+        sequence += 1;
+        events::record(
+            &transaction,
+            run_id,
+            sequence,
+            run.run_id.as_str(),
+            events::terminal(TerminalReason::HostRestart),
+        )?;
+        transaction.commit()?;
+        // 本进程若仍在 drive，解开 Engine 的等待，避免挂死。
+        self.trigger_cancel_token(run_id);
+        Ok(true)
+    }
+
+    /// 取出并清除「下次 prepare 在 COMMIT 前失败」测试开关。
+    ///
+    /// **作用**：仅测试构建有效；生产恒为 `false`。
+    /// **边界**：一次消费；并发调用不保证顺序。
     fn take_fail_prepare(&self) -> bool {
         #[cfg(test)]
         {
@@ -496,6 +762,10 @@ impl RunHost {
         }
     }
 
+    /// 取出并清除「下次 finish 在 COMMIT 前失败」测试开关。
+    ///
+    /// **作用**：仅测试构建有效；生产恒为 `false`。
+    /// **边界**：一次消费；并发调用不保证顺序。
     fn take_fail_finish(&self) -> bool {
         #[cfg(test)]
         {
@@ -507,6 +777,10 @@ impl RunHost {
         }
     }
 
+    /// 取得本进程 SQLite 连接的互斥锁。
+    ///
+    /// **作用**：所有同步读库/写库入口共用这一把锁。
+    /// **边界**：锁毒化返回 `Poisoned`。不跨 `.await` 持有。
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, HostError> {
         self.shared.conn.lock().map_err(|_| HostError::Poisoned)
     }
@@ -540,6 +814,77 @@ fn read_task_text(root: &Path, input_ref: &str) -> Result<String, HostError> {
     String::from_utf8(bytes).map_err(|_| HostError::Corrupt("input blob"))
 }
 
+/// 一次 `drive_run` 的清理托底。
+///
+/// **作用**：持有租约续期任务，并在析构时停掉续期、撤销取消令牌登记。正常结束、`prepare_drive` 失败、Engine panic、
+/// `drive_run` 的 future 被丢弃都走同一条清理路径，不会留下继续续期的游离任务。
+/// **边界**：续期用自己的停止令牌，**不**跟 Engine 的取消令牌联动：取消只是让 Engine 收尾，Run 仍需要租约直到 `engine.run` 返回。
+struct DriveGuard {
+    host: RunHost,
+    run_id: RunId,
+    renew_stop: CancellationToken,
+    renew_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl DriveGuard {
+    /// **作用**：登记完取消令牌后立刻建 guard，保证之后任何早退都会撤销登记。
+    fn new(host: RunHost, run_id: RunId) -> Self {
+        Self {
+            host,
+            run_id,
+            renew_stop: CancellationToken::new(),
+            renew_task: None,
+        }
+    }
+
+    /// 开始每 [`LEASE_RENEW_INTERVAL_SECS`] 续期一次。
+    ///
+    /// **边界**：只在 Run 进入 `Running` 之后调用。数据库调用放进 `spawn_blocking`，不占住异步 worker。
+    /// 续期报 `Invalid`（Run 已终态或被收尸）才停；其它错误（如 SQLite busy）记日志，下个周期再试。
+    fn start_renewal(&mut self) {
+        let host = self.host.clone();
+        let run_id = self.run_id.clone();
+        let stop = self.renew_stop.clone();
+        self.renew_task = Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(LEASE_RENEW_INTERVAL_SECS));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // `interval` 的第一次 tick 立即触发；租约刚写过，跳过它。
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    biased;
+                    () = stop.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let (host, run_id) = (host.clone(), run_id.clone());
+                        match tokio::task::spawn_blocking(move || host.renew_lease(&run_id)).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(HostError::Invalid(reason))) => {
+                                log::error!("lease renewal stopped: {reason}");
+                                break;
+                            }
+                            Ok(Err(error)) => log::error!("lease renewal failed: {error}"),
+                            Err(error) => {
+                                log::error!("lease renewal task failed: {error}");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+    }
+}
+
+impl Drop for DriveGuard {
+    fn drop(&mut self) {
+        self.renew_stop.cancel();
+        if let Some(task) = self.renew_task.take() {
+            task.abort();
+        }
+        self.host.unregister_cancel(&self.run_id);
+    }
+}
+
 /// `prepare_drive` 交给 `drive_run` 的任务与预算上限。
 ///
 /// **作用**：一次打开工作区并进入 `Running` 后，把 `EngineRunRequest` 与本次 drive 的预算上限一起交出。
@@ -561,7 +906,8 @@ enum PrepareDriveError {
 /// 空的产物类型不能收成成功。
 ///
 /// **作用**：把这种 Engine 返回改写成 `Failed(engine_error)`，让 Run 离开 `Running`。
-/// **边界**：不保留那份空类型草稿，因此也不会写 Artifact。
+/// **参数**：`outcome` 是 Engine 交回值；仅当草稿 `artifact_type` 为空时改写。
+/// **边界**：不保留那份空类型草稿，因此也不会写 Artifact。其它失败/取消原样返回。
 fn normalize_outcome(outcome: EngineOutcome) -> EngineOutcome {
     if report_draft(&outcome).is_some_and(|draft| draft.artifact_type.is_empty()) {
         EngineOutcome::Failed {
@@ -573,20 +919,38 @@ fn normalize_outcome(outcome: EngineOutcome) -> EngineOutcome {
     }
 }
 
+/// 取消已受理时，把任意 Engine 结果收成 `Cancelled`。
+///
+/// **作用**：先提交的 `Cancelling` 优先于随后到达的 Completed/Failed；由 [`RunHost::finish_drive`] 调用。
+/// **参数**：`outcome` 是 Engine 原始或已经 `normalize_outcome` 过的值。
+/// **边界**：`Completed` 的报告降为 partial；已有 partial 保留。不发明新的失败原因。
+fn force_cancelled(outcome: EngineOutcome) -> EngineOutcome {
+    let partial = match outcome {
+        EngineOutcome::Completed { report } => Some(report),
+        EngineOutcome::Failed { partial, .. } | EngineOutcome::Cancelled { partial } => partial,
+    };
+    EngineOutcome::Cancelled { partial }
+}
+
 /// 本进程还没有日志后端时，把 `fluxaxiom_run_host` 的错误写到 stderr。
 struct HostLogger;
 
 impl log::Log for HostLogger {
+    /// **作用**：只接受本 crate 的 Error 级记录。
+    /// **边界**：不放开其它 target，避免抢走应用已安装的全局后端。
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
         metadata.level() <= log::Level::Error && metadata.target().starts_with("fluxaxiom_run_host")
     }
 
+    /// **作用**：把已启用的记录打到 stderr，前缀 `fluxaxiom-run-host:`。
+    /// **边界**：不打印密钥或 blob 路径以外的业务正文；本实现只转发 `record.args()`。
     fn log(&self, record: &log::Record<'_>) {
         if self.enabled(record.metadata()) {
             eprintln!("fluxaxiom-run-host: {}", record.args());
         }
     }
 
+    /// **作用**：满足 `log::Log`；stderr 无需额外 flush。
     fn flush(&self) {}
 }
 
@@ -746,11 +1110,13 @@ fn apply_outcome(
 
 #[cfg(test)]
 impl RunHost {
+    /// 读当前 `journal_mode` pragma，供打开库后的断言。
     pub(crate) fn journal_mode(&self) -> Result<String, HostError> {
         let connection = self.lock()?;
         store::journal_mode(&connection)
     }
 
+    /// 读当前 `busy_timeout`（毫秒），供打开库后的断言。
     pub(crate) fn busy_timeout_ms(&self) -> Result<i64, HostError> {
         let connection = self.lock()?;
         store::busy_timeout_ms(&connection)
@@ -759,17 +1125,31 @@ impl RunHost {
 
 #[cfg(test)]
 impl RunHost {
+    /// 下次 `prepare_drive` 的 COMMIT 前回滚并返回 `Aborted`。
+    ///
+    /// **作用**：单测原子性；一次生效，经 [`Self::take_fail_prepare`] 消费。
     fn fail_next_prepare_commit(&self) {
         self.shared.fail_prepare.store(true, Ordering::SeqCst);
     }
 
+    /// 下次 `finish_drive` 的 COMMIT 前回滚并返回 `Aborted`。
+    ///
+    /// **作用**：单测原子性；一次生效，经 [`Self::take_fail_finish`] 消费。
     fn fail_next_finish_commit(&self) {
         self.shared.fail_finish.store(true, Ordering::SeqCst);
     }
 
     /// 测试用：在不经过 `prepare_drive` 时构造端口，用来验证非 `Running` 的 `reserve`。
+    ///
+    /// **参数**：`budget` 写入内存计数上限；取消令牌是孤立的新令牌，不登记进 `active_cancels`。
+    /// **边界**：不改库状态；调用方须自行保证 `run_id` 已存在。
     pub(crate) fn drive_port_for_test(&self, run_id: &RunId, budget: Budget) -> DrivePort {
-        DrivePort::new(Arc::clone(&self.shared), run_id.clone(), budget)
+        DrivePort::new(
+            Arc::clone(&self.shared),
+            run_id.clone(),
+            budget,
+            CancellationToken::new(),
+        )
     }
 }
 
@@ -928,6 +1308,30 @@ mod tests {
             host.get_run(&created.run.run_id).unwrap().status,
             RunStatus::Accepted
         );
+    }
+
+    /// 收尸前在事务内重查租约：候选快照过期、但已被续期的 Run 不能被收成孤儿。
+    ///
+    /// **边界**：直接调 `orphan_drive`，模拟「列候选时过期、拿到写锁前被续期」的旧快照。
+    #[test]
+    fn orphan_drive_skips_a_lease_renewed_after_the_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        let host = RunHost::open(path).unwrap();
+        let created = host
+            .create_run(sample_request("req_orphan_recheck", path))
+            .unwrap();
+        let run_id = created.run.run_id.clone();
+        assert!(host.prepare_drive(&run_id).is_ok());
+
+        assert!(!host.orphan_drive(&run_id).unwrap());
+        assert_eq!(host.get_run(&run_id).unwrap().status, RunStatus::Running);
+
+        host.expire_lease_for_test(&run_id).unwrap();
+        assert!(host.orphan_drive(&run_id).unwrap());
+        assert_eq!(host.get_run(&run_id).unwrap().status, RunStatus::Failed);
+        // 已终态：再收一次是空操作。
+        assert!(!host.orphan_drive(&run_id).unwrap());
     }
 
     /// 测试用创建参数。`parent` 下会建可 `open` 的 `authorized/` 目录。

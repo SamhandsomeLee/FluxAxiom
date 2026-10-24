@@ -27,7 +27,8 @@ struct Remaining {
 /// 一次 `drive_run` 交给 Engine 的 [`HostPort`]。
 ///
 /// **作用**：Engine 只能经这里提交 blob、观测和预算预留。`run_id` 与剩余额度在构造时固定。
-/// **边界**：不写 `run.*` / `attempt.*`。观测在 Run 不是 `Running` 时返回 `Invalid`。
+/// **边界**：不写 `run.*` / `attempt.*`。观测在 Run 不是 `Running` / `Cancelling` 时返回 `Invalid`；`reserve` 只在 `Running` 发 lease，
+/// 取消后的 Engine 不该再开新调用（`finish_drive` 无论 Engine 交回什么都会把 `Cancelling` 的 Run 收成 `Cancelled`）。
 /// `reserve` 只在本次 drive 的内存里计数。`propose_effect` / `request_input` 仍不支持。
 pub(crate) struct DrivePort {
     shared: Arc<Shared>,
@@ -37,15 +38,21 @@ pub(crate) struct DrivePort {
 }
 
 impl DrivePort {
-    /// 用本次 drive 的 Run 预算上限构造端口。
+    /// 用本次 drive 的 Run 预算上限与取消令牌构造端口。
     ///
-    /// **参数**：`budget` 是 `prepare_drive` 时读到的 `Run.budget`。剩余额度初始化为这两个上限。
+    /// **作用**：把 Host 共享状态收成 Engine 可见的 `HostPort`；仅由 `drive_run` 调用。
+    /// **参数**：`budget` 是 `prepare_drive` 时读到的 `Run.budget`。`cancel` 与 `RunHost` 登记的是同一把，供 CLI `request_cancel` 触发。
     /// **边界**：已用量不入库。同一次 `drive_run` 共用这一把计数器；下一次 drive 会新建端口。
-    pub(crate) fn new(shared: Arc<Shared>, run_id: RunId, budget: Budget) -> Self {
+    pub(crate) fn new(
+        shared: Arc<Shared>,
+        run_id: RunId,
+        budget: Budget,
+        cancel: CancellationToken,
+    ) -> Self {
         Self {
             shared,
             run_id,
-            cancel: CancellationToken::new(),
+            cancel,
             remaining: Mutex::new(Remaining {
                 model_calls: budget.max_model_calls,
                 tool_calls: budget.max_tool_calls,
@@ -108,7 +115,7 @@ impl HostPort for DrivePort {
     }
 
     /// **作用**：把这次 drive 的取消令牌交给 Engine，供它在 await 点观察。
-    /// **边界**：令牌只属于这一次 drive。A1.2 没有 Ctrl-C，不会被 cancel。
+    /// **边界**：令牌只属于这一次 drive。由 CLI 经 `RunHost::request_cancel` 触发（A3b）。
     fn cancellation(&self) -> CancellationToken {
         self.cancel.clone()
     }
@@ -128,8 +135,10 @@ impl HostPort for DrivePort {
 
 /// 把一次观测写成 durable event。
 ///
-/// **作用**：在 Run 与 Attempt 都处于 `Running` 时，用当前 Attempt 做 `subject_id` 写入一条模型或工具事件。
+/// **作用**：在 Run 为 `Running` 或 `Cancelling`、Attempt 为 `Running` 时，用当前 Attempt 做 `subject_id` 写入一条模型或工具事件。
 /// **边界**：先校验再开 `BEGIN IMMEDIATE`。校验失败不写行。返回 `Ok` 时事务已提交。不发 `run.*` / `attempt.*`。
+/// `Cancelling` 也接受：被 Ctrl-C 打断的那次调用已经花了钱，Engine 收尾时提交的 `model.call_completed` / `tool.call_completed`
+/// 带着用量，丢掉会让已取消 Run 的事件日志和用量记账不完整。
 pub(crate) fn observe_durable(
     shared: &Shared,
     run_id: &RunId,
@@ -140,7 +149,9 @@ pub(crate) fn observe_durable(
     let transaction = store::immediate(&mut connection)?;
     let run = store::load_run(&transaction, run_id)?;
     let attempt = store::latest_attempt(&transaction, run_id)?;
-    if run.status != RunStatus::Running || attempt.status != AttemptStatus::Running {
+    if !matches!(run.status, RunStatus::Running | RunStatus::Cancelling)
+        || attempt.status != AttemptStatus::Running
+    {
         return Err(HostError::Invalid("run is not running"));
     }
     let sequence = events::max_sequence(&transaction, run_id)? + 1;

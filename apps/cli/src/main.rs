@@ -1,7 +1,8 @@
 //! FluxAxiom CLI：组合根。
 //!
 //! **作用**：组装 `RunHost` 与 `EngineA`，提供 `run` / `status` / `events` / `artifacts`。
-//! **边界**：A3a 不做 Ctrl-C → Host 取消、不做租约扫描（ADR-021 / A3b）。默认 Fake Engine；`--engine deepseek` 读 `DEEPSEEK_API_KEY`。
+//! **边界**：`run` 内监听 Ctrl-C 并调用 `request_cancel`；第二次 Ctrl-C 强退（§4.8 / A3b）。
+//! 租约扫描在 `RunHost::open`。默认 Fake Engine；`--engine deepseek` 读 `DEEPSEEK_API_KEY`。
 
 mod data_dir;
 
@@ -19,7 +20,7 @@ use fluxaxiom_engine_custom::{
 };
 use fluxaxiom_run_host::{CreateRun, HostError, RunHost};
 
-/// FluxAxiom 只读仓库分析 CLI（P0a / A3a）。
+/// FluxAxiom 只读仓库分析 CLI（P0a / A3）。
 #[derive(Debug, Parser)]
 #[command(
     name = "flux",
@@ -100,6 +101,7 @@ async fn main() {
 
 /// 解析参数并分派子命令。
 ///
+/// **作用**：`main` 的唯一业务入口；把 clap 结果交给各 `cmd_*`。
 /// **边界**：错误已经格式化成用户可见字符串；不把密钥写进消息。
 async fn run() -> Result<(), String> {
     match Cli::parse().command {
@@ -138,7 +140,7 @@ async fn run() -> Result<(), String> {
 ///
 /// **参数**：`engine` 为 `Fake` 时不读密钥；`Deepseek` 缺密钥则失败。
 /// **边界**：Engine 在碰数据目录之前构造，缺密钥不会留下 Accepted 的孤儿 Run。同一进程内再开一个 `RunHost` 只读轮询事件（WAL）。
-/// 不做 Host 侧 Ctrl-C 取消。Run 没有以 `Completed` 结束时进程以非零码退出，stdout 的状态行照常打印。
+/// Ctrl-C 由本命令监听并调用 `request_cancel`（A3b）；第二次 Ctrl-C 直接退出。未以 `Completed` 结束时进程非零退出。
 /// 复用已有 `request_id` 且 Run 未终态时继续驱动它：库里的工作区、任务和预算不变，只有 `--engine` 采用本次的。
 async fn cmd_run(
     workspace: PathBuf,
@@ -183,7 +185,8 @@ async fn cmd_run(
     }
     if existing {
         eprintln!(
-            "flux: request_id {request_id} already exists; continuing the stored run              (its workspace, prompt and budget are kept)"
+            "flux: request_id {request_id} already exists; continuing the stored run \
+             (its workspace, prompt and budget are kept)"
         );
     }
 
@@ -202,14 +205,36 @@ async fn cmd_run(
         }
     });
 
+    let cancel_host = host.clone();
+    let cancel_id = run_id.clone();
+    let interrupt = tokio::spawn(async move {
+        // 接线在 CLI：第一次 Ctrl-C → request_cancel；第二次强制退出（§4.8）。
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        eprintln!("flux: interrupt requested; cancelling run");
+        // `request_cancel` 会在 SQLite 写锁上阻塞等待，放进阻塞线程，别占住异步 worker。
+        match tokio::task::spawn_blocking(move || cancel_host.request_cancel(&cancel_id)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("flux: cancel failed: {error}"),
+            Err(error) => eprintln!("flux: cancel failed: {error}"),
+        }
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("flux: second interrupt; exiting");
+            std::process::exit(130);
+        }
+    });
+
     let outcome = match host.drive_run(&run_id, engine.as_ref()).await {
         Ok(outcome) => outcome,
         Err(error) => {
             // Run 没有走到终态时轮询永远不会结束，必须停掉。
             progress.abort();
+            interrupt.abort();
             return Err(host_err(error));
         }
     };
+    interrupt.abort();
     let _ = progress.await;
 
     let snapshot = host.snapshot(&run_id).map_err(host_err)?;
@@ -223,6 +248,8 @@ async fn cmd_run(
 
 /// 构造本次使用的 Engine 与要写进 Attempt 的身份。
 ///
+/// **作用**：在创建 Run 之前选定实现，避免缺密钥留下 Accepted 孤儿。
+/// **参数**：`kind` 来自 `--engine`；`Fake` 不碰网络。
 /// **边界**：`Deepseek` 在这里读 `DEEPSEEK_API_KEY`，所以缺密钥发生在任何落库之前。
 fn build_engine(kind: EngineKind) -> Result<(EngineDescriptor, Box<dyn EngineAdapter>), String> {
     match kind {
@@ -249,6 +276,10 @@ fn build_engine(kind: EngineKind) -> Result<(EngineDescriptor, Box<dyn EngineAda
 }
 
 /// 只有 `Completed` 算成功；其余终态让进程以非零码退出。
+///
+/// **作用**：把 Host 终态收成 CLI 退出码约定。
+/// **参数**：`terminal_reason` 仅用于错误消息。
+/// **边界**：`Cancelled` / `Failed` 一律非零；不区分取消与失败码。
 fn require_completed(
     status: RunStatus,
     terminal_reason: impl std::fmt::Debug,
@@ -261,6 +292,9 @@ fn require_completed(
 }
 
 /// `flux status`：打印快照关键字段。
+///
+/// **作用**：只读查询；`open` 仍会扫过期租约。
+/// **边界**：不驱动 Engine；找不到 Run 时返回 Host 错误字符串。
 fn cmd_status(run_id: String, data_dir: Option<PathBuf>) -> Result<(), String> {
     let host = open_host(data_dir)?;
     let id = parse_run_id(&run_id)?;
@@ -289,6 +323,10 @@ fn cmd_status(run_id: String, data_dir: Option<PathBuf>) -> Result<(), String> {
 }
 
 /// `flux events`：打印事件；可选跟随直到终态。
+///
+/// **作用**：补读或跟随 durable event；`--follow` 复用 `print_events_until_terminal`。
+/// **参数**：`after_sequence` 是开区间下界；`0` 表示从头。
+/// **边界**：先 `snapshot` 确认 Run 存在，避免空列表与「找错目录」混淆。
 async fn cmd_events(
     run_id: String,
     after_sequence: u64,
@@ -311,6 +349,9 @@ async fn cmd_events(
 }
 
 /// `flux artifacts`：打印 Artifact 索引行。
+///
+/// **作用**：列出类型、`storage_ref` 与短摘要；不打开 blob 正文。
+/// **边界**：无产物时打印 `(no artifacts)` 并以零退出。
 fn cmd_artifacts(run_id: String, data_dir: Option<PathBuf>) -> Result<(), String> {
     let host = open_host(data_dir)?;
     let id = parse_run_id(&run_id)?;
@@ -355,7 +396,10 @@ async fn print_events_until_terminal(
     }
 }
 
-/// 一行事件摘要。不打印 payload 里的引用原文以外的敏感大段。
+/// 一行事件摘要。
+///
+/// **作用**：`run` 进度与 `events` 共用的 stdout 格式。
+/// **边界**：只打印序号、类型名与 `subject_id`；不打印 payload 里的引用或正文。
 fn print_event(event: &Event) {
     let kind = event_kind(&event.body);
     println!(
@@ -364,6 +408,10 @@ fn print_event(event: &Event) {
     );
 }
 
+/// 把契约 `EventBody` 收成稳定类型名字符串。
+///
+/// **作用**：供 `print_event` 展示；与 schema 的 `event_type` 一致。
+/// **边界**：穷尽匹配；新增变体时必须改这里。
 fn event_kind(body: &EventBody) -> &'static str {
     match body {
         EventBody::RunAccepted(_) => "run.accepted",
@@ -381,6 +429,10 @@ fn event_kind(body: &EventBody) -> &'static str {
     }
 }
 
+/// Run 是否已离开可驱动状态。
+///
+/// **作用**：`print_events_until_terminal` 的停止条件。
+/// **边界**：`Cancelling` 不算终态，继续轮询。
 fn is_terminal(status: RunStatus) -> bool {
     matches!(
         status,
@@ -388,18 +440,32 @@ fn is_terminal(status: RunStatus) -> bool {
     )
 }
 
+/// 解析数据目录并打开 Host。
+///
+/// **作用**：各子命令共用的入口；内部会 `reap_expired_leases`。
+/// **参数**：`data_dir` 为 `--data-dir`；`None` 走环境变量与平台默认。
 fn open_host(data_dir: Option<PathBuf>) -> Result<RunHost, String> {
     RunHost::open(data_dir::resolve(data_dir)).map_err(host_err)
 }
 
+/// 把 CLI 字符串收成契约 `RunId`。
+///
+/// **边界**：非法格式返回用户可见错误，不暴露解析细节。
 fn parse_run_id(value: &str) -> Result<RunId, String> {
     RunId::parse(value).map_err(|_| format!("invalid run id: {value}"))
 }
 
+/// 把 `HostError` 收成 CLI 错误字符串。
+///
+/// **边界**：依赖 `Display`；不附加堆栈。
 fn host_err(error: HostError) -> String {
     error.to_string()
 }
 
+/// 把多行摘要压成单行并截断，避免刷屏。
+///
+/// **参数**：`text` 通常是 Artifact `summary`。
+/// **边界**：最多 120 字符；换行换成空格。
 fn one_line(text: &str) -> String {
     text.chars()
         .map(|ch| if ch == '\n' || ch == '\r' { ' ' } else { ch })
@@ -408,6 +474,9 @@ fn one_line(text: &str) -> String {
 }
 
 /// 生成本地幂等键。不是契约 ID。
+///
+/// **作用**：用户省略 `--request-id` 时填 `CreateRun.request_id`。
+/// **边界**：含毫秒与 pid，不保证全局唯一，只降低本机碰撞。
 fn new_request_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let millis = SystemTime::now()
