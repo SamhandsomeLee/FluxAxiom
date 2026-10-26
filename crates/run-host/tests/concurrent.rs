@@ -139,6 +139,7 @@ impl fluxaxiom_engine_api::EngineAdapter for RaceEngine {
             .put_blob(bytes::Bytes::from_static(b"race"), "text/plain")
             .expect("blob");
         host.observe(fluxaxiom_engine_api::EngineObservation::ToolCall {
+            tool_call_id: "call_test".to_owned(),
             tool_name: "read_file".to_owned(),
             normalized_path_or_query: "src/lib.rs".to_owned(),
             result_ref: stored,

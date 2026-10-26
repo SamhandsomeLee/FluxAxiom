@@ -58,13 +58,22 @@ fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
         .stderr(std::process::Stdio::null());
     let mut child = command.spawn().ok()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(GIT_TIMEOUT_SECS);
+    // 一边等待进程一边排空 stdout，避免 status 输出写满管道后相互等待。
+    let mut stdout = child.stdout.take()?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut text = String::new();
+        let result = stdout.read_to_string(&mut text).map(|_| text);
+        let _ = sender.send(result);
+    });
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
-                let mut stdout = String::new();
-                use std::io::Read;
-                child.stdout.take()?.read_to_string(&mut stdout).ok()?;
-                return Some(stdout);
+                return receiver
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .ok()?
+                    .ok();
             }
             Ok(Some(_)) => return None,
             Ok(None) if std::time::Instant::now() >= deadline => {
@@ -73,7 +82,11 @@ fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
                 return None;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(_) => return None,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
     }
 }
@@ -175,5 +188,30 @@ mod tests {
     fn non_git_is_unknown() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(collect(dir.path()), WorkspaceRevision::Unknown);
+    }
+
+    /// 大量脏文件的 status 输出超过管道容量时仍能采集，不会误触发五秒超时。
+    #[test]
+    fn large_status_output_does_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init"]);
+        fs::write(root.join("seed"), "seed").unwrap();
+        git(root, &["add", "seed"]);
+        git(root, &["commit", "-m", "init"]);
+        for index in 0..1500 {
+            fs::write(
+                root.join(format!("file-{index:04}-{}", "x".repeat(80))),
+                "x",
+            )
+            .unwrap();
+        }
+        let output = git_stdout(root, &["status", "--porcelain", "--", "."])
+            .expect("stdout must be drained while git runs");
+        assert!(output.len() > 128 * 1024);
+        assert!(matches!(
+            collect(root),
+            WorkspaceRevision::Git { dirty: true, .. }
+        ));
     }
 }

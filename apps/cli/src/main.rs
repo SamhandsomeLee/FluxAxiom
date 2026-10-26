@@ -19,8 +19,8 @@ use fluxaxiom_contract::{
 use fluxaxiom_engine_api::{EngineAdapter, EngineDescriptor};
 use fluxaxiom_engine_custom::{
     format_rebuild_line, lookup_doc_version, verify_rebuild, DeepSeekClient, EngineA, FakeChat,
-    FakeStep, FinishReason, RebuildCall, RecordingBackoff, ScriptedTurn, SleepBackoff, ToolCall,
-    API_KEY_ENV,
+    FakeStep, FinishReason, RebuildCall, RebuildTool, RecordingBackoff, ScriptedTurn, SleepBackoff,
+    ToolCall, API_KEY_ENV,
 };
 use fluxaxiom_run_host::{format_trace, CreateRun, HostError, RunHost, RunTrace};
 use serde_json::Value;
@@ -144,6 +144,7 @@ enum SampleCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CliFeedbackVerdict {
     Usable,
+    #[value(name = "needs_edit", alias = "needs-edit")]
     NeedsEdit,
     Redo,
 }
@@ -712,13 +713,13 @@ fn print_round_blob(
 /// 把 JSON 文本里的 `reasoning_content` 字符串值换成长度占位。
 ///
 /// **作用**：`flux trace --show-request` 默认路径，避免把思维链打到终端。
-/// **边界**：解析失败时原样返回（并仍不含单独提取逻辑）。非对象根也原样返回。
+/// **边界**：解析失败时显示 unavailable，不回退到可能含思维链的原文。
 fn redact_reasoning(text: &str) -> String {
     let Ok(mut value) = serde_json::from_str::<Value>(text) else {
-        return text.to_owned();
+        return "unavailable (invalid JSON)".to_owned();
     };
     redact_reasoning_in_value(&mut value);
-    serde_json::to_string_pretty(&value).unwrap_or_else(|_| text.to_owned())
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "unavailable (invalid JSON)".to_owned())
 }
 
 fn redact_reasoning_in_value(value: &mut Value) {
@@ -820,6 +821,11 @@ fn rebuild_from_trace(host: &RunHost, trace: &RunTrace) -> RebuildResult {
     let mut calls = Vec::new();
     for round in &trace.rounds {
         let Some(model) = &round.model else {
+            if !round.tools.is_empty() {
+                return RebuildResult::Unverifiable {
+                    missing: "model_call#0".to_owned(),
+                };
+            }
             continue;
         };
         let request = read_json_blob(host, &model.request_ref);
@@ -827,7 +833,11 @@ fn rebuild_from_trace(host: &RunHost, trace: &RunTrace) -> RebuildResult {
         let tool_results = round
             .tools
             .iter()
-            .map(|tool| read_bytes_blob(host, &tool.result_ref))
+            .map(|tool| RebuildTool {
+                tool_call_id: tool.tool_call_id.clone(),
+                tool_name: tool.tool_name.clone(),
+                result: read_bytes_blob(host, &tool.result_ref),
+            })
             .collect();
         calls.push(RebuildCall {
             index: round.index,
@@ -913,6 +923,7 @@ fn build_sample(host: &RunHost, run_id: &RunId) -> Result<Sample, String> {
                 .tools
                 .iter()
                 .map(|tool| SampleToolCall {
+                    tool_call_id: tool.tool_call_id.clone(),
                     tool_name: tool.tool_name.clone(),
                     normalized_path_or_query: tool.normalized_path_or_query.clone(),
                     result_ref: tool.result_ref.clone(),

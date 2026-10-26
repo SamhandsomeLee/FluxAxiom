@@ -57,6 +57,9 @@ pub struct TraceModelCall {
 /// 一轮内的一次工具调用。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraceToolCall {
+    /// 旧事件缺失时为 None，仍可展示；校验不得推断调用 ID。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     pub seq: u64,
     pub tool_name: String,
     pub normalized_path_or_query: String,
@@ -135,6 +138,7 @@ pub fn build_trace(
             }
             EventBody::ToolCallCompleted(payload) => {
                 pending_tools.push(TraceToolCall {
+                    tool_call_id: payload.tool_call_id.clone(),
                     seq: event.sequence,
                     tool_name: payload.tool_name.clone(),
                     normalized_path_or_query: payload.normalized_path_or_query.clone(),
@@ -442,6 +446,7 @@ mod tests {
                 2,
                 "2026-10-26T00:00:01Z",
                 EventBody::ToolCallCompleted(ToolCallCompletedPayload {
+                    tool_call_id: None,
                     tool_name: "list_files".to_owned(),
                     normalized_path_or_query: ".".to_owned(),
                     result_ref: "sha256:t1".to_owned(),
@@ -550,6 +555,7 @@ mod tests {
                 seq,
                 "2026-10-26T00:00:01Z",
                 EventBody::ToolCallCompleted(ToolCallCompletedPayload {
+                    tool_call_id: None,
                     tool_name: "list_files".to_owned(),
                     normalized_path_or_query: path.to_owned(),
                     result_ref: format!("sha256:t{seq}"),
@@ -618,6 +624,7 @@ mod tests {
                 3,
                 "2026-10-26T00:00:02Z",
                 EventBody::ToolCallCompleted(ToolCallCompletedPayload {
+                    tool_call_id: None,
                     tool_name: "read_file".to_owned(),
                     normalized_path_or_query: "a.rs".to_owned(),
                     result_ref: "sha256:t".to_owned(),

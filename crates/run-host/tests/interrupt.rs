@@ -74,6 +74,7 @@ impl EngineAdapter for ObserveAfterCancelEngine {
         let body = Bytes::from_static(b"late");
         let result_ref = host.put_blob(body.clone(), "text/plain").unwrap();
         host.observe(EngineObservation::ToolCall {
+            tool_call_id: "call_test".to_owned(),
             tool_name: "read_file".to_owned(),
             normalized_path_or_query: "src/lib.rs".to_owned(),
             result_ref,

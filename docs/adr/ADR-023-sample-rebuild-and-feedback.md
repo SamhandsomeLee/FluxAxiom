@@ -24,6 +24,10 @@ A4a 已经能用 `flux trace` 按轮次读出 `request_ref` / `response_ref` 与
 
 6. **`doc_version` 小表随 ADR-020 维护。** 别名 → 文档版本与核对日期；初始仅 `deepseek-flash → DeepSeek-V4.1-Flash-1017（2026-10-21）`。未知别名导出为 `unknown`。费用仍离线算，不进样本。
 
+7. **工具事件保留调用身份。** Engine 的 `ToolCall` 观测必须携带非空 `tool_call_id`；Host 将其写入 `tool.call_completed`，时间线与样本逐项保留。事件/导出契约中的字段为可选，以便继续读取旧事件；校验不推断缺失的 ID，而返回 `unverifiable missing=tool_call_id#k:j`。规则 4/6 同时核对事件 ID、工具名和顺序，相同工具名也不能跳过或交换调用。历史 Run 如含无 ID 的工具事件，不再声称已证明一致；§4.12 原有真实 Run 的 `consistent` 验收改由新 Run 完成。
+
+8. **结构损坏不能降级成一致。** 请求/响应解析为 JSON 后还需核对必需字段、类型和每一项工具调用；不接受把坏条目过滤后的剩余列表。结构损坏归 `unverifiable`，结构合法但消息链或事件不相等归 `inconsistent`。兼容只有 `finish_reason` / `usage` 的已记录失败响应。CLI 默认展示坏 JSON 时只输出 `unavailable`；显式 `--include-reasoning` 才允许展示原文。git 采集等待进程时并发读取 stdout，读取与等待共用单命令五秒期限。
+
 ## 后果
 
 - Host 多一条 git 子进程路径，但仍不是 Agent 工具；模型不能触发它。

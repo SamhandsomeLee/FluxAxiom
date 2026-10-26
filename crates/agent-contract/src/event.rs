@@ -143,6 +143,9 @@ pub struct ModelCallCompletedPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolCallCompletedPayload {
+    /// 对应响应中的调用 ID；旧事件缺失时无法证明工具顺序。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     pub tool_name: String,
     pub normalized_path_or_query: String,
     pub result_ref: String,

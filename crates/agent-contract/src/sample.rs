@@ -88,6 +88,9 @@ pub struct SampleCall {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SampleToolCall {
+    /// 新事件的调用关联 ID；历史样本允许缺失。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     pub tool_name: String,
     pub normalized_path_or_query: String,
     pub result_ref: String,

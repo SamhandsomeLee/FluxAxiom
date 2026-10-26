@@ -210,6 +210,7 @@ pub(crate) fn observation_body(
             }))
         }
         EngineObservation::ToolCall {
+            tool_call_id,
             tool_name,
             normalized_path_or_query,
             result_ref,
@@ -217,6 +218,7 @@ pub(crate) fn observation_body(
             truncated,
             duration_ms,
         } => {
+            require_text(tool_call_id, "tool_call_id")?;
             require_text(tool_name, "tool_name")?;
             require_text(normalized_path_or_query, "normalized_path_or_query")?;
             let stored = blob::stored_len(root, result_ref)?;
@@ -226,6 +228,7 @@ pub(crate) fn observation_body(
                 ));
             }
             Ok(EventBody::ToolCallCompleted(ToolCallCompletedPayload {
+                tool_call_id: Some(tool_call_id.clone()),
                 tool_name: tool_name.clone(),
                 normalized_path_or_query: normalized_path_or_query.clone(),
                 result_ref: result_ref.as_str().to_owned(),

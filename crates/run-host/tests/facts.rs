@@ -172,6 +172,7 @@ impl EngineAdapter for RecordingEngine {
             .put_blob(bytes::Bytes::from_static(b"body"), "text/plain")
             .expect("blob");
         host.observe(EngineObservation::ToolCall {
+            tool_call_id: "call_test".to_owned(),
             tool_name: "read_file".to_owned(),
             normalized_path_or_query: "src/lib.rs".to_owned(),
             result_ref: result,
@@ -199,6 +200,7 @@ impl EngineAdapter for InvalidEngine {
 
     async fn run(&self, _request: EngineRunRequest, host: Arc<dyn HostPort>) -> EngineOutcome {
         let error = host.observe(EngineObservation::ToolCall {
+            tool_call_id: "call_test".to_owned(),
             tool_name: String::new(),
             normalized_path_or_query: "src/lib.rs".to_owned(),
             result_ref: BlobRef::new(String::new()),
@@ -233,6 +235,16 @@ impl EngineAdapter for RejectingEngine {
         assert_eq!(empty_media, Err(HostPortError::Invalid));
         for observation in [
             EngineObservation::ToolCall {
+                tool_call_id: String::new(),
+                tool_name: "read_file".to_owned(),
+                normalized_path_or_query: "src/lib.rs".to_owned(),
+                result_ref: stored.clone(),
+                byte_count: 4,
+                truncated: false,
+                duration_ms: 1,
+            },
+            EngineObservation::ToolCall {
+                tool_call_id: "call_test".to_owned(),
                 tool_name: String::new(),
                 normalized_path_or_query: "src/lib.rs".to_owned(),
                 result_ref: stored.clone(),
@@ -241,6 +253,7 @@ impl EngineAdapter for RejectingEngine {
                 duration_ms: 1,
             },
             EngineObservation::ToolCall {
+                tool_call_id: "call_test".to_owned(),
                 tool_name: "read_file".to_owned(),
                 normalized_path_or_query: String::new(),
                 result_ref: stored.clone(),
@@ -249,6 +262,7 @@ impl EngineAdapter for RejectingEngine {
                 duration_ms: 1,
             },
             EngineObservation::ToolCall {
+                tool_call_id: "call_test".to_owned(),
                 tool_name: "read_file".to_owned(),
                 normalized_path_or_query: "src/lib.rs".to_owned(),
                 result_ref: BlobRef::new(String::new()),
@@ -257,6 +271,7 @@ impl EngineAdapter for RejectingEngine {
                 duration_ms: 0,
             },
             EngineObservation::ToolCall {
+                tool_call_id: "call_test".to_owned(),
                 tool_name: "read_file".to_owned(),
                 normalized_path_or_query: "src/lib.rs".to_owned(),
                 result_ref: stored.clone(),

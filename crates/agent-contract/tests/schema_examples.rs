@@ -119,6 +119,22 @@ fn reasoning_content_is_rejected_in_event_payload() {
     assert_invalid("contracts/schemas/event.schema.json", &event);
 }
 
+/// 新工具事件携带关联 ID，旧事件省略时仍能完整往返且不补造字段。
+#[test]
+fn tool_call_id_is_optional_but_preserved_in_full_event_json() {
+    let legacy = read_json("contracts/examples/event-tool-call.json");
+    let mut current = legacy.clone();
+    current["payload"]["tool_call_id"] = Value::String("call_read_1".into());
+    for value in [legacy, current] {
+        assert_valid("contracts/schemas/event.schema.json", &value);
+        let event: Event = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(event).unwrap(), value);
+    }
+    let mut invalid = read_json("contracts/examples/event-tool-call.json");
+    invalid["payload"]["tool_call_id"] = Value::String(String::new());
+    assert_invalid("contracts/schemas/event.schema.json", &invalid);
+}
+
 #[test]
 fn running_run_cannot_carry_a_terminal_reason() {
     let mut run = read_json("contracts/examples/run.json");

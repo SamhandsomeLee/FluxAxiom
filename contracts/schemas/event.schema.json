@@ -252,6 +252,7 @@
               "duration_ms"
             ],
             "properties": {
+              "tool_call_id": { "type": "string", "minLength": 1 },
               "tool_name": { "type": "string", "minLength": 1 },
               "normalized_path_or_query": { "type": "string", "minLength": 1 },
               "result_ref": { "type": "string", "minLength": 1 },

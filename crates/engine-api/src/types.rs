@@ -105,6 +105,8 @@ pub enum EngineObservation {
     },
     /// 一次只读工具调用完成。结果原文在 `result_ref`，不在本结构里。
     ToolCall {
+        /// 响应中的调用 ID，用于核对工具执行顺序；不能为空。
+        tool_call_id: String,
         /// 工具名。空字符串是 `Invalid`。
         tool_name: String,
         /// 规范化路径或查询。空字符串是 `Invalid`。只读工具才走这里，不是 Effect。

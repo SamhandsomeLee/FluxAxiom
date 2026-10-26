@@ -41,6 +41,7 @@ impl EngineAdapter for FakeEngine {
         };
         // byte_count 是返回给模型的长度，必须和刚才写入的 blob 等长。
         let observe = host.observe(EngineObservation::ToolCall {
+            tool_call_id: "call_test".to_owned(),
             tool_name: "read_file".to_owned(),
             normalized_path_or_query: "src/lib.rs".to_owned(),
             result_ref,

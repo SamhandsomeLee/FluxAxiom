@@ -385,6 +385,7 @@ async fn run_one_tool(
     observe(
         host,
         EngineObservation::ToolCall {
+            tool_call_id: call.id.clone(),
             tool_name: call.name.clone(),
             normalized_path_or_query: path_or_query,
             result_ref,
