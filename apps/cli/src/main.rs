@@ -1,6 +1,7 @@
 //! FluxAxiom CLI：组合根。
 //!
-//! **作用**：组装 `RunHost` 与 `EngineA`，提供 `run` / `status` / `events` / `artifacts` / `trace`。
+//! **作用**：组装 `RunHost` 与 `EngineA`，提供 `run` / `status` / `events` / `artifacts` / `trace` /
+//! `sample export` / `sample feedback`。
 //! **边界**：`run` 内监听 Ctrl-C 并调用 `request_cancel`；第二次 Ctrl-C 强退（§4.8 / A3b）。
 //! 租约扫描在 `RunHost::open`。默认 Fake Engine；`--engine deepseek` 读 `DEEPSEEK_API_KEY`（环境变量，或当前目录向上的 `.env`）。
 
@@ -11,12 +12,15 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use fluxaxiom_contract::{
-    Budget, Event, EventBody, ModelUsage, RunId, RunStatus, TokenCount, SCHEMA_VERSION,
+    ArtifactId, Budget, Event, EventBody, FeedbackVerdict, ModelUsage, RebuildResult, RunId,
+    RunStatus, Sample, SampleArtifact, SampleCall, SampleModel, SampleRun, SampleToolCall,
+    SampleTotals, SampleWorkspace, Timestamp, TokenCount, WorkspaceRevision, SCHEMA_VERSION,
 };
 use fluxaxiom_engine_api::{EngineAdapter, EngineDescriptor};
 use fluxaxiom_engine_custom::{
-    DeepSeekClient, EngineA, FakeChat, FakeStep, FinishReason, RecordingBackoff, ScriptedTurn,
-    SleepBackoff, ToolCall, API_KEY_ENV,
+    format_rebuild_line, lookup_doc_version, verify_rebuild, DeepSeekClient, EngineA, FakeChat,
+    FakeStep, FinishReason, RebuildCall, RecordingBackoff, ScriptedTurn, SleepBackoff, ToolCall,
+    API_KEY_ENV,
 };
 use fluxaxiom_run_host::{format_trace, CreateRun, HostError, RunHost, RunTrace};
 use serde_json::Value;
@@ -84,12 +88,12 @@ enum Command {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
-    /// 按「模型调用 → 工具调用」还原 Run 时间线（A4a）。
+    /// 按「模型调用 → 工具调用」还原 Run 时间线（A4a / A4b）。
     Trace {
         run_id: String,
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// 输出 `RunTrace` JSON。
+        /// 输出 `RunTrace` JSON；`--verify` 时另含 `rebuild` 字段。
         #[arg(long)]
         json: bool,
         /// 打印第 N 轮（从 1 起）的请求 blob；默认遮盖 `reasoning_content`。
@@ -101,7 +105,47 @@ enum Command {
         /// 与 `--show-request` / `--show-response` 联用，输出思维链原文。
         #[arg(long)]
         include_reasoning: bool,
+        /// 校验请求链可从 blob 重建（A4b）；`inconsistent` / `unverifiable` 时退出码非零。
+        #[arg(long)]
+        verify: bool,
     },
+    /// 样本导出与人工反馈（A4b）。
+    Sample {
+        #[command(subcommand)]
+        command: SampleCommand,
+    },
+}
+
+/// `flux sample` 子命令。
+#[derive(Debug, Subcommand)]
+enum SampleCommand {
+    /// 从已提交事实与 blob 导出样本记录。
+    Export {
+        run_id: String,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// 写入文件；省略则 stdout。
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// 追加一条人工总评。不要在 `--note` 里粘贴密钥。
+    Feedback {
+        run_id: String,
+        #[arg(long, value_enum)]
+        verdict: CliFeedbackVerdict,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+}
+
+/// CLI 的反馈三档（与契约 `FeedbackVerdict` 对齐）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliFeedbackVerdict {
+    Usable,
+    NeedsEdit,
+    Redo,
 }
 
 /// CLI 可选的 Engine 实现。
@@ -176,6 +220,7 @@ async fn run() -> Result<(), String> {
             show_request,
             show_response,
             include_reasoning,
+            verify,
         } => cmd_trace(
             run_id,
             data_dir,
@@ -183,7 +228,21 @@ async fn run() -> Result<(), String> {
             show_request,
             show_response,
             include_reasoning,
+            verify,
         ),
+        Command::Sample { command } => match command {
+            SampleCommand::Export {
+                run_id,
+                data_dir,
+                out,
+            } => cmd_sample_export(run_id, data_dir, out),
+            SampleCommand::Feedback {
+                run_id,
+                verdict,
+                note,
+                data_dir,
+            } => cmd_sample_feedback(run_id, verdict, note, data_dir),
+        },
     }
 }
 
@@ -454,11 +513,11 @@ fn cmd_artifacts(
     Ok(())
 }
 
-/// `flux trace`：打印 Run 时间线或 JSON（A4a）。
+/// `flux trace`：打印 Run 时间线或 JSON（A4a）；可选 `--verify`（A4b）。
 ///
-/// **作用**：按模型轮次还原工具调用；可选展示某轮请求/响应 blob。
-/// **边界**：默认不输出 `reasoning_content` 原文。坏 blob 显示 `unavailable`，退出码仍为 0（除非 Run 不存在）。
-/// 未终态 Run 也可以 trace。
+/// **作用**：按模型轮次还原工具调用；可选展示某轮请求/响应 blob；校验可重建性。
+/// **边界**：默认不输出 `reasoning_content` 原文。坏 blob 在展示路径显示 `unavailable`；
+/// `--verify` 时缺 blob 为 `unverifiable` 且退出码非零。未终态 Run 也可以 trace。
 fn cmd_trace(
     run_id: String,
     data_dir: Option<PathBuf>,
@@ -466,18 +525,36 @@ fn cmd_trace(
     show_request: Option<u32>,
     show_response: Option<u32>,
     include_reasoning: bool,
+    verify: bool,
 ) -> Result<(), String> {
     let host = open_host(data_dir)?;
     let id = parse_run_id(&run_id)?;
     let trace = host.trace(&id).map_err(host_err)?;
+    let rebuild = if verify {
+        Some(rebuild_from_trace(&host, &trace))
+    } else {
+        None
+    };
     if json {
-        let value = serde_json::to_value(&trace).map_err(|error| error.to_string())?;
+        let mut value = serde_json::to_value(&trace).map_err(|error| error.to_string())?;
+        if let Some(rebuild) = &rebuild {
+            let obj = value
+                .as_object_mut()
+                .ok_or_else(|| "trace json root must be object".to_owned())?;
+            obj.insert(
+                "rebuild".to_owned(),
+                serde_json::to_value(rebuild).map_err(|e| e.to_string())?,
+            );
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
         );
     } else {
         print!("{}", format_trace(&trace));
+        if let Some(rebuild) = &rebuild {
+            println!("{}", format_rebuild_line(rebuild));
+        }
     }
     if let Some(n) = show_request {
         print_round_blob(&host, &trace, n, true, include_reasoning)?;
@@ -485,6 +562,58 @@ fn cmd_trace(
     if let Some(n) = show_response {
         print_round_blob(&host, &trace, n, false, include_reasoning)?;
     }
+    if let Some(rebuild) = rebuild {
+        match rebuild {
+            RebuildResult::Consistent => Ok(()),
+            RebuildResult::Inconsistent { .. } | RebuildResult::Unverifiable { .. } => {
+                Err(format_rebuild_line(&rebuild))
+            }
+        }
+    } else {
+        Ok(())
+    }
+}
+
+/// `flux sample export`：写出样本记录 JSON。
+///
+/// **作用**：从 trace、事件、反馈与 blob 派生 [`Sample`]；含 `rebuild` 结论。
+/// **边界**：记录本身不含正文；缺 blob 时 `rebuild` 为 `unverifiable`，仍导出。
+fn cmd_sample_export(
+    run_id: String,
+    data_dir: Option<PathBuf>,
+    out: Option<PathBuf>,
+) -> Result<(), String> {
+    let host = open_host(data_dir)?;
+    let id = parse_run_id(&run_id)?;
+    let sample = build_sample(&host, &id)?;
+    let text = serde_json::to_string_pretty(&sample).map_err(|e| e.to_string())?;
+    if let Some(path) = out {
+        std::fs::write(&path, format!("{text}\n")).map_err(|e| e.to_string())?;
+    } else {
+        println!("{text}");
+    }
+    Ok(())
+}
+
+/// `flux sample feedback`：追加人工总评。
+///
+/// **作用**：调用 `RunHost::add_feedback`；打印新写入的 `feedback_id`。
+/// **边界**：不要在 note 里粘贴密钥。note 超 2000 字符由 Host 拒绝。
+fn cmd_sample_feedback(
+    run_id: String,
+    verdict: CliFeedbackVerdict,
+    note: Option<String>,
+    data_dir: Option<PathBuf>,
+) -> Result<(), String> {
+    let host = open_host(data_dir)?;
+    let id = parse_run_id(&run_id)?;
+    let verdict = match verdict {
+        CliFeedbackVerdict::Usable => FeedbackVerdict::Usable,
+        CliFeedbackVerdict::NeedsEdit => FeedbackVerdict::NeedsEdit,
+        CliFeedbackVerdict::Redo => FeedbackVerdict::Redo,
+    };
+    let feedback = host.add_feedback(&id, verdict, note).map_err(host_err)?;
+    println!("feedback_id={}", feedback.feedback_id);
     Ok(())
 }
 
@@ -681,6 +810,210 @@ fn is_terminal(status: RunStatus) -> bool {
         status,
         RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
     )
+}
+
+/// 从 trace 与 blob 组装可重建性输入并校验。
+///
+/// **作用**：`flux trace --verify` 与 `sample export` 共用。
+/// **边界**：缺 JSON / 缺工具 blob 时由 `verify_rebuild` 返回 `unverifiable`。
+fn rebuild_from_trace(host: &RunHost, trace: &RunTrace) -> RebuildResult {
+    let mut calls = Vec::new();
+    for round in &trace.rounds {
+        let Some(model) = &round.model else {
+            continue;
+        };
+        let request = read_json_blob(host, &model.request_ref);
+        let response = read_json_blob(host, &model.response_ref);
+        let tool_results = round
+            .tools
+            .iter()
+            .map(|tool| read_bytes_blob(host, &tool.result_ref))
+            .collect();
+        calls.push(RebuildCall {
+            index: round.index,
+            request,
+            response,
+            tool_results,
+            event_finish_reason: model.finish_reason.clone(),
+            event_usage: model.usage.clone(),
+        });
+    }
+    verify_rebuild(&calls)
+}
+
+/// 读 blob 并解析为 JSON；失败为 `None`。
+fn read_json_blob(host: &RunHost, storage_ref: &str) -> Option<Value> {
+    let bytes = read_bytes_blob(host, storage_ref)?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// 读 blob 字节；失败为 `None`。
+fn read_bytes_blob(host: &RunHost, storage_ref: &str) -> Option<Vec<u8>> {
+    host.read_blob(&fluxaxiom_engine_api::BlobRef::new(storage_ref.to_owned()))
+        .ok()
+}
+
+/// 组装一次样本导出。
+///
+/// **作用**：`flux sample export`；字段与 §4.12.2 / `sample.schema.json` 对齐。
+/// **边界**：不把 blob 正文写入记录。`prompt_layout_version` 与 `doc_version` 读不到时为 `unknown`。
+fn build_sample(host: &RunHost, run_id: &RunId) -> Result<Sample, String> {
+    let trace = host.trace(run_id).map_err(host_err)?;
+    let events = host.events_after(run_id, 0).map_err(host_err)?;
+    let feedback = host.list_feedback(run_id).map_err(host_err)?;
+    let rebuild = rebuild_from_trace(host, &trace);
+
+    let mut started_at = None;
+    let mut ended_at = None;
+    let mut revision = WorkspaceRevision::Unknown;
+    for event in &events {
+        match &event.body {
+            EventBody::RunStarted(_) => started_at = Some(event.occurred_at.clone()),
+            EventBody::RunCompleted(_) | EventBody::RunFailed(_) | EventBody::RunCancelled(_) => {
+                ended_at = Some(event.occurred_at.clone())
+            }
+            EventBody::AttemptStarted(payload) => {
+                if let Some(value) = &payload.workspace_revision {
+                    revision = value.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut calls = Vec::new();
+    let mut first_request: Option<Value> = None;
+    let mut prompt_layout_version = "unknown".to_owned();
+    for round in &trace.rounds {
+        let Some(model) = &round.model else {
+            continue;
+        };
+        if first_request.is_none() {
+            first_request = read_json_blob(host, &model.request_ref);
+        }
+        if prompt_layout_version == "unknown" {
+            if let Some(resp) = read_json_blob(host, &model.response_ref) {
+                if let Some(v) = resp.get("prompt_layout_version").and_then(Value::as_str) {
+                    prompt_layout_version = v.to_owned();
+                }
+            }
+        }
+        let occurred_at = Timestamp::parse(&model.occurred_at)
+            .map_err(|_| format!("bad occurred_at in trace seq={}", model.seq))?;
+        calls.push(SampleCall {
+            index: round.index,
+            seq: model.seq,
+            occurred_at,
+            finish_reason: model.finish_reason.clone(),
+            latency_ms: model.latency_ms,
+            usage: model.usage.clone(),
+            request_ref: model.request_ref.clone(),
+            response_ref: model.response_ref.clone(),
+            tools: round
+                .tools
+                .iter()
+                .map(|tool| SampleToolCall {
+                    tool_name: tool.tool_name.clone(),
+                    normalized_path_or_query: tool.normalized_path_or_query.clone(),
+                    result_ref: tool.result_ref.clone(),
+                    byte_count: tool.byte_count,
+                    truncated: tool.truncated,
+                    duration_ms: tool.duration_ms,
+                })
+                .collect(),
+        });
+    }
+
+    let (alias, reasoning_effort, max_tokens) = match &first_request {
+        Some(req) => (
+            req.get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+            req.get("reasoning_effort")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+            req.get("max_tokens")
+                .and_then(Value::as_u64)
+                .map(|n| n as u32),
+        ),
+        None => ("unknown".to_owned(), "unknown".to_owned(), None),
+    };
+    let (doc_version, doc_checked_at) = match lookup_doc_version(&alias) {
+        Some(row) => (row.version.to_owned(), row.checked_at.to_owned()),
+        None => ("unknown".to_owned(), "unknown".to_owned()),
+    };
+
+    Ok(Sample {
+        schema_version: SCHEMA_VERSION.to_owned(),
+        run: SampleRun {
+            run_id: run_id.clone(),
+            status: trace.status,
+            terminal_reason: trace.terminal_reason,
+            started_at,
+            ended_at,
+            wall_seconds: trace.totals.wall_seconds,
+            budget: trace.budget.clone(),
+            model_calls_used: trace.totals.model_calls,
+            tool_calls_used: trace.totals.tool_calls,
+        },
+        workspace: SampleWorkspace {
+            path: trace.workspace_ref.clone(),
+            revision,
+        },
+        model: SampleModel {
+            provider: "deepseek".to_owned(),
+            alias,
+            doc_version,
+            doc_checked_at,
+            reasoning_effort,
+            max_tokens,
+            prompt_layout_version,
+            engine_id: trace.engine_id.clone(),
+            engine_version: trace.engine_version.clone(),
+        },
+        calls,
+        totals: SampleTotals {
+            model_calls: trace.totals.model_calls,
+            tool_calls: trace.totals.tool_calls,
+            prompt_tokens: trace.totals.prompt_tokens,
+            completion_tokens: trace.totals.completion_tokens,
+            prompt_cache_hit_tokens: trace.totals.prompt_cache_hit_tokens,
+            prompt_cache_miss_tokens: trace.totals.prompt_cache_miss_tokens,
+        },
+        artifacts: {
+            let mut artifacts = Vec::with_capacity(trace.artifacts.len());
+            for artifact in &trace.artifacts {
+                artifacts.push(SampleArtifact {
+                    artifact_id: ArtifactId::parse(&artifact.artifact_id)
+                        .map_err(|_| format!("bad artifact_id {}", artifact.artifact_id))?,
+                    artifact_type: artifact.artifact_type.clone(),
+                    storage_ref: artifact.storage_ref.clone(),
+                    bytes: artifact.bytes,
+                });
+            }
+            artifacts
+        },
+        rebuild,
+        feedback,
+        exported_at: now_timestamp()?,
+    })
+}
+
+/// 当前 UTC 秒精度时间戳，供 `exported_at`。
+fn now_timestamp() -> Result<Timestamp, String> {
+    let now = time::OffsetDateTime::now_utc();
+    let text = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    );
+    Timestamp::parse(text).map_err(|_| "failed to format exported_at".to_owned())
 }
 
 /// 解析数据目录并打开 Host。

@@ -148,10 +148,7 @@ impl fluxaxiom_engine_api::EngineAdapter for RaceEngine {
         })
         .expect("observe");
         fluxaxiom_engine_api::EngineOutcome::Completed {
-            report: fluxaxiom_engine_api::ArtifactDraft {
-                artifact_type: "report".to_owned(),
-                summary: "done".to_owned(),
-            },
+            report: fluxaxiom_engine_api::ArtifactDraft::report("done".to_owned()),
         }
     }
 }

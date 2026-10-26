@@ -40,10 +40,7 @@ impl EngineAdapter for BudgetEngine {
             leases.push(host.reserve(*step));
         }
         EngineOutcome::Completed {
-            report: ArtifactDraft {
-                artifact_type: "report".to_owned(),
-                summary: "budget probe".to_owned(),
-            },
+            report: ArtifactDraft::report("budget probe".to_owned()),
         }
     }
 }
@@ -87,10 +84,7 @@ impl EngineAdapter for ConcurrentBudgetEngine {
             handle.join().unwrap();
         }
         EngineOutcome::Completed {
-            report: ArtifactDraft {
-                artifact_type: "report".to_owned(),
-                summary: "concurrent budget".to_owned(),
-            },
+            report: ArtifactDraft::report("concurrent budget".to_owned()),
         }
     }
 }
@@ -375,10 +369,7 @@ async fn engine_can_report_budget_exhausted_outcome() {
             );
             EngineOutcome::Failed {
                 reason: FailureReason::BudgetExhausted,
-                partial: Some(ArtifactDraft {
-                    artifact_type: "report".to_owned(),
-                    summary: "stopped early".to_owned(),
-                }),
+                partial: Some(ArtifactDraft::report("stopped early".to_owned())),
             }
         }
     }

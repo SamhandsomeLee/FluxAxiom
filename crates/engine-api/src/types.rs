@@ -21,10 +21,46 @@ pub struct EngineRunRequest {
 }
 
 /// Engine 交回的产物草稿。Host 负责落成 Artifact；Engine 不写存储。
+///
+/// **作用**：`body` 是完整正文（进 blob）；`summary` 是短摘要（进事件与索引）。
+/// **边界**：P0a 由 Engine 取 `body` 首个非空行截断到 200 字符填 `summary`（A4b / ADR-023）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactDraft {
     pub artifact_type: String,
+    /// 短摘要，只进 `artifact.created` 与 Artifact 索引，不进 blob。
     pub summary: String,
+    /// 完整正文；Host 只把它写成 blob。
+    pub body: String,
+}
+
+impl ArtifactDraft {
+    /// 用完整正文构造报告草稿，并按规则填 `summary`。
+    ///
+    /// **作用**：Engine 成功 / 部分报告的共用入口。
+    /// **参数**：`body` 是交给 Host 写 blob 的全文。
+    /// **边界**：`summary` 取首个非空行，截断到 200 字符；全文为空时 `summary` 也为空。
+    #[must_use]
+    pub fn report(body: impl Into<String>) -> Self {
+        let body = body.into();
+        Self {
+            artifact_type: "report".to_owned(),
+            summary: summarize_body(&body),
+            body,
+        }
+    }
+}
+
+/// 从正文取事件用短摘要。
+///
+/// **作用**：与 [`ArtifactDraft::report`] 同一规则，供测试断言。
+/// **边界**：跳过空白行；截断按 Unicode 标量，最多 200。
+#[must_use]
+pub fn summarize_body(body: &str) -> String {
+    let line = body
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    line.chars().take(200).collect()
 }
 
 /// 内容寻址原文的引用。事件只保存这个引用，不保存文件全文、prompt 或 `reasoning_content`。

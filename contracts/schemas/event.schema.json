@@ -76,6 +76,32 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {}
+    },
+    "workspaceRevision": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["vcs", "commit", "dirty", "prefix"],
+          "properties": {
+            "vcs": { "const": "git" },
+            "commit": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "dirty": { "type": "boolean" },
+            "prefix": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["vcs"],
+          "properties": {
+            "vcs": { "const": "unknown" }
+          }
+        }
+      ]
     }
   },
   "allOf": [
@@ -120,7 +146,8 @@
             "properties": {
               "attempt_id": { "$ref": "#/$defs/attemptId" },
               "owner": { "type": "string", "minLength": 1 },
-              "lease_expires_at": { "$ref": "#/$defs/timestamp" }
+              "lease_expires_at": { "$ref": "#/$defs/timestamp" },
+              "workspace_revision": { "$ref": "#/$defs/workspaceRevision" }
             }
           }
         }

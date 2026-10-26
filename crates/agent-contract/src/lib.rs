@@ -6,6 +6,7 @@ mod error;
 mod event;
 mod id;
 mod run;
+mod sample;
 mod session;
 mod snapshot;
 mod time_stamp;
@@ -16,10 +17,14 @@ pub use error::Error;
 pub use event::{
     ArtifactCreatedPayload, AttemptEndedPayload, AttemptOrphanedPayload, AttemptStartedPayload,
     EmptyPayload, Event, EventBody, ModelCallCompletedPayload, ModelUsage, RunTerminalPayload,
-    TokenCount, ToolCallCompletedPayload,
+    TokenCount, ToolCallCompletedPayload, WorkspaceRevision,
 };
-pub use id::{ArtifactId, AttemptId, EventId, IdError, RunId, SessionId};
+pub use id::{ArtifactId, AttemptId, EventId, FeedbackId, IdError, RunId, SessionId};
 pub use run::{run_transition_allowed, Budget, Run, RunStatus, TerminalReason};
+pub use sample::{
+    FeedbackVerdict, RebuildResult, Sample, SampleArtifact, SampleCall, SampleFeedback,
+    SampleModel, SampleRun, SampleToolCall, SampleTotals, SampleWorkspace,
+};
 pub use session::Session;
 pub use snapshot::RunSnapshot;
 pub use time_stamp::{Timestamp, TimestampError};

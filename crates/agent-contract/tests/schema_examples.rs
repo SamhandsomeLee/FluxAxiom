@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use fluxaxiom_contract::{
-    Artifact, Attempt, Error, Event, Run, RunSnapshot, Session, SCHEMA_VERSION,
+    Artifact, Attempt, Error, Event, Run, RunSnapshot, Sample, Session, SCHEMA_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -94,6 +94,14 @@ fn examples_match_schemas_and_rust_types() {
     round_trip::<Error>(
         "contracts/schemas/error.schema.json",
         "contracts/examples/error.json",
+    );
+    round_trip::<Sample>(
+        "contracts/schemas/sample.schema.json",
+        "contracts/examples/sample.json",
+    );
+    round_trip::<Event>(
+        "contracts/schemas/event.schema.json",
+        "contracts/examples/event-attempt-started.json",
     );
 }
 

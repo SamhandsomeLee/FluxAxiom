@@ -59,11 +59,7 @@ impl EngineAdapter for FakeEngine {
         let _cancel = host.cancellation();
         assert!(request.workspace.as_path().is_dir());
         EngineOutcome::Completed {
-            report: ArtifactDraft {
-                artifact_type: "report".to_owned(),
-                // Host 本阶段丢弃草稿；字段只为让 `EngineOutcome` 形状完整。
-                summary: format!("fake completed {}", request.run_id),
-            },
+            report: ArtifactDraft::report(format!("fake completed {}", request.run_id)),
         }
     }
 }

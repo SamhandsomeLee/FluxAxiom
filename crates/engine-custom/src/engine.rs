@@ -264,10 +264,7 @@ where
                         };
                     }
                     return EngineOutcome::Completed {
-                        report: ArtifactDraft {
-                            artifact_type: "report".to_owned(),
-                            summary: content,
-                        },
+                        report: ArtifactDraft::report(content),
                     };
                 }
                 FinishReason::Other(_) => {
@@ -579,10 +576,7 @@ fn partial_report(content: &str) -> Option<ArtifactDraft> {
     if content.is_empty() {
         None
     } else {
-        Some(ArtifactDraft {
-            artifact_type: "report".to_owned(),
-            summary: content.to_owned(),
-        })
+        Some(ArtifactDraft::report(content.to_owned()))
     }
 }
 

@@ -88,6 +88,23 @@ pub struct AttemptStartedPayload {
     pub attempt_id: AttemptId,
     pub owner: String,
     pub lease_expires_at: Timestamp,
+    /// 本次 drive 开始时采集的工作区版本（A4b）。旧事件没有该字段，反序列化为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_revision: Option<WorkspaceRevision>,
+}
+
+/// 工作区版本快照（A4b）。写入 `attempt.started`，也出现在样本导出里。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "vcs", rename_all = "lowercase")]
+pub enum WorkspaceRevision {
+    /// git 仓库：`commit` 为 40 位 hex；`prefix` 是工作区相对仓库根的路径（根上为空串）。
+    Git {
+        commit: String,
+        dirty: bool,
+        prefix: String,
+    },
+    /// 非 git、找不到 git、超时或失败（含无提交的新仓库）。
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,5 +207,37 @@ impl Event {
     #[must_use]
     pub fn invariants_hold(&self) -> bool {
         self.schema_version == SCHEMA_VERSION && self.sequence >= 1 && !self.subject_id.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 旧 `attempt.started` 无 `workspace_revision` 仍可反序列化。
+    #[test]
+    fn attempt_started_without_revision_deserializes() {
+        let value = json!({
+            "event_id": "evt_01936c2f-8a4b-7c3d-9e1f-2a3b4c5d6e90",
+            "schema_version": "0.3-draft",
+            "run_id": "run_01936c2f-8a4b-7c3d-9e1f-2a3b4c5d6e7f",
+            "sequence": 2,
+            "subject_id": "attempt_01936c2f-8a4b-7c3d-9e1f-2a3b4c5d6e91",
+            "occurred_at": "2026-10-26T12:00:00Z",
+            "event_type": "attempt.started",
+            "payload": {
+                "attempt_id": "attempt_01936c2f-8a4b-7c3d-9e1f-2a3b4c5d6e91",
+                "owner": "pid:1",
+                "lease_expires_at": "2026-10-26T12:01:00Z"
+            }
+        });
+        let event: Event = serde_json::from_value(value).unwrap();
+        match event.body {
+            EventBody::AttemptStarted(payload) => {
+                assert!(payload.workspace_revision.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

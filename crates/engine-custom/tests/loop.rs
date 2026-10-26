@@ -162,10 +162,7 @@ async fn stop_without_tools_completes_with_report() {
     assert_eq!(
         outcome,
         EngineOutcome::Completed {
-            report: ArtifactDraft {
-                artifact_type: "report".to_owned(),
-                summary: "final answer".to_owned(),
-            }
+            report: ArtifactDraft::report("final answer".to_owned())
         }
     );
     let observations = host.observations();
@@ -249,10 +246,7 @@ async fn length_is_budget_exhausted_with_partial() {
         outcome,
         EngineOutcome::Failed {
             reason: FailureReason::BudgetExhausted,
-            partial: Some(ArtifactDraft {
-                artifact_type: "report".to_owned(),
-                summary: "partial text".to_owned(),
-            }),
+            partial: Some(ArtifactDraft::report("partial text".to_owned())),
         }
     );
 }

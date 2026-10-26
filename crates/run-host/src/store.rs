@@ -61,6 +61,7 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), HostError> {
     const MIGRATIONS: &[&str] = &[
         include_str!("../migrations/0001_init.sql"),
         include_str!("../migrations/0002_events.sql"),
+        include_str!("../migrations/0003_sample_feedback.sql"),
     ];
     for (index, sql) in MIGRATIONS.iter().enumerate() {
         let version = i64::try_from(index + 1).expect("migration count fits i64");
@@ -520,5 +521,81 @@ fn decode_attempt_outcome(value: &str) -> Result<AttemptOutcome, HostError> {
         "failed" => Ok(AttemptOutcome::Failed),
         "cancelled" => Ok(AttemptOutcome::Cancelled),
         _ => Err(HostError::Corrupt("attempt outcome")),
+    }
+}
+
+/// 追加一条人工反馈（A4b）。
+///
+/// **作用**：`RunHost::add_feedback` 在确认 Run 存在后调用。
+/// **边界**：不写 event、不改 `last_sequence`。`note` 已由调用方截断校验。
+pub(crate) fn insert_feedback(
+    connection: &Connection,
+    feedback: &fluxaxiom_contract::SampleFeedback,
+    run_id: &RunId,
+) -> Result<(), HostError> {
+    connection.execute(
+        "INSERT INTO sample_feedback (feedback_id, run_id, created_at, verdict, note)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            feedback.feedback_id.as_str(),
+            run_id.as_str(),
+            feedback.created_at.as_str(),
+            encode_verdict(feedback.verdict),
+            feedback.note.as_deref(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// 按 `created_at`、`feedback_id` 升序列出该 Run 的全部反馈。
+///
+/// **作用**：样本导出与反馈验收读回。
+/// **边界**：没有行时返回空 Vec，不报 `NotFound`。
+pub(crate) fn list_feedback(
+    connection: &Connection,
+    run_id: &RunId,
+) -> Result<Vec<fluxaxiom_contract::SampleFeedback>, HostError> {
+    let mut statement = connection.prepare(
+        "SELECT feedback_id, created_at, verdict, note FROM sample_feedback
+         WHERE run_id = ?1
+         ORDER BY created_at ASC, feedback_id ASC",
+    )?;
+    let rows = statement.query_map(params![run_id.as_str()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, created_at, verdict, note) = row?;
+        out.push(fluxaxiom_contract::SampleFeedback {
+            feedback_id: fluxaxiom_contract::FeedbackId::parse(id)
+                .map_err(|_| HostError::Corrupt("feedback_id"))?,
+            created_at: fluxaxiom_contract::Timestamp::parse(created_at)
+                .map_err(|_| HostError::Corrupt("feedback created_at"))?,
+            verdict: decode_verdict(&verdict)?,
+            note,
+        });
+    }
+    Ok(out)
+}
+
+fn encode_verdict(verdict: fluxaxiom_contract::FeedbackVerdict) -> &'static str {
+    match verdict {
+        fluxaxiom_contract::FeedbackVerdict::Usable => "usable",
+        fluxaxiom_contract::FeedbackVerdict::NeedsEdit => "needs_edit",
+        fluxaxiom_contract::FeedbackVerdict::Redo => "redo",
+    }
+}
+
+fn decode_verdict(value: &str) -> Result<fluxaxiom_contract::FeedbackVerdict, HostError> {
+    match value {
+        "usable" => Ok(fluxaxiom_contract::FeedbackVerdict::Usable),
+        "needs_edit" => Ok(fluxaxiom_contract::FeedbackVerdict::NeedsEdit),
+        "redo" => Ok(fluxaxiom_contract::FeedbackVerdict::Redo),
+        _ => Err(HostError::Corrupt("feedback verdict")),
     }
 }

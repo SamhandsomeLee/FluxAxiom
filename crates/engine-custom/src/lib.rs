@@ -6,9 +6,11 @@
 //! `ChatRequest::new` 默认带未校准的 `max_tokens: 32768`。
 
 mod chat;
+mod doc_version;
 mod engine;
 mod fake;
 mod http;
+mod rebuild;
 mod retry;
 mod sse;
 mod tools;
@@ -18,11 +20,13 @@ pub use chat::{
     FinishReason, Message, ObservedText, ReasoningEffort, ReplayReasoning, ToolCall, ToolSpec,
     API_KEY_ENV, DEFAULT_MAX_TOKENS, DEFAULT_MODEL, MAX_TOKENS_LIMIT,
 };
+pub use doc_version::{lookup as lookup_doc_version, DocVersion};
 pub use engine::{EngineA, PROMPT_LAYOUT_VERSION};
 pub use fake::{FakeChat, FakeStep, ScriptedTurn};
-pub use fluxaxiom_contract::{ModelUsage, TokenCount};
+pub use fluxaxiom_contract::{ModelUsage, RebuildResult, TokenCount};
 pub use fluxaxiom_engine_api::{WorkspaceError, WorkspaceRoot};
 pub use http::{stream_request_body, DeepSeekClient, DEFAULT_BASE_URL};
+pub use rebuild::{format_rebuild_line, verify as verify_rebuild, RebuildCall};
 pub use retry::{
     execute, Backoff, ChatTransport, RecordingBackoff, Round, SleepBackoff, RETRY_DELAYS,
 };

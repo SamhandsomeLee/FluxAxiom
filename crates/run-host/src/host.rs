@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use fluxaxiom_contract::{
     attempt_transition_allowed, run_transition_allowed, Artifact, ArtifactId, Attempt, AttemptId,
-    AttemptOutcome, AttemptStatus, Budget, Event, Run, RunId, RunSnapshot, RunStatus, Session,
-    SessionId, TerminalReason, SCHEMA_VERSION,
+    AttemptOutcome, AttemptStatus, Budget, Event, FeedbackId, FeedbackVerdict, Run, RunId,
+    RunSnapshot, RunStatus, SampleFeedback, Session, SessionId, TerminalReason, SCHEMA_VERSION,
 };
 use fluxaxiom_engine_api::{
     ArtifactDraft, BlobRef, EngineAdapter, EngineDescriptor, EngineOutcome, EngineRunRequest,
@@ -368,6 +368,45 @@ impl RunHost {
         load_created(&connection, request_id)?.ok_or(HostError::NotFound)
     }
 
+    /// 追加一条人工反馈（A4b / §4.12.4）。
+    ///
+    /// **作用**：`flux sample feedback` 的写入路径；只追加，不改 Run 状态。
+    /// **参数**：`verdict` 为三档总评；`note` 可选，超过 2000 字符拒绝。
+    /// **边界**：Run 必须存在，状态不限。不写 durable event，不改 `last_sequence`。
+    pub fn add_feedback(
+        &self,
+        run_id: &RunId,
+        verdict: FeedbackVerdict,
+        note: Option<String>,
+    ) -> Result<SampleFeedback, HostError> {
+        if let Some(text) = note.as_ref() {
+            if text.chars().count() > 2000 {
+                return Err(HostError::Invalid("feedback note exceeds 2000 characters"));
+            }
+        }
+        let connection = self.lock()?;
+        // 确认 Run 存在；失败的 Run 同样可评价。
+        store::load_run(&connection, run_id)?;
+        let feedback = SampleFeedback {
+            feedback_id: FeedbackId::generate(),
+            created_at: now_utc(),
+            verdict,
+            note,
+        };
+        store::insert_feedback(&connection, &feedback, run_id)?;
+        Ok(feedback)
+    }
+
+    /// 按时间顺序列出该 Run 的全部人工反馈。
+    ///
+    /// **作用**：样本导出与重新打开数据目录后的读回。
+    /// **边界**：Run 不存在时 `NotFound`；无反馈时为空列表。
+    pub fn list_feedback(&self, run_id: &RunId) -> Result<Vec<SampleFeedback>, HostError> {
+        let connection = self.lock()?;
+        store::load_run(&connection, run_id)?;
+        store::list_feedback(&connection, run_id)
+    }
+
     /// 经 `HostPort` 跑一次 Engine，再根据 `EngineOutcome` 写入终态。
     ///
     /// **作用**：启动前提交 `run.started` 与 `attempt.started`，结束后把报告、Attempt 和 Run 终态放进同一事务。
@@ -452,6 +491,8 @@ impl RunHost {
                 .map_err(PrepareDriveError::Host)?;
             return Err(PrepareDriveError::UnstartedFailed);
         }
+        // 在持有 SQLite 写锁之前采集；失败为 Unknown，不使 Run 失败（§4.12.3）。
+        let workspace_revision = crate::workspace_revision::collect(workspace.as_path());
         let fail = self.take_fail_prepare();
         let mut connection = self.lock().map_err(PrepareDriveError::Host)?;
         let transaction = store::immediate(&mut connection).map_err(PrepareDriveError::Host)?;
@@ -490,6 +531,7 @@ impl RunHost {
                 attempt.attempt_id.clone(),
                 attempt.owner.clone(),
                 attempt.lease_expires_at.clone(),
+                Some(workspace_revision),
             ),
         )
         .map_err(PrepareDriveError::Host)?;
@@ -570,7 +612,7 @@ impl RunHost {
         let draft = report_draft(&outcome).cloned();
         let stored = draft
             .as_ref()
-            .map(|draft| blob::put(&self.shared.root, draft.summary.as_bytes(), "text/plain"))
+            .map(|draft| blob::put(&self.shared.root, draft.body.as_bytes(), "text/plain"))
             .transpose()?;
         let fail = self.take_fail_finish();
         let mut connection = self.lock()?;
@@ -1412,10 +1454,7 @@ mod tests {
 
         async fn run(&self, _request: EngineRunRequest, _host: Arc<dyn HostPort>) -> EngineOutcome {
             EngineOutcome::Completed {
-                report: fluxaxiom_engine_api::ArtifactDraft {
-                    artifact_type: "report".to_owned(),
-                    summary: "done".to_owned(),
-                },
+                report: fluxaxiom_engine_api::ArtifactDraft::report("done".to_owned()),
             }
         }
     }

@@ -1,0 +1,20 @@
+{
+  "event_id": "evt_01936c2f-8a4b-7c3d-9e1f-2a3b4c5d6e90",
+  "schema_version": "0.3-draft",
+  "run_id": "run_01936c2f-8a4b-7c3d-9e1f-2a3b4c5d6e7f",
+  "sequence": 2,
+  "subject_id": "attempt_01936c2f-8a4b-7c3d-9e1f-2a3b4c5d6e91",
+  "occurred_at": "2026-10-26T12:00:00Z",
+  "event_type": "attempt.started",
+  "payload": {
+    "attempt_id": "attempt_01936c2f-8a4b-7c3d-9e1f-2a3b4c5d6e91",
+    "owner": "pid:1",
+    "lease_expires_at": "2026-10-26T12:01:00Z",
+    "workspace_revision": {
+      "vcs": "git",
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "dirty": false,
+      "prefix": ""
+    }
+  }
+}

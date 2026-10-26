@@ -1,0 +1,108 @@
+{
+  "schema_version": "0.3-draft",
+  "run": {
+    "run_id": "run_01936c2f-8a4b-7c3d-9e1f-2a3b4c5d6e7f",
+    "status": "Completed",
+    "terminal_reason": "completed",
+    "started_at": "2026-10-26T12:00:00Z",
+    "ended_at": "2026-10-26T12:00:05Z",
+    "wall_seconds": 5,
+    "budget": {
+      "max_model_calls": 8,
+      "max_tool_calls": 32
+    },
+    "model_calls_used": 2,
+    "tool_calls_used": 1
+  },
+  "workspace": {
+    "path": "/tmp/workspace",
+    "revision": {
+      "vcs": "git",
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "dirty": false,
+      "prefix": ""
+    }
+  },
+  "model": {
+    "provider": "deepseek",
+    "alias": "deepseek-flash",
+    "doc_version": "DeepSeek-V4.1-Flash-1017",
+    "doc_checked_at": "2026-10-21",
+    "reasoning_effort": "high",
+    "max_tokens": 32768,
+    "prompt_layout_version": "1",
+    "engine_id": "engine-a",
+    "engine_version": "0.1.0"
+  },
+  "calls": [
+    {
+      "index": 1,
+      "seq": 3,
+      "occurred_at": "2026-10-26T12:00:01Z",
+      "finish_reason": "tool_calls",
+      "latency_ms": 100,
+      "usage": {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 10
+      },
+      "request_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "response_ref": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "tools": [
+        {
+          "tool_name": "list_files",
+          "normalized_path_or_query": ".",
+          "result_ref": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "byte_count": 12,
+          "truncated": false,
+          "duration_ms": 2
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "seq": 5,
+      "occurred_at": "2026-10-26T12:00:03Z",
+      "finish_reason": "stop",
+      "latency_ms": 80,
+      "usage": {
+        "prompt_tokens": 20,
+        "completion_tokens": 8,
+        "prompt_cache_hit_tokens": 5,
+        "prompt_cache_miss_tokens": 15
+      },
+      "request_ref": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "response_ref": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "tools": []
+    }
+  ],
+  "totals": {
+    "model_calls": 2,
+    "tool_calls": 1,
+    "prompt_tokens": 30,
+    "completion_tokens": 13,
+    "prompt_cache_hit_tokens": 5,
+    "prompt_cache_miss_tokens": 25
+  },
+  "artifacts": [
+    {
+      "artifact_id": "artifact_01936c2f-8a4b-7c3d-9e1f-2a3b4c5d6e80",
+      "artifact_type": "report",
+      "storage_ref": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "bytes": 42
+    }
+  ],
+  "rebuild": {
+    "status": "consistent"
+  },
+  "feedback": [
+    {
+      "feedback_id": "fbk_01936c2f-8a4b-7c3d-9e1f-2a3b4c5d6e81",
+      "created_at": "2026-10-26T13:00:00Z",
+      "verdict": "usable",
+      "note": "looks good"
+    }
+  ],
+  "exported_at": "2026-10-26T14:00:00Z"
+}

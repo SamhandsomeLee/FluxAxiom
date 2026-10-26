@@ -13,6 +13,7 @@ mod port;
 mod store;
 mod time;
 mod trace;
+mod workspace_revision;
 
 pub use error::HostError;
 pub use host::{CreateRun, CreatedRun, RunHost};

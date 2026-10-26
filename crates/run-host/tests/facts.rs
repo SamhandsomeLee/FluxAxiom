@@ -181,10 +181,7 @@ impl EngineAdapter for RecordingEngine {
         })
         .expect("observe");
         EngineOutcome::Completed {
-            report: fluxaxiom_engine_api::ArtifactDraft {
-                artifact_type: "report".to_owned(),
-                summary: "done".to_owned(),
-            },
+            report: fluxaxiom_engine_api::ArtifactDraft::report("done".to_owned()),
         }
     }
 }
@@ -306,6 +303,7 @@ impl EngineAdapter for EmptyTypeEngine {
             report: fluxaxiom_engine_api::ArtifactDraft {
                 artifact_type: String::new(),
                 summary: "unused".to_owned(),
+                body: "unused".to_owned(),
             },
         }
     }

@@ -75,6 +75,7 @@ prefixed_id!(RunId, "run");
 prefixed_id!(AttemptId, "attempt");
 prefixed_id!(EventId, "evt");
 prefixed_id!(ArtifactId, "artifact");
+prefixed_id!(FeedbackId, "fbk");
 
 fn parse_prefixed(prefix: &str, value: &str) -> Result<String, IdError> {
     let Some(rest) = value.strip_prefix(prefix) else {

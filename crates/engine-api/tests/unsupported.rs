@@ -54,10 +54,7 @@ impl EngineAdapter for ImmediateEngine {
 
     async fn run(&self, _request: EngineRunRequest, _host: Arc<dyn HostPort>) -> EngineOutcome {
         EngineOutcome::Completed {
-            report: ArtifactDraft {
-                artifact_type: "report".to_owned(),
-                summary: "stub".to_owned(),
-            },
+            report: ArtifactDraft::report("stub".to_owned()),
         }
     }
 }

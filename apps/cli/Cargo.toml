@@ -16,6 +16,7 @@ fluxaxiom-engine-api = { path = "../../crates/engine-api" }
 fluxaxiom-engine-custom = { path = "../../crates/engine-custom" }
 fluxaxiom-run-host = { path = "../../crates/run-host" }
 serde_json = "1"
+time = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 
 [dev-dependencies]

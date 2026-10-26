@@ -50,3 +50,7 @@ A2.1 再实现薄客户端、流式响应和 Fake Provider。本 ADR 不包含 H
 ## 复审触发器
 
 官方模型列表或 `deepseek-flash` 所指向的版本发生变化，或者 Chat Completions 不再回传本 ADR 依赖的 `reasoning_content` 与缓存用量字段。
+
+## 补充（2026-10-26 / A4b）
+
+样本导出所需的「别名 → 文档版本、核对日期」落在 `engine-custom::doc_version` 小表，初始仅 `deepseek-flash → DeepSeek-V4.1-Flash-1017（2026-10-21）`。别名改指或增行时，与本 ADR 同一次提交更新该表；未知别名导出为 `unknown`。详见 ADR-023。

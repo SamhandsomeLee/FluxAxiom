@@ -13,8 +13,8 @@ pub use adapter::EngineAdapter;
 pub use fluxaxiom_contract::{ModelUsage, TokenCount};
 pub use host::{HostPort, HostPortError};
 pub use types::{
-    ArtifactDraft, BlobRef, BudgetExhausted, BudgetLease, BudgetRequest, EffectOutcome,
-    EngineDescriptor, EngineObservation, EngineOutcome, EngineRunRequest, FailureReason,
-    InputOutcome, InputRequest, ProposedEffect,
+    summarize_body, ArtifactDraft, BlobRef, BudgetExhausted, BudgetLease, BudgetRequest,
+    EffectOutcome, EngineDescriptor, EngineObservation, EngineOutcome, EngineRunRequest,
+    FailureReason, InputOutcome, InputRequest, ProposedEffect,
 };
 pub use workspace::{WorkspaceError, WorkspaceRoot};

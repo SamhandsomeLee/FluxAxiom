@@ -1,0 +1,298 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sample.schema.json",
+  "title": "Sample",
+  "description": "P0a sample export derived from committed facts and blobs. schema_version 0.3-draft is not Contract v1. Refs only; no prompt, tool body, reasoning_content, or report body.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run",
+    "workspace",
+    "model",
+    "calls",
+    "totals",
+    "artifacts",
+    "rebuild",
+    "feedback",
+    "exported_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "0.3-draft" },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "status",
+        "budget",
+        "model_calls_used",
+        "tool_calls_used"
+      ],
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "pattern": "^run_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "status": {
+          "enum": [
+            "Accepted",
+            "Running",
+            "Cancelling",
+            "Completed",
+            "Failed",
+            "Cancelled"
+          ]
+        },
+        "terminal_reason": {
+          "enum": [
+            "completed",
+            "cancelled",
+            "budget_exhausted",
+            "host_restart",
+            "engine_error",
+            "provider_error"
+          ]
+        },
+        "started_at": { "$ref": "#/$defs/timestamp" },
+        "ended_at": { "$ref": "#/$defs/timestamp" },
+        "wall_seconds": { "type": "integer", "minimum": 0 },
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["max_model_calls", "max_tool_calls"],
+          "properties": {
+            "max_model_calls": { "type": "integer", "minimum": 0 },
+            "max_tool_calls": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "model_calls_used": { "type": "integer", "minimum": 0 },
+        "tool_calls_used": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "revision"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "revision": { "$ref": "#/$defs/workspaceRevision" }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "alias",
+        "doc_version",
+        "doc_checked_at",
+        "reasoning_effort",
+        "prompt_layout_version",
+        "engine_id",
+        "engine_version"
+      ],
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "alias": { "type": "string", "minLength": 1 },
+        "doc_version": { "type": "string", "minLength": 1 },
+        "doc_checked_at": { "type": "string", "minLength": 1 },
+        "reasoning_effort": { "type": "string", "minLength": 1 },
+        "max_tokens": { "type": "integer", "minimum": 1 },
+        "prompt_layout_version": { "type": "string", "minLength": 1 },
+        "engine_id": { "type": "string", "minLength": 1 },
+        "engine_version": { "type": "string", "minLength": 1 }
+      }
+    },
+    "calls": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "index",
+          "seq",
+          "occurred_at",
+          "finish_reason",
+          "latency_ms",
+          "usage",
+          "request_ref",
+          "response_ref",
+          "tools"
+        ],
+        "properties": {
+          "index": { "type": "integer", "minimum": 1 },
+          "seq": { "type": "integer", "minimum": 1 },
+          "occurred_at": { "$ref": "#/$defs/timestamp" },
+          "finish_reason": { "type": "string", "minLength": 1 },
+          "latency_ms": { "type": "integer", "minimum": 0 },
+          "usage": { "$ref": "#/$defs/usage" },
+          "request_ref": { "type": "string", "minLength": 1 },
+          "response_ref": { "type": "string", "minLength": 1 },
+          "tools": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "tool_name",
+                "normalized_path_or_query",
+                "result_ref",
+                "byte_count",
+                "truncated",
+                "duration_ms"
+              ],
+              "properties": {
+                "tool_name": { "type": "string", "minLength": 1 },
+                "normalized_path_or_query": { "type": "string" },
+                "result_ref": { "type": "string", "minLength": 1 },
+                "byte_count": { "type": "integer", "minimum": 0 },
+                "truncated": { "type": "boolean" },
+                "duration_ms": { "type": "integer", "minimum": 0 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_calls",
+        "tool_calls",
+        "prompt_tokens",
+        "completion_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens"
+      ],
+      "properties": {
+        "model_calls": { "type": "integer", "minimum": 0 },
+        "tool_calls": { "type": "integer", "minimum": 0 },
+        "prompt_tokens": { "$ref": "#/$defs/tokenCount" },
+        "completion_tokens": { "$ref": "#/$defs/tokenCount" },
+        "prompt_cache_hit_tokens": { "$ref": "#/$defs/tokenCount" },
+        "prompt_cache_miss_tokens": { "$ref": "#/$defs/tokenCount" }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["artifact_id", "artifact_type", "storage_ref"],
+        "properties": {
+          "artifact_id": {
+            "type": "string",
+            "pattern": "^artifact_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "artifact_type": { "type": "string", "minLength": 1 },
+          "storage_ref": { "type": "string", "minLength": 1 },
+          "bytes": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "rebuild": { "$ref": "#/$defs/rebuild" },
+    "feedback": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["feedback_id", "created_at", "verdict"],
+        "properties": {
+          "feedback_id": {
+            "type": "string",
+            "pattern": "^fbk_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "created_at": { "$ref": "#/$defs/timestamp" },
+          "verdict": { "enum": ["usable", "needs_edit", "redo"] },
+          "note": { "type": "string", "maxLength": 2000 }
+        }
+      }
+    },
+    "exported_at": { "$ref": "#/$defs/timestamp" }
+  },
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+    },
+    "tokenCount": {
+      "anyOf": [{ "type": "integer", "minimum": 0 }, { "const": "unknown" }]
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "prompt_tokens",
+        "completion_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens"
+      ],
+      "properties": {
+        "prompt_tokens": { "$ref": "#/$defs/tokenCount" },
+        "completion_tokens": { "$ref": "#/$defs/tokenCount" },
+        "prompt_cache_hit_tokens": { "$ref": "#/$defs/tokenCount" },
+        "prompt_cache_miss_tokens": { "$ref": "#/$defs/tokenCount" }
+      }
+    },
+    "workspaceRevision": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["vcs", "commit", "dirty", "prefix"],
+          "properties": {
+            "vcs": { "const": "git" },
+            "commit": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "dirty": { "type": "boolean" },
+            "prefix": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["vcs"],
+          "properties": {
+            "vcs": { "const": "unknown" }
+          }
+        }
+      ]
+    },
+    "rebuild": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": {
+            "status": { "const": "consistent" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "call", "rule", "detail"],
+          "properties": {
+            "status": { "const": "inconsistent" },
+            "call": { "type": "integer", "minimum": 1 },
+            "rule": { "type": "integer", "minimum": 1, "maximum": 7 },
+            "detail": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "missing"],
+          "properties": {
+            "status": { "const": "unverifiable" },
+            "missing": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    }
+  }
+}

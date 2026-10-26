@@ -49,10 +49,7 @@ impl EngineAdapter for WaitCancelEngine {
     async fn run(&self, _request: EngineRunRequest, host: Arc<dyn HostPort>) -> EngineOutcome {
         host.cancellation().cancelled().await;
         EngineOutcome::Cancelled {
-            partial: Some(ArtifactDraft {
-                artifact_type: "report".to_owned(),
-                summary: "interrupted".to_owned(),
-            }),
+            partial: Some(ArtifactDraft::report("interrupted".to_owned())),
         }
     }
 }
@@ -106,10 +103,7 @@ impl EngineAdapter for InstantCompleteEngine {
     /// **边界**：用于证明终态提交后 `request_cancel` 不改库。
     async fn run(&self, _request: EngineRunRequest, _host: Arc<dyn HostPort>) -> EngineOutcome {
         EngineOutcome::Completed {
-            report: ArtifactDraft {
-                artifact_type: "report".to_owned(),
-                summary: "done".to_owned(),
-            },
+            report: ArtifactDraft::report("done".to_owned()),
         }
     }
 }

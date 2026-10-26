@@ -272,18 +272,21 @@ pub(crate) fn attempt_orphaned(attempt_id: AttemptId) -> EventBody {
 
 /// `attempt.started`：Attempt 进入 `Running`。
 ///
-/// **作用**：供 `prepare_drive` 写入 owner 与首次租约截止时间。
-/// **参数**：`owner` 是本进程标识；`lease_expires_at` 为 `now + TTL`。
+/// **作用**：供 `prepare_drive` 写入 owner、首次租约与可选的工作区版本。
+/// **参数**：`owner` 是本进程标识；`lease_expires_at` 为 `now + TTL`；
+/// `workspace_revision` 为 `None` 时不序列化该键（旧读者仍可反序列化）。
 /// **边界**：续期只改 Attempt 行，不再发本事件。
 pub(crate) fn attempt_started(
     attempt_id: AttemptId,
     owner: String,
     lease_expires_at: fluxaxiom_contract::Timestamp,
+    workspace_revision: Option<fluxaxiom_contract::WorkspaceRevision>,
 ) -> EventBody {
     EventBody::AttemptStarted(AttemptStartedPayload {
         attempt_id,
         owner,
         lease_expires_at,
+        workspace_revision,
     })
 }
 
