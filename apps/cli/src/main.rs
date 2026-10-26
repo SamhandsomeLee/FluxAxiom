@@ -2,7 +2,7 @@
 //!
 //! **作用**：组装 `RunHost` 与 `EngineA`，提供 `run` / `status` / `events` / `artifacts`。
 //! **边界**：`run` 内监听 Ctrl-C 并调用 `request_cancel`；第二次 Ctrl-C 强退（§4.8 / A3b）。
-//! 租约扫描在 `RunHost::open`。默认 Fake Engine；`--engine deepseek` 读 `DEEPSEEK_API_KEY`。
+//! 租约扫描在 `RunHost::open`。默认 Fake Engine；`--engine deepseek` 读 `DEEPSEEK_API_KEY`（环境变量，或当前目录向上的 `.env`）。
 
 mod data_dir;
 
@@ -91,8 +91,18 @@ enum EngineKind {
     Deepseek,
 }
 
+/// 进程入口。
+///
+/// **作用**：在 tokio 运行时启动之前加载 `.env`，此时还没有工作线程，写环境变量不会与读取竞争。
+/// **边界**：从当前目录向上找第一个 `.env`。已存在的环境变量优先，不被文件覆盖。找不到或解析失败都静默跳过，
+/// 缺密钥由 `build_engine` 报告。`.env` 已在 `.gitignore`；只有这里读文件，`engine-custom` 仍只读环境变量。
+fn main() {
+    let _ = dotenvy::dotenv();
+    real_main();
+}
+
 #[tokio::main]
-async fn main() {
+async fn real_main() {
     if let Err(error) = run().await {
         eprintln!("flux: {error}");
         std::process::exit(1);

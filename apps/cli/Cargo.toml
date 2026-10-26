@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
 fluxaxiom-contract = { path = "../../crates/agent-contract" }
 fluxaxiom-engine-api = { path = "../../crates/engine-api" }
 fluxaxiom-engine-custom = { path = "../../crates/engine-custom" }
