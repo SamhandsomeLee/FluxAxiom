@@ -1,2 +1,6 @@
 /target
 .env
+
+# samples 内独立项目的构建产物
+samples/**/target/
+samples/**/Cargo.lock
