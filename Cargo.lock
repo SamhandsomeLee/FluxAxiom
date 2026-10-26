@@ -476,6 +476,7 @@ dependencies = [
  "fluxaxiom-engine-custom",
  "fluxaxiom-run-host",
  "predicates",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
@@ -532,6 +533,7 @@ dependencies = [
  "fluxaxiom-engine-api",
  "log",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

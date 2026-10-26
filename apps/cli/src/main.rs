@@ -1,6 +1,6 @@
 //! FluxAxiom CLI：组合根。
 //!
-//! **作用**：组装 `RunHost` 与 `EngineA`，提供 `run` / `status` / `events` / `artifacts`。
+//! **作用**：组装 `RunHost` 与 `EngineA`，提供 `run` / `status` / `events` / `artifacts` / `trace`。
 //! **边界**：`run` 内监听 Ctrl-C 并调用 `request_cancel`；第二次 Ctrl-C 强退（§4.8 / A3b）。
 //! 租约扫描在 `RunHost::open`。默认 Fake Engine；`--engine deepseek` 读 `DEEPSEEK_API_KEY`（环境变量，或当前目录向上的 `.env`）。
 
@@ -16,11 +16,12 @@ use fluxaxiom_contract::{
 use fluxaxiom_engine_api::{EngineAdapter, EngineDescriptor};
 use fluxaxiom_engine_custom::{
     DeepSeekClient, EngineA, FakeChat, FakeStep, FinishReason, RecordingBackoff, ScriptedTurn,
-    SleepBackoff, API_KEY_ENV,
+    SleepBackoff, ToolCall, API_KEY_ENV,
 };
-use fluxaxiom_run_host::{CreateRun, HostError, RunHost};
+use fluxaxiom_run_host::{format_trace, CreateRun, HostError, RunHost, RunTrace};
+use serde_json::Value;
 
-/// FluxAxiom 只读仓库分析 CLI（P0a / A3）。
+/// FluxAxiom 只读仓库分析 CLI（P0a / A4a）。
 #[derive(Debug, Parser)]
 #[command(
     name = "flux",
@@ -74,11 +75,32 @@ enum Command {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
-    /// 列出该 Run 的 Artifact 摘要。
+    /// 列出该 Run 的 Artifact 摘要；`--show` 输出正文。
     Artifacts {
+        run_id: String,
+        /// 输出 Artifact 正文到 stdout。可跟 `artifact_id`；省略则依次输出全部。
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        show: Option<String>,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// 按「模型调用 → 工具调用」还原 Run 时间线（A4a）。
+    Trace {
         run_id: String,
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// 输出 `RunTrace` JSON。
+        #[arg(long)]
+        json: bool,
+        /// 打印第 N 轮（从 1 起）的请求 blob；默认遮盖 `reasoning_content`。
+        #[arg(long, value_name = "N")]
+        show_request: Option<u32>,
+        /// 打印第 N 轮的响应 blob。
+        #[arg(long, value_name = "N")]
+        show_response: Option<u32>,
+        /// 与 `--show-request` / `--show-response` 联用，输出思维链原文。
+        #[arg(long)]
+        include_reasoning: bool,
     },
 }
 
@@ -142,7 +164,26 @@ async fn run() -> Result<(), String> {
             follow,
             data_dir,
         } => cmd_events(run_id, after_sequence, follow, data_dir).await,
-        Command::Artifacts { run_id, data_dir } => cmd_artifacts(run_id, data_dir),
+        Command::Artifacts {
+            run_id,
+            show,
+            data_dir,
+        } => cmd_artifacts(run_id, show, data_dir),
+        Command::Trace {
+            run_id,
+            data_dir,
+            json,
+            show_request,
+            show_response,
+            include_reasoning,
+        } => cmd_trace(
+            run_id,
+            data_dir,
+            json,
+            show_request,
+            show_response,
+            include_reasoning,
+        ),
     }
 }
 
@@ -191,6 +232,7 @@ async fn cmd_run(
             "status={:?} terminal_reason={:?} last_sequence={} (idempotent; not re-driven)",
             snapshot.status, snapshot.terminal_reason, snapshot.last_sequence
         );
+        print_run_reports(&host, &run_id, snapshot.status)?;
         return require_completed(snapshot.status, snapshot.terminal_reason);
     }
     if existing {
@@ -235,15 +277,12 @@ async fn cmd_run(
         }
     });
 
-    let outcome = match host.drive_run(&run_id, engine.as_ref()).await {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            // Run 没有走到终态时轮询永远不会结束，必须停掉。
-            progress.abort();
-            interrupt.abort();
-            return Err(host_err(error));
-        }
-    };
+    if let Err(error) = host.drive_run(&run_id, engine.as_ref()).await {
+        // Run 没有走到终态时轮询永远不会结束，必须停掉。
+        progress.abort();
+        interrupt.abort();
+        return Err(host_err(error));
+    }
     interrupt.abort();
     let _ = progress.await;
 
@@ -252,7 +291,7 @@ async fn cmd_run(
         "status={:?} terminal_reason={:?} last_sequence={}",
         snapshot.status, snapshot.terminal_reason, snapshot.last_sequence
     );
-    println!("outcome={outcome:?}");
+    print_run_reports(&host, &run_id, snapshot.status)?;
     require_completed(snapshot.status, snapshot.terminal_reason)
 }
 
@@ -358,14 +397,47 @@ async fn cmd_events(
     }
 }
 
-/// `flux artifacts`：打印 Artifact 索引行。
+/// `flux artifacts`：打印索引行，或 `--show` 输出正文。
 ///
-/// **作用**：列出类型、`storage_ref` 与短摘要；不打开 blob 正文。
-/// **边界**：无产物时打印 `(no artifacts)` 并以零退出。
-fn cmd_artifacts(run_id: String, data_dir: Option<PathBuf>) -> Result<(), String> {
+/// **作用**：列表模式只打摘要；`--show` 把 blob 原文写到 stdout（A4a）。
+/// **参数**：`show` 为 `Some("")` 表示输出全部；`Some(id)` 只输出该 Artifact；`None` 为列表。
+/// **边界**：无产物时列表打印 `(no artifacts)`。blob 读不到时该项标 `unavailable`，不使整次失败。
+fn cmd_artifacts(
+    run_id: String,
+    show: Option<String>,
+    data_dir: Option<PathBuf>,
+) -> Result<(), String> {
     let host = open_host(data_dir)?;
     let id = parse_run_id(&run_id)?;
     let artifacts = host.list_artifacts(&id).map_err(host_err)?;
+    if let Some(filter) = show {
+        let selected: Vec<_> = if filter.is_empty() {
+            artifacts.iter().collect()
+        } else {
+            artifacts
+                .iter()
+                .filter(|artifact| artifact.artifact_id.as_str() == filter)
+                .collect()
+        };
+        if selected.is_empty() {
+            return if filter.is_empty() {
+                // 正文走 stdout；这条提示不能混进去。
+                eprintln!("(no artifacts)");
+                Ok(())
+            } else {
+                Err(format!("artifact not found: {filter}"))
+            };
+        }
+        for artifact in selected {
+            println!(
+                "--- artifact {} ({}) ---",
+                artifact.artifact_id.as_str(),
+                artifact.artifact_type
+            );
+            print_blob_text(&host, &artifact.storage_ref);
+        }
+        return Ok(());
+    }
     if artifacts.is_empty() {
         println!("(no artifacts)");
         return Ok(());
@@ -380,6 +452,167 @@ fn cmd_artifacts(run_id: String, data_dir: Option<PathBuf>) -> Result<(), String
         );
     }
     Ok(())
+}
+
+/// `flux trace`：打印 Run 时间线或 JSON（A4a）。
+///
+/// **作用**：按模型轮次还原工具调用；可选展示某轮请求/响应 blob。
+/// **边界**：默认不输出 `reasoning_content` 原文。坏 blob 显示 `unavailable`，退出码仍为 0（除非 Run 不存在）。
+/// 未终态 Run 也可以 trace。
+fn cmd_trace(
+    run_id: String,
+    data_dir: Option<PathBuf>,
+    json: bool,
+    show_request: Option<u32>,
+    show_response: Option<u32>,
+    include_reasoning: bool,
+) -> Result<(), String> {
+    let host = open_host(data_dir)?;
+    let id = parse_run_id(&run_id)?;
+    let trace = host.trace(&id).map_err(host_err)?;
+    if json {
+        let value = serde_json::to_value(&trace).map_err(|error| error.to_string())?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+        );
+    } else {
+        print!("{}", format_trace(&trace));
+    }
+    if let Some(n) = show_request {
+        print_round_blob(&host, &trace, n, true, include_reasoning)?;
+    }
+    if let Some(n) = show_response {
+        print_round_blob(&host, &trace, n, false, include_reasoning)?;
+    }
+    Ok(())
+}
+
+/// 在 `run` 收尾打印报告正文。
+///
+/// **作用**：代替 Debug 形式的 `outcome=`；`Completed` 用 `--- report`，其余终态带出的报告用 `--- partial report`。
+/// **边界**：没有 Artifact 时不打印分隔头。blob 读不到时打印 `unavailable`。
+/// 只有 `Completed` 的报告算完整：预算耗尽、取消和失败带出的都是已有的部分内容（§4.7.7）。
+fn print_run_reports(host: &RunHost, run_id: &RunId, status: RunStatus) -> Result<(), String> {
+    let artifacts = host.list_artifacts(run_id).map_err(host_err)?;
+    for artifact in artifacts {
+        println!("{}", report_header(status, artifact.artifact_id.as_str()));
+        print_blob_text(host, &artifact.storage_ref);
+    }
+    Ok(())
+}
+
+/// 报告分隔头。
+///
+/// **作用**：让读者一眼分清完整报告与部分报告。
+/// **边界**：只看 Run 状态；不判断内容是否真的残缺。
+fn report_header(status: RunStatus, artifact_id: &str) -> String {
+    if status == RunStatus::Completed {
+        format!("--- report {artifact_id} ---")
+    } else {
+        format!("--- partial report {artifact_id} ---")
+    }
+}
+
+/// 把 blob 当 UTF-8 文本写到 stdout，并保证以换行结尾。
+///
+/// **作用**：`run` 的报告和 `artifacts --show` 共用；真实模型的报告常常不以换行结尾，
+/// 不补的话 shell 提示符和下一个分隔头会黏在最后一行后面。
+/// **边界**：读不到打印 `unavailable`；不是 UTF-8 打印字节数。空正文不补换行。
+fn print_blob_text(host: &RunHost, storage_ref: &str) {
+    let blob_ref = fluxaxiom_engine_api::BlobRef::new(storage_ref.to_owned());
+    match host.read_blob(&blob_ref) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => print!("{}", with_trailing_newline(&text)),
+            Err(error) => println!("(binary {} bytes)", error.into_bytes().len()),
+        },
+        Err(_) => println!("unavailable"),
+    }
+}
+
+fn with_trailing_newline(text: &str) -> String {
+    if text.is_empty() || text.ends_with('\n') {
+        text.to_owned()
+    } else {
+        format!("{text}\n")
+    }
+}
+
+/// 打印某一模型轮的请求或响应 blob。
+///
+/// **参数**：`n` 从 1 起，对应带 `model` 的轮次；`request` 为真读 `request_ref`。
+/// **边界**：轮次不存在返回错误。JSON 里的 `reasoning_content` 默认替换为长度占位。
+fn print_round_blob(
+    host: &RunHost,
+    trace: &RunTrace,
+    n: u32,
+    request: bool,
+    include_reasoning: bool,
+) -> Result<(), String> {
+    if n == 0 {
+        return Err("round index starts at 1".to_owned());
+    }
+    let round = trace
+        .rounds
+        .iter()
+        .filter(|round| round.model.is_some())
+        .nth(n as usize - 1)
+        .ok_or_else(|| format!("model round #{n} not found"))?;
+    let model = round.model.as_ref().expect("filtered");
+    let blob_ref = if request {
+        model.request_ref.as_str()
+    } else {
+        model.response_ref.as_str()
+    };
+    let label = if request { "request" } else { "response" };
+    println!("--- {label} #{n} ({blob_ref}) ---");
+    match host.read_blob(&fluxaxiom_engine_api::BlobRef::new(blob_ref.to_owned())) {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            if include_reasoning {
+                println!("{text}");
+            } else {
+                println!("{}", redact_reasoning(&text));
+            }
+        }
+        Err(_) => println!("unavailable"),
+    }
+    Ok(())
+}
+
+/// 把 JSON 文本里的 `reasoning_content` 字符串值换成长度占位。
+///
+/// **作用**：`flux trace --show-request` 默认路径，避免把思维链打到终端。
+/// **边界**：解析失败时原样返回（并仍不含单独提取逻辑）。非对象根也原样返回。
+fn redact_reasoning(text: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<Value>(text) else {
+        return text.to_owned();
+    };
+    redact_reasoning_in_value(&mut value);
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| text.to_owned())
+}
+
+fn redact_reasoning_in_value(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(content)) = map.get("reasoning_content") {
+                let n = content.chars().count();
+                map.insert(
+                    "reasoning_content".to_owned(),
+                    Value::String(format!("[reasoning_content: {n} chars]")),
+                );
+            }
+            for child in map.values_mut() {
+                redact_reasoning_in_value(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_reasoning_in_value(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 轮询打印新事件，直到 Run 终态。
@@ -496,30 +729,55 @@ fn new_request_id() -> String {
     format!("req_{millis}_{}", std::process::id())
 }
 
-/// 单轮 Fake Engine：直接 `stop`，用于不拨号验收。
+/// Fake Engine：两轮工具后再 `stop`，供 A4a `trace` 验收；不拨号。
 ///
-/// **边界**：不调用真实工具。内容固定，证明 CLI→Host→EngineA 贯通。
+/// **边界**：工具针对授权工作区执行；工作区为空时 `list_files` 仍成功。报告正文固定。
 fn fake_engine() -> EngineA<FakeChat, RecordingBackoff> {
+    let usage = ModelUsage {
+        prompt_tokens: TokenCount::Known(10),
+        completion_tokens: TokenCount::Known(5),
+        prompt_cache_hit_tokens: TokenCount::Known(0),
+        prompt_cache_miss_tokens: TokenCount::Known(10),
+    };
     EngineA::new(
-        FakeChat::script([FakeStep::Turn(ScriptedTurn {
-            reasoning_deltas: vec!["plan".to_owned()],
-            content_deltas: vec!["Fake Engine A report.".to_owned()],
-            tool_calls: vec![],
-            finish_reason: FinishReason::Stop,
-            usage: ModelUsage {
-                prompt_tokens: TokenCount::Known(1),
-                completion_tokens: TokenCount::Known(1),
-                prompt_cache_hit_tokens: TokenCount::Unknown,
-                prompt_cache_miss_tokens: TokenCount::Unknown,
-            },
-        })]),
+        FakeChat::script([
+            FakeStep::Turn(ScriptedTurn {
+                reasoning_deltas: vec!["look around".to_owned()],
+                content_deltas: vec![String::new()],
+                tool_calls: vec![ToolCall {
+                    id: "call_list".to_owned(),
+                    name: "list_files".to_owned(),
+                    arguments: r#"{"path":""}"#.to_owned(),
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: usage.clone(),
+            }),
+            FakeStep::Turn(ScriptedTurn {
+                reasoning_deltas: vec!["search".to_owned()],
+                content_deltas: vec![String::new()],
+                tool_calls: vec![ToolCall {
+                    id: "call_search".to_owned(),
+                    name: "search_code".to_owned(),
+                    arguments: r#"{"query":"fn"}"#.to_owned(),
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: usage.clone(),
+            }),
+            FakeStep::Turn(ScriptedTurn {
+                reasoning_deltas: vec!["done".to_owned()],
+                content_deltas: vec!["Fake Engine A report.".to_owned()],
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage,
+            }),
+        ]),
         RecordingBackoff::default(),
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{event_kind, is_terminal, one_line};
+    use super::{event_kind, is_terminal, one_line, report_header, with_trailing_newline};
     use fluxaxiom_contract::{EmptyPayload, EventBody, RunStatus};
 
     #[test]
@@ -535,6 +793,31 @@ mod tests {
             event_kind(&EventBody::RunAccepted(EmptyPayload {})),
             "run.accepted"
         );
+    }
+
+    #[test]
+    fn only_completed_runs_have_a_full_report() {
+        assert_eq!(
+            report_header(RunStatus::Completed, "artifact_1"),
+            "--- report artifact_1 ---"
+        );
+        for status in [
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+            RunStatus::Cancelling,
+        ] {
+            assert_eq!(
+                report_header(status, "artifact_1"),
+                "--- partial report artifact_1 ---"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_newline_is_added_once() {
+        assert_eq!(with_trailing_newline("a"), "a\n");
+        assert_eq!(with_trailing_newline("a\n"), "a\n");
+        assert_eq!(with_trailing_newline(""), "");
     }
 
     #[test]

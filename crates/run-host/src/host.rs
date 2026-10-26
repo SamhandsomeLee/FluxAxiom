@@ -23,6 +23,7 @@ use crate::events;
 use crate::port::DrivePort;
 use crate::store;
 use crate::time::{lease_expires_at, lease_is_expired, now_utc, LEASE_RENEW_INTERVAL_SECS};
+use crate::trace::{self, RunTrace};
 
 /// 进程内共享的库连接和数据目录。
 ///
@@ -306,28 +307,9 @@ impl RunHost {
     pub fn snapshot(&self, run_id: &RunId) -> Result<RunSnapshot, HostError> {
         let mut connection = self.lock()?;
         let transaction = store::deferred(&mut connection)?;
-        let run = store::load_run(&transaction, run_id)?;
-        let last_sequence = events::max_sequence(&transaction, run_id)?;
-        let artifact_ids = events::artifact_ids(&transaction, run_id)?;
+        let snapshot = snapshot_in(&transaction, run_id)?;
         transaction.commit()?;
-        let snapshot = RunSnapshot {
-            schema_version: SCHEMA_VERSION.to_owned(),
-            run_id: run.run_id.clone(),
-            session_id: run.session_id,
-            status: run.status,
-            terminal_reason: run.terminal_reason,
-            last_sequence,
-            input_ref: run.input_ref,
-            workspace_ref: run.workspace_ref,
-            budget: run.budget,
-            artifact_ids,
-            updated_at: run.updated_at,
-        };
-        if snapshot.invariants_hold() {
-            Ok(snapshot)
-        } else {
-            Err(HostError::Corrupt("snapshot"))
-        }
+        Ok(snapshot)
     }
 
     /// 按主键读已持久化的 Session。
@@ -346,6 +328,38 @@ impl RunHost {
     pub fn get_attempt(&self, attempt_id: &AttemptId) -> Result<Attempt, HostError> {
         let connection = self.lock()?;
         store::load_attempt(&connection, attempt_id)
+    }
+
+    /// 组装一次 Run 的只读时间线（A4a）。
+    ///
+    /// **作用**：供 `flux trace` 打印或 JSON 导出；只读已提交事件与 Artifact 索引。
+    /// **参数**：`run_id` 必须已存在，否则 `NotFound`（与 `status` 相同）。
+    /// **边界**：快照、Attempt、事件与 Artifact 索引在同一条 `DEFERRED` 读事务里读取，未终态 Run 也不会看到新事件配旧状态。
+    /// 不解析 Provider JSON。blob 在事务之后读：某个 Artifact blob 读不到时该项 `bytes` 为 `None`（显示 `unavailable`），不使整次失败。请求/响应 blob 不在这里探测。
+    pub fn trace(&self, run_id: &RunId) -> Result<RunTrace, HostError> {
+        let (snapshot, attempt, events, artifacts) = {
+            let mut connection = self.lock()?;
+            let transaction = store::deferred(&mut connection)?;
+            let snapshot = snapshot_in(&transaction, run_id)?;
+            let attempt = store::latest_attempt(&transaction, run_id)?;
+            let events = events::load_after(&transaction, run_id, 0)?;
+            let artifacts = events::list_artifacts(&transaction, run_id)?;
+            transaction.commit()?;
+            (snapshot, attempt, events, artifacts)
+        };
+        let mut artifact_bytes = HashMap::new();
+        for artifact in &artifacts {
+            let blob_ref = BlobRef::new(artifact.storage_ref.clone());
+            if let Ok(bytes) = self.read_blob(&blob_ref) {
+                artifact_bytes.insert(artifact.artifact_id.as_str().to_owned(), bytes.len() as u64);
+            }
+        }
+        Ok(trace::build_trace(
+            &snapshot,
+            &attempt,
+            &events,
+            &artifact_bytes,
+        ))
     }
 
     /// 按幂等键读取。没有这条请求时返回 `NotFound`。
@@ -981,6 +995,37 @@ fn report_draft(outcome: &EngineOutcome) -> Option<&ArtifactDraft> {
 struct PreparedCreate {
     request_id: String,
     record: CreatedRun,
+}
+
+/// 在调用方给的读事务里组装 [`RunSnapshot`]。
+///
+/// **作用**：`snapshot` 与 `trace` 共用，使两者读到同一套状态、序号和 Artifact 索引。
+/// **边界**：不开事务、不提交；一致性由调用方的事务提供。参数取 `Transaction` 是因为 `max_sequence` 要求调用方已在事务里。
+fn snapshot_in(
+    transaction: &rusqlite::Transaction<'_>,
+    run_id: &RunId,
+) -> Result<RunSnapshot, HostError> {
+    let run = store::load_run(transaction, run_id)?;
+    let last_sequence = events::max_sequence(transaction, run_id)?;
+    let artifact_ids = events::artifact_ids(transaction, run_id)?;
+    let snapshot = RunSnapshot {
+        schema_version: SCHEMA_VERSION.to_owned(),
+        run_id: run.run_id.clone(),
+        session_id: run.session_id,
+        status: run.status,
+        terminal_reason: run.terminal_reason,
+        last_sequence,
+        input_ref: run.input_ref,
+        workspace_ref: run.workspace_ref,
+        budget: run.budget,
+        artifact_ids,
+        updated_at: run.updated_at,
+    };
+    if snapshot.invariants_hold() {
+        Ok(snapshot)
+    } else {
+        Err(HostError::Corrupt("snapshot"))
+    }
 }
 
 fn validate_create(request: &CreateRun) -> Result<(), HostError> {

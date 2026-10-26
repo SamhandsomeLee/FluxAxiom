@@ -12,6 +12,10 @@ mod host;
 mod port;
 mod store;
 mod time;
+mod trace;
 
 pub use error::HostError;
 pub use host::{CreateRun, CreatedRun, RunHost};
+pub use trace::{
+    format_trace, RunTrace, TraceArtifact, TraceModelCall, TraceRound, TraceToolCall, TraceTotals,
+};

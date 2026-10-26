@@ -52,10 +52,11 @@ cargo test -p fluxaxiom-engine-custom --test sse -- --ignored
 
 | 命令 | 作用 |
 |---|---|
-| `flux run` | 创建 Run、同步驱动 Engine，边跑边打印已提交事件。只有 `Completed` 以零退出 |
+| `flux run` | 创建 Run、同步驱动 Engine，边跑边打印已提交事件；收尾打印报告正文。只有 `Completed` 以零退出 |
 | `flux status <run_id>` | 打印 Run 快照 |
 | `flux events <run_id> [--after-sequence N] [--follow]` | 打印 durable events；`--follow` 轮询到终态 |
-| `flux artifacts <run_id>` | 列出该 Run 的 Artifact 摘要 |
+| `flux artifacts <run_id> [--show [artifact_id]]` | 列出 Artifact 摘要；`--show` 输出正文 |
+| `flux trace <run_id> [--json] [--show-request N] [--show-response N] [--include-reasoning]` | 按模型轮次还原工具调用时间线 |
 
 `run` 的主要参数：`--workspace`、`--prompt`、`--request-id`（幂等键）、`--engine fake|deepseek`、`--max-model-calls`（默认 8）、`--max-tool-calls`（默认 32）。
 
@@ -78,4 +79,4 @@ Ctrl-C 取消当前 Run（`Cancelled`），第二次 Ctrl-C 强制退出。进�
 
 ## 进度
 
-P0a 已完成 A0–A3（契约、Host、DeepSeek 客户端与只读 Engine、CLI 与中断语义）。A4（样本与可重建）、A5（只读安全负向测试）暂停，当前优先对真实 DeepSeek 做端到端验证。详见 `docs/development/P0阶段执行方案 v1.1.md`。
+P0a 已完成 A0–A3，以及 A4a（`flux trace` 与报告读取）。下一步为 A4b（可重建性校验与样本记录）与 A5（只读安全负向测试）。详见 `docs/development/P0阶段执行方案 v1.1.md`。
