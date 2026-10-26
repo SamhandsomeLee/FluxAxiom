@@ -56,7 +56,9 @@ cargo test -p fluxaxiom-engine-custom --test sse -- --ignored
 | `flux status <run_id>` | 打印 Run 快照 |
 | `flux events <run_id> [--after-sequence N] [--follow]` | 打印 durable events；`--follow` 轮询到终态 |
 | `flux artifacts <run_id> [--show [artifact_id]]` | 列出 Artifact 摘要；`--show` 输出正文 |
-| `flux trace <run_id> [--json] [--show-request N] [--show-response N] [--include-reasoning]` | 按模型轮次还原工具调用时间线 |
+| `flux trace <run_id> [--json] [--verify] [--show-request N] [--show-response N] [--include-reasoning]` | 按模型轮次查看调用时间线；`--verify` 检查请求链一致性 |
+| `flux sample export <run_id> [--out FILE]` | 导出引用/摘要式 Sample JSON，含重建结论与反馈 |
+| `flux sample feedback <run_id> --verdict usable\|needs-edit\|redo [--note TEXT]` | 为一次 Run 追加人工评价（实际 CLI 选项可用 `--help` 校对） |
 
 `run` 的主要参数：`--workspace`、`--prompt`、`--request-id`（幂等键）、`--engine fake|deepseek`、`--max-model-calls`（默认 8）、`--max-tool-calls`（默认 32）。
 
@@ -79,4 +81,4 @@ Ctrl-C 取消当前 Run（`Cancelled`），第二次 Ctrl-C 强制退出。进�
 
 ## 进度
 
-P0a 已完成 A0–A3，以及 A4a（`flux trace` 与报告读取）。下一步为 A4b（可重建性校验与样本记录）与 A5（只读安全负向测试）。详见 `docs/development/P0阶段执行方案 v1.1.md`。
+截至 2026-10-26（`main` 基线 `d6f1a384`），P0a 的 A0–A3、A4a（Trace / 报告读取）、A4b（请求链校验、Sample / Feedback）已实现并通过 CI；真实模型验收另计。**下一阶段是 A5 只读安全负向测试 → G-A 基础验收和至少 5 个实际使用日、10 次有记录的任务 → G-A 通过后才进入 P0b Effect Gateway。** B3 前还需确认宿主 OS 的沙箱/网络/凭据隔离方案。详细 PR、数据证据与阶段门禁见 `docs/development/P0阶段执行方案 v1.1.md` §4.13、§4.14、§5.4、§12；总体边界见 V0.3 §14。

@@ -892,6 +892,12 @@ FluxAxiom/
 
 **P0a 不要求**审批全流程、写操作的崩溃对账、Codex、Web、MCP、Cordis、Multi-Agent、长期 Memory、GPU、通用插件容器、多仓库发布流水线。只保留 Contract 中的必要语义和迁移空间。
 
+**实施状态同步（2026-10-26，main `d6f1a384`）**：本表是分阶段设计目标，不表示全部完成。A-1、A0–A3、A4a（Trace/报告）、A4b（Rebuild/Sample/Feedback）已有代码与回归测试；最新 CI 已通过。A4b 将 `tool_call_id` 作为工具执行证据透传，历史事件缺关联 ID 时不得推断一致；真实 DeepSeek Run 与安全边界仍需实机验收。下一主线为 **A5 只读负向测试 → G-A 实际使用门禁 → B3/B4**，其唯一可执行的 PR 级清单见《P0 阶段执行方案 v1.1》`4.13、`4.14、`5.4、`12。
+
+**P0a 的两种独立完成条件**：① 工程闭环（CI、Run/Attempt/Event、Trace、Sample）已经具备；② 可用且可信的验收（只读安全、真实模型的请求重建和报告事实、关闭/重启后的持久访问、5 个实际使用日且至少 10 次有记录任务）尚待形成证据。`Completed`、`rebuild=consistent`、事实正确各自证明不同性质，任何一项都不能替代另一项。若多数报告必须重做，暂停 P0b，优先修 Engine A 的工具/Prompt/结果质量。
+
+**A5 保证边界**：复用现有路径、symlink、`.env`/ignore 和分页工具测试，重点新增 Fake Model → Engine Tool Dispatch → HostPort/Event → CLI/Sample 的越权/泄漏证明；用户文件、`README`/`AGENTS.md` 和 Model Tool Call 都不构成权限来源。`canonicalize` 再 `open` 不能构成 TOCTOU 免疫，更不能替代 P0b 经 OS 实证的沙箱。
+
 ### 14.2 P0b：先验证可靠性，再验证可替换性
 
 | 顺序 | 工作包 | 交付及验收 |
@@ -905,6 +911,15 @@ FluxAxiom/
 | B2 | **E-001 对照报告** | 同业务/任务 A/B，对保证差异、模拟语义和维护成本出具证据 |
 
 **阶段门槛**：B3/B4 的状态与恢复语义在 Engine A 测试通过前，暂停 B1/B5 的业务适配；避免分不清 Contract 错误与第三方模型限制。
+
+#### 14.2.1 B3/B4 实施拆分与前置约束（2026-10-26）
+
+这不是新的状态机或新的 Contract v1 承诺；`7` 的 Effect/Approval/Unknown 语义保持不变。通过 G-A 后依次交付：**B3-01 Effect Contract → B3-02 Host Ledger/事务事件 → B3-03 确定性 Policy/Approval once → B3-04 受控 `write_file` 再 `apply_patch` → B4-01 崩溃注入/Unknown → B4-02 对账/取消分级 → B6-A 安全回归/G-B**。每一项的测试证据与落点以 P0 执行方案 `5.4` 为准。
+
+- **B3 前必须锁定 OS 专项 ADR**：真实宿主 OS 的沙箱类型、授权写入路径、网络出口、环境变量/凭据隔离、进程组停止方式和可核验证据。可丢弃 worktree 是数据保护手段，不等于 OS 沙箱。
+- **Engine 不自行执行 Host-owned Effect**：`HostPort::propose_effect` 是候选意图入口；Host 校验规范参数、持久化 Intent、创建一次性 Approval、等待裁决、提交 Dispatching 后交给受控 Executor。批准时不持有 SQLite 长事务，等待审批不等于 Run `WaitingInput`。
+- **未知结果不能当失败**：SQLite 与外部写入没有跨系统原子性。`Dispatching` 后崩溃进入 `Unknown`，需核对 `Succeeded/Failed/NotApplied`；不使用同 Effect ID 自动重放。存在未决 Effect 的 Run 进入 `NeedsReconciliation`，不是简单沿用 P0a 的 `Failed(host_restart)`。
+- **强保证只来自实际强制点**：`args_digest` 绑定审批参数却不能阻止 symlink/TOCTOU；缺少 OS 证据时不开放不可信写入，不声称 `sandbox verified`。完成 B3/B4/B6-A 的 Engine A 实验后才启动 Codex 的 T/H/D 实测。
 
 ### 14.3 P0 通过标准
 
@@ -1042,7 +1057,9 @@ H1：同一业务 Task，在 A/B 切换时不修改 Experience 核心代码；�
 7. `FluxAxiom` 名称、仓库地址和未来发布标识是否最终确认？
 8. 哪些能力实际形成第二份实现，足以证明独立 `engine-api` / `inference` / `storage` crate 的必要性？
 
-### 19.3 P0a 开工检查清单
+### 19.3 P0a 开工检查清单（2026-10-20 历史基线）
+
+以下为最初启动时的规划记录，保留原始勾选状态，不代表 2026-10-26 的当前待办；下一轮工作请按 §14.1 状态同步与 P0 执行方案 §12 执行。
 
 - [ ] 确定项目最终名称，初始化 Monorepo 和最小 Cargo Workspace，记录 ADR-018 与 README 范围。
 - [ ] 配置 `main` 的基本构建/测试门槛，以及最小 Issue/PR 模板；不创建未使用的未来模块。
