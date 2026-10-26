@@ -892,7 +892,7 @@ FluxAxiom/
 
 **P0a 不要求**审批全流程、写操作的崩溃对账、Codex、Web、MCP、Cordis、Multi-Agent、长期 Memory、GPU、通用插件容器、多仓库发布流水线。只保留 Contract 中的必要语义和迁移空间。
 
-**实施状态同步（2026-10-26，main `d6f1a384`）**：本表是分阶段设计目标，不表示全部完成。A-1、A0–A3、A4a（Trace/报告）、A4b（Rebuild/Sample/Feedback）已有代码与回归测试；最新 CI 已通过。A4b 将 `tool_call_id` 作为工具执行证据透传，历史事件缺关联 ID 时不得推断一致；真实 DeepSeek Run 与安全边界仍需实机验收。下一主线为 **A5 只读负向测试 → G-A 实际使用门禁 → B3/B4**，其唯一可执行的 PR 级清单见《P0 阶段执行方案 v1.1》`4.13、`4.14、`5.4、`12。
+**实施状态同步（2026-10-26，main `d6f1a384`）**：本表是分阶段设计目标，不表示全部完成。A-1、A0–A3、A4a（Trace/报告）、A4b（Rebuild/Sample/Feedback）已有代码与回归测试；最新 CI 已通过。A4b 将 `tool_call_id` 作为工具执行证据透传，历史事件缺关联 ID 时不得推断一致；真实 DeepSeek Run 与安全边界仍需实机验收。下一主线为 **A5 只读负向测试 → G-A 实际使用门禁 → B3/B4**，其唯一可执行的 PR 级清单见《P0 阶段执行方案 v1.1》§4.13、§4.14、§5.4、§12。
 
 **P0a 的两种独立完成条件**：① 工程闭环（CI、Run/Attempt/Event、Trace、Sample）已经具备；② 可用且可信的验收（只读安全、真实模型的请求重建和报告事实、关闭/重启后的持久访问、5 个实际使用日且至少 10 次有记录任务）尚待形成证据。`Completed`、`rebuild=consistent`、事实正确各自证明不同性质，任何一项都不能替代另一项。若多数报告必须重做，暂停 P0b，优先修 Engine A 的工具/Prompt/结果质量。
 
@@ -914,7 +914,7 @@ FluxAxiom/
 
 #### 14.2.1 B3/B4 实施拆分与前置约束（2026-10-26）
 
-这不是新的状态机或新的 Contract v1 承诺；`7` 的 Effect/Approval/Unknown 语义保持不变。通过 G-A 后依次交付：**B3-01 Effect Contract → B3-02 Host Ledger/事务事件 → B3-03 确定性 Policy/Approval once → B3-04 受控 `write_file` 再 `apply_patch` → B4-01 崩溃注入/Unknown → B4-02 对账/取消分级 → B6-A 安全回归/G-B**。每一项的测试证据与落点以 P0 执行方案 `5.4` 为准。
+这不是新的状态机或新的 Contract v1 承诺；§7 的 Effect/Approval/Unknown 语义保持不变。通过 G-A 后依次交付：**B3-01 Effect Contract → B3-02 Host Ledger/事务事件 → B3-03 确定性 Policy/Approval once → B3-04 受控 `write_file` 再 `apply_patch` → B4-01 崩溃注入/Unknown → B4-02 对账/取消分级 → B6-A 安全回归/G-B**。每一项的测试证据与落点以 P0 执行方案 `5.4` 为准。
 
 - **B3 前必须锁定 OS 专项 ADR**：真实宿主 OS 的沙箱类型、授权写入路径、网络出口、环境变量/凭据隔离、进程组停止方式和可核验证据。可丢弃 worktree 是数据保护手段，不等于 OS 沙箱。
 - **Engine 不自行执行 Host-owned Effect**：`HostPort::propose_effect` 是候选意图入口；Host 校验规范参数、持久化 Intent、创建一次性 Approval、等待裁决、提交 Dispatching 后交给受控 Executor。批准时不持有 SQLite 长事务，等待审批不等于 Run `WaitingInput`。
