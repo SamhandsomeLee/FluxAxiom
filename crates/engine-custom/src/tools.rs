@@ -193,11 +193,10 @@ pub fn list_files(
     }
     ensure_visible(root, &directory)?;
     let mut names = Vec::new();
-    let mut walker = walk_from(&directory);
-    walker.max_depth(Some(1));
+    let walker = directory_walker(root, &directory)?;
     for entry in walker.build() {
         let entry = entry.map_err(|_| ToolError::Io)?;
-        if entry.depth() == 0 {
+        if entry.path().parent() != Some(directory.as_path()) {
             continue;
         }
         let Some(name) = entry.file_name().to_str() else {
@@ -393,6 +392,27 @@ fn walk_from(path: &Path) -> WalkBuilder {
     walker
 }
 
+/// 从授权根遍历到目标目录的直接子项，沿途保留根内的忽略规则及覆盖顺序。
+///
+/// **作用**：列表和直接读取的可见性判断与根起点搜索一致；不把上层规则重解释为目标目录规则。
+/// **参数**：`directory` 已由 resolve 规范化。仅进入通往它的祖先和它的直接子项，不递归兄弟子树。
+/// **边界**：根外路径返回 OutsideRoot；忽略文件仍由 walk_from 处理，不读取授权根上层规则。
+fn directory_walker(root: &WorkspaceRoot, directory: &Path) -> Result<WalkBuilder, ToolError> {
+    let depth = directory
+        .strip_prefix(root.as_path())
+        .map_err(|_| WorkspaceError::OutsideRoot)?
+        .components()
+        .count();
+    let selected = directory.to_path_buf();
+    let mut walker = walk_from(root.as_path());
+    walker
+        .max_depth(Some(depth + 1))
+        .filter_entry(move |entry| {
+            selected.starts_with(entry.path()) || entry.path().parent() == Some(selected.as_path())
+        });
+    Ok(walker)
+}
+
 /// 路径的每一层是否都会被同一套遍历交出来。
 ///
 /// **作用**：`read_file` 用它拒绝列表和搜索看不到的文件。
@@ -408,7 +428,7 @@ fn ensure_visible(root: &WorkspaceRoot, path: &Path) -> Result<(), ToolError> {
         if part == ".git" {
             return Err(ToolError::Ignored);
         }
-        if !parent_lists_child(&directory, OsStr::new(part))? {
+        if !parent_lists_child(root, &directory, OsStr::new(part))? {
             return Err(ToolError::Ignored);
         }
         directory.push(part);
@@ -418,14 +438,17 @@ fn ensure_visible(root: &WorkspaceRoot, path: &Path) -> Result<(), ToolError> {
 
 /// 父目录的一页遍历里是否出现这个名字。
 ///
-/// **参数**：`directory` 是已经可见的目录。`child` 是下一层的文件名。
-/// **边界**：只看深度 1。遍历规则与 `list_files` 相同，因此隐藏文件和被忽略目录都不会出现。
-fn parent_lists_child(directory: &Path, child: &OsStr) -> Result<bool, ToolError> {
-    let mut walker = walk_from(directory);
-    walker.max_depth(Some(1));
+/// **参数**：`root` 固定忽略规则的起点；`directory` 是已经可见的目录，`child` 是下一层的文件名。
+/// **边界**：只接受 directory 的直接子项；从授权根继承忽略规则，与列表和搜索一致。
+fn parent_lists_child(
+    root: &WorkspaceRoot,
+    directory: &Path,
+    child: &OsStr,
+) -> Result<bool, ToolError> {
+    let walker = directory_walker(root, directory)?;
     for entry in walker.build() {
         let entry = entry.map_err(|_| ToolError::Io)?;
-        if entry.depth() == 1 && entry.file_name() == child {
+        if entry.path().parent() == Some(directory) && entry.file_name() == child {
             return Ok(true);
         }
     }

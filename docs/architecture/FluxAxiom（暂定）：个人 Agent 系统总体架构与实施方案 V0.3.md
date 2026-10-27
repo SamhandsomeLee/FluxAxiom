@@ -896,7 +896,7 @@ FluxAxiom/
 
 **P0a 的两种独立完成条件**：① 工程闭环（CI、Run/Attempt/Event、Trace、Sample）已经具备；② 可用且可信的验收（只读安全、真实模型的请求重建和报告事实、关闭/重启后的持久访问、5 个实际使用日且至少 10 次有记录任务）尚待形成证据。`Completed`、`rebuild=consistent`、事实正确各自证明不同性质，任何一项都不能替代另一项。若多数报告必须重做，暂停 P0b，优先修 Engine A 的工具/Prompt/结果质量。
 
-**A5 保证边界**：复用现有路径、symlink、`.env`/ignore 和分页工具测试，重点新增 Fake Model → Engine Tool Dispatch → HostPort/Event → CLI/Sample 的越权/泄漏证明；用户文件、`README`/`AGENTS.md` 和 Model Tool Call 都不构成权限来源。`canonicalize` 再 `open` 不能构成 TOCTOU 免疫，更不能替代 P0b 经 OS 实证的沙箱。
+**A5 保证边界**：复用现有路径、symlink、`.env`/ignore 和分页工具测试，重点新增 Fake Model → Engine Tool Dispatch → HostPort/Event → CLI/Sample 的越权/泄漏证明；用户文件、`README`/`AGENTS.md` 和 Model Tool Call 都不构成权限来源。`canonicalize` 再 `open` 不能构成 TOCTOU 免疫，更不能替代 P0b 经 OS 实证的沙箱。可执行切片与残余风险声明见执行方案 §4.13 与 **ADR-024**。
 
 ### 14.2 P0b：先验证可靠性，再验证可替换性
 

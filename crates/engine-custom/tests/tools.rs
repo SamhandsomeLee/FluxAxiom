@@ -83,15 +83,13 @@ fn absolute_and_parent_paths_stay_inside_the_root() {
 
 /// 指向根外的符号链接不能当根内文件读。
 ///
-/// **边界**：当前进程建不了符号链接时跳过。能建时，解析必须拒绝。
+/// **边界**：默认明确记为 ignored；CI 单独执行，建不了链接时失败，不能算安全通过。
 #[test]
+#[ignore = "requires symlink capability; CI runs explicitly with --ignored"]
 fn symlink_pointing_outside_is_rejected() {
     let (root, root_path, outside) = fixture();
     let link = root_path.join("leak.txt");
-    if !make_file_symlink(outside.join("outside.txt").as_path(), &link) {
-        eprintln!("skipping symlink_pointing_outside_is_rejected: symlink could not be created");
-        return;
-    }
+    make_file_symlink(outside.join("outside.txt").as_path(), &link);
     let error = read_file(&root, "leak.txt", 1).unwrap_err();
     assert_eq!(error, ToolError::Workspace(WorkspaceError::OutsideRoot));
 }
@@ -288,6 +286,99 @@ fn parent_gitignore_does_not_apply() {
     let root = WorkspaceRoot::open(&child).unwrap();
     let rendered = read_file(&root, "lib.rs", 1).unwrap().render();
     assert!(rendered.contains("fn keep() {}"));
+}
+
+/// 根内祖先的 glob、带路径规则和忽略目录，对列表、直接读取、搜索同时生效。
+///
+/// **边界**：分别覆盖 .gitignore / .ignore，且带根锚点的规则不能错误屏蔽更深层同名文件。
+/// 合成密钥标记不出现在任何成功结果；测试目录自动回收。
+#[test]
+fn ancestor_ignore_rules_apply_to_all_tools() {
+    for ignore_file in [".gitignore", ".ignore"] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        fs::create_dir_all(path.join("src/deep")).unwrap();
+        fs::create_dir_all(path.join("src/cache")).unwrap();
+        fs::write(
+            path.join(ignore_file),
+            "*.key\n/src/secret.txt\n/src/cache/\n",
+        )
+        .unwrap();
+        for file in [
+            "src/private.key",
+            "src/secret.txt",
+            "src/deep/private.key",
+            "src/cache/data.txt",
+        ] {
+            fs::write(path.join(file), "SYNTHETIC_SECRET_MARKER\n").unwrap();
+        }
+        fs::write(path.join("src/deep/secret.txt"), "PUBLIC_MARKER\n").unwrap();
+        let root = WorkspaceRoot::open(path).unwrap();
+        for file in [
+            "src/private.key",
+            "src/secret.txt",
+            "src/deep/private.key",
+            "src/cache/data.txt",
+        ] {
+            assert_eq!(
+                read_file(&root, file, 1).unwrap_err(),
+                ToolError::Ignored,
+                "{ignore_file}: {file}"
+            );
+        }
+        assert_eq!(
+            list_files(&root, "src/cache", 1).unwrap_err(),
+            ToolError::Ignored
+        );
+        let listed = list_files(&root, "src", 1).unwrap().render();
+        for hidden in ["private.key", "secret.txt", "cache/"] {
+            assert!(
+                !listed.lines().any(|line| line == hidden),
+                "{ignore_file}: {hidden}"
+            );
+        }
+        let deep = list_files(&root, "src/deep", 1).unwrap().render();
+        assert!(!deep.contains("private.key"));
+        assert!(deep.lines().any(|line| line == "secret.txt"));
+        assert!(read_file(&root, "src/deep/secret.txt", 1)
+            .unwrap()
+            .render()
+            .contains("PUBLIC_MARKER"));
+        let searched = search_code(&root, "MARKER", 0).unwrap().render();
+        assert!(!searched.contains("SYNTHETIC_SECRET_MARKER"));
+        assert!(searched.contains("src/deep/secret.txt:1:PUBLIC_MARKER"));
+    }
+}
+
+/// 子目录的否定规则可覆盖祖先 glob，三个工具应保留同一个重新放行的文件。
+///
+/// **边界**：覆盖 .gitignore / .ignore 的层级优先级，不改变同目录中的其它被忽略文件。
+#[test]
+fn nested_negation_overrides_ancestor_ignore_for_all_tools() {
+    for ignore_file in [".gitignore", ".ignore"] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        fs::create_dir(path.join("src")).unwrap();
+        fs::write(path.join(ignore_file), "*.key\n").unwrap();
+        fs::write(path.join("src").join(ignore_file), "!public.key\n").unwrap();
+        fs::write(path.join("src/public.key"), "PUBLIC_MARKER\n").unwrap();
+        fs::write(path.join("src/private.key"), "SYNTHETIC_SECRET_MARKER\n").unwrap();
+        let root = WorkspaceRoot::open(path).unwrap();
+        assert!(read_file(&root, "src/public.key", 1)
+            .unwrap()
+            .render()
+            .contains("PUBLIC_MARKER"));
+        assert_eq!(
+            read_file(&root, "src/private.key", 1).unwrap_err(),
+            ToolError::Ignored
+        );
+        let listed = list_files(&root, "src", 1).unwrap().render();
+        assert!(listed.lines().any(|line| line == "public.key"));
+        assert!(!listed.contains("private.key"));
+        let searched = search_code(&root, "MARKER", 0).unwrap().render();
+        assert!(searched.contains("src/public.key:1:PUBLIC_MARKER"));
+        assert!(!searched.contains("SYNTHETIC_SECRET_MARKER"));
+    }
 }
 
 /// 列表和搜索的小结果用完整文本断言。
@@ -495,20 +586,108 @@ fn nul_after_the_first_line_rejects_the_file() {
 
 /// 指向根外目录的符号链接不能当根内目录用。
 ///
-/// **边界**：建不了目录符号链接时打印一行并返回。能建时必须是 `OutsideRoot`。
+/// **边界**：默认明确记为 ignored；显式执行时，缺少目录链接能力会失败并标注未验证。
 #[test]
+#[ignore = "requires symlink capability; CI runs explicitly with --ignored"]
 fn directory_symlink_pointing_outside_is_rejected() {
     let (root, root_path, outside) = fixture();
     fs::write(outside.join("inside.txt"), "linked-body\n").unwrap();
     let link = root_path.join("linked");
-    if !make_dir_symlink(&outside, &link) {
-        eprintln!(
-            "skipping directory_symlink_pointing_outside_is_rejected: symlink could not be created"
-        );
-        return;
-    }
+    make_dir_symlink(&outside, &link);
     let error = read_file(&root, "linked/inside.txt", 1).unwrap_err();
     assert_eq!(error, ToolError::Workspace(WorkspaceError::OutsideRoot));
+    let listed = list_files(&root, "linked", 1).unwrap_err();
+    assert_eq!(listed, ToolError::Workspace(WorkspaceError::OutsideRoot));
+}
+
+/// 非法工具参数在读盘前失败（A5-01）。
+///
+/// **作用**：补齐 `page` / `start_line` / `query` 的受控拒绝，错误文本不含路径与正文。
+/// **边界**：`page=0`、`start_line=0`、空查询与含换行的查询均为 `InvalidRequest`。
+#[test]
+fn invalid_tool_parameters_are_rejected_before_io() {
+    let (root, root_path, _) = fixture();
+    let before = file_digest(&root_path.join("src").join("lib.rs"));
+    assert_eq!(
+        list_files(&root, "src", 0).unwrap_err(),
+        ToolError::InvalidRequest
+    );
+    assert_eq!(
+        read_file(&root, "src/lib.rs", 0).unwrap_err(),
+        ToolError::InvalidRequest
+    );
+    assert_eq!(
+        search_code(&root, "", 0).unwrap_err(),
+        ToolError::InvalidRequest
+    );
+    assert_eq!(
+        search_code(&root, "host\n", 0).unwrap_err(),
+        ToolError::InvalidRequest
+    );
+    assert_eq!(before, file_digest(&root_path.join("src").join("lib.rs")));
+    assert!(!ToolError::InvalidRequest.to_string().contains("lib.rs"));
+}
+
+/// resolve 成功后把同名路径换成根外 symlink，再读必须受控失败（A5-01 / ADR-024）。
+///
+/// **作用**：静态、可重复地模拟「校验后路径身份变成根外链接」；不用并发线程，不加 resolve/open 测试缝。
+/// **边界**：默认明确记为 ignored；显式执行时建不了链接会失败（未验证）。根外目标字节前后不变；错误与任何 Ok 正文都不得含 `OUTSIDE_SECRET`。
+/// 不证明单次 `read_file` 调用内部的并发 TOCTOU 已关闭。
+#[test]
+#[ignore = "requires symlink capability; CI runs explicitly with --ignored"]
+fn bait_path_swapped_for_outside_symlink_is_rejected() {
+    let (root, root_path, outside) = fixture();
+    let bait = root_path.join("bait.txt");
+    let outside_target = outside.join("outside-secret.txt");
+    fs::write(&bait, "INSIDE\n").unwrap();
+    fs::write(&outside_target, "OUTSIDE_SECRET\n").unwrap();
+    let outside_before = file_digest(&outside_target);
+
+    assert!(root.resolve("bait.txt").is_ok());
+
+    fs::remove_file(&bait).unwrap();
+    make_file_symlink(&outside_target, &bait);
+
+    let error = read_file(&root, "bait.txt", 1).unwrap_err();
+    assert_eq!(error, ToolError::Workspace(WorkspaceError::OutsideRoot));
+    assert!(!error.to_string().contains("OUTSIDE_SECRET"));
+    assert!(!format!("{error:?}").contains("OUTSIDE_SECRET"));
+    assert_eq!(outside_before, file_digest(&outside_target));
+    assert_eq!(
+        fs::read_to_string(&outside_target).unwrap(),
+        "OUTSIDE_SECRET\n"
+    );
+}
+
+/// 工作区关键文件在越界尝试前后字节不变（A5-01）。
+///
+/// **边界**：绝对路径与 `../` 失败后，根内 `src/lib.rs` 与根外 `outside.txt` 摘要不变。
+#[test]
+fn outside_escape_attempts_do_not_mutate_workspace_bytes() {
+    let (root, root_path, outside) = fixture();
+    let inside = root_path.join("src").join("lib.rs");
+    let outside_file = outside.join("outside.txt");
+    let inside_before = file_digest(&inside);
+    let outside_before = file_digest(&outside_file);
+    let _ = read_file(&root, "../outside.txt", 1);
+    let _ = read_file(&root, outside_file.to_str().unwrap(), 1);
+    assert_eq!(inside_before, file_digest(&inside));
+    assert_eq!(outside_before, file_digest(&outside_file));
+}
+
+/// 文件内容的稳定摘要，供测试前后比对。
+///
+/// **边界**：用字节长度与简单滚动和，避免为测试引入哈希依赖。碰撞在本夹具下可接受。
+fn file_digest(path: &Path) -> (u64, u64) {
+    let bytes = fs::read(path).unwrap();
+    let mut rolling = 0_u64;
+    for (index, byte) in bytes.iter().enumerate() {
+        rolling = rolling
+            .wrapping_mul(131)
+            .wrapping_add(*byte as u64)
+            .wrapping_add(index as u64);
+    }
+    (bytes.len() as u64, rolling)
 }
 
 #[cfg(windows)]
@@ -525,23 +704,23 @@ fn leading_backslash_without_a_drive_is_outside() {
 /// 在当前系统上建立文件符号链接。
 ///
 /// **参数**：`target` 是根外文件。`link` 是根内的新路径。
-/// **边界**：权限不够时返回 false。调用方必须打印跳过原因。
-fn make_file_symlink(target: &Path, link: &Path) -> bool {
+/// **边界**：建链失败时使显式能力验收失败，不能把未验证记录成通过；保留 OS 错误原因。
+fn make_file_symlink(target: &Path, link: &Path) {
     #[cfg(windows)]
     let result = std::os::windows::fs::symlink_file(target, link);
     #[cfg(not(windows))]
     let result = std::os::unix::fs::symlink(target, link);
-    result.is_ok()
+    result.expect("UNVERIFIED: file symlink capability is required for this security test");
 }
 
 /// 在当前系统上建立目录符号链接。
 ///
 /// **参数**：`target` 是根外目录。`link` 是根内的新路径。
-/// **边界**：权限不够时返回 false。调用方必须打印跳过原因。
-fn make_dir_symlink(target: &Path, link: &Path) -> bool {
+/// **边界**：建链失败时使显式能力验收失败，不能把未验证记录成通过；保留 OS 错误原因。
+fn make_dir_symlink(target: &Path, link: &Path) {
     #[cfg(windows)]
     let result = std::os::windows::fs::symlink_dir(target, link);
     #[cfg(not(windows))]
     let result = std::os::unix::fs::symlink(target, link);
-    result.is_ok()
+    result.expect("UNVERIFIED: directory symlink capability is required for this security test");
 }

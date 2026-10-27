@@ -156,3 +156,38 @@ fn reject_before_io(requested: &str) -> Result<(), WorkspaceError> {
 fn canonical_path(path: &Path) -> std::io::Result<PathBuf> {
     std::fs::canonicalize(path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{WorkspaceError, WorkspaceRoot};
+    use std::fs;
+
+    /// 相对路径在根内时 `resolve` 成功；`..` 与绝对路径在读盘前拒绝。
+    ///
+    /// **作用**：A5-01 在 `engine-api` 层锁住授权根边界，不依赖工具包装。
+    #[test]
+    fn resolve_rejects_parent_and_absolute_before_io() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("ok.txt"), "in").unwrap();
+        let root = WorkspaceRoot::open(directory.path()).unwrap();
+        assert!(root.resolve("ok.txt").is_ok());
+        assert_eq!(root.resolve("../ok.txt"), Err(WorkspaceError::OutsideRoot));
+        let absolute = directory.path().join("ok.txt");
+        assert_eq!(
+            root.resolve(absolute.to_str().unwrap()),
+            Err(WorkspaceError::OutsideRoot)
+        );
+    }
+
+    /// 空字节与换行是 `InvalidPath`，错误文本不含路径。
+    #[test]
+    fn resolve_rejects_control_bytes_as_invalid_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = WorkspaceRoot::open(directory.path()).unwrap();
+        assert_eq!(root.resolve("a\0b"), Err(WorkspaceError::InvalidPath));
+        assert_eq!(root.resolve("a\nb"), Err(WorkspaceError::InvalidPath));
+        assert!(!WorkspaceError::InvalidPath
+            .to_string()
+            .contains(directory.path().to_str().unwrap_or("")));
+    }
+}

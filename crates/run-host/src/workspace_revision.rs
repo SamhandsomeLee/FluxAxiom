@@ -17,7 +17,8 @@ const GIT_TIMEOUT_SECS: u64 = 5;
 /// **作用**：返回写入 `attempt.started` / 样本导出的 `WorkspaceRevision`。
 /// **参数**：`root` 是已打开的授权工作区绝对路径。
 /// **边界**：非 git、找不到 `git`、超时、无 HEAD、或任一命令失败 → `Unknown`。
-/// 设置 `GIT_OPTIONAL_LOCKS=0`，避免 `status` 刷新 index 改写工作区。
+/// 设置 `GIT_OPTIONAL_LOCKS=0`，避免 `status` 刷新 index 改写工作区；
+/// 用命令行配置关闭 fsmonitor，避免执行仓库或用户配置的 hook。
 pub(crate) fn collect(root: &Path) -> WorkspaceRevision {
     let commit = match git_stdout(root, &["rev-parse", "HEAD"]) {
         Some(text) => {
@@ -46,9 +47,12 @@ pub(crate) fn collect(root: &Path) -> WorkspaceRevision {
 }
 
 /// 跑一条 git 子命令，成功时返回 stdout；失败 / 超时 / 找不到可执行文件返回 `None`。
+///
+/// **边界**：每条命令强制 `core.fsmonitor=false`，不执行 fsmonitor hook，也不修改 Git 配置。
 fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
     let mut command = Command::new("git");
     command
+        .args(["-c", "core.fsmonitor=false"])
         .arg("-C")
         .arg(root)
         .args(args)
@@ -136,6 +140,55 @@ mod tests {
         }
         let after = fs::read(root.join(".git").join("index")).unwrap();
         assert_eq!(before, after, "index must not change");
+    }
+
+    /// 仓库配置的 fsmonitor 可以执行程序，但版本采集必须禁用它。
+    ///
+    /// **边界**：先用未加固的 Git 验证合成 hook 确实可执行，再断言 collect 不创建标记，
+    /// 且 index 与 config 字节不变。只操作临时仓库；不依赖用户的 hook 或凭据。
+    #[test]
+    fn collection_disables_repository_fsmonitor_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init"]);
+        fs::write(root.join("seed.txt"), "seed\n").unwrap();
+        git(root, &["add", "seed.txt"]);
+        git(root, &["commit", "-m", "init"]);
+        let hook = root.join(".git/hooks/review-fsmonitor");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nprintf 'SYNTHETIC_HOOK_EXECUTED' > fsmonitor-executed.txt\nprintf '\\000'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        git(
+            root,
+            &["config", "core.fsmonitor", ".git/hooks/review-fsmonitor"],
+        );
+        git(root, &["status", "--porcelain", "--", "."]);
+        let marker = root.join("fsmonitor-executed.txt");
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap(),
+            "SYNTHETIC_HOOK_EXECUTED"
+        );
+        fs::remove_file(&marker).unwrap();
+        let index_before = fs::read(root.join(".git/index")).unwrap();
+        let config_before = fs::read(root.join(".git/config")).unwrap();
+
+        assert!(matches!(
+            collect(root),
+            WorkspaceRevision::Git { dirty: false, .. }
+        ));
+        assert!(
+            !marker.exists(),
+            "version collection must not execute fsmonitor"
+        );
+        assert_eq!(index_before, fs::read(root.join(".git/index")).unwrap());
+        assert_eq!(config_before, fs::read(root.join(".git/config")).unwrap());
     }
 
     /// 已跟踪文件改动或未跟踪文件都算脏。

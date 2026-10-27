@@ -232,8 +232,9 @@ fn relative_workspace_is_stored_as_an_absolute_path() {
 
 /// 创建之后路径被换成指向别处的符号链接，驱动时必须拒绝。
 ///
-/// **边界**：不进入 Running。当前进程建不了符号链接时打印原因并跳过，不当作通过。
+/// **边界**：不进入 Running。默认明确记为 ignored；CI 显式执行，建链失败表示未验证且验收失败。
 #[tokio::test]
+#[ignore = "requires symlink capability; CI runs explicitly with --ignored"]
 async fn workspace_swapped_for_a_symlink_is_rejected_at_drive() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path();
@@ -247,13 +248,10 @@ async fn workspace_swapped_for_a_symlink_is_rejected_at_drive() {
         .unwrap();
     std::fs::remove_dir(&workspace).unwrap();
     #[cfg(windows)]
-    let linked = std::os::windows::fs::symlink_dir(&elsewhere, &workspace).is_ok();
+    let linked = std::os::windows::fs::symlink_dir(&elsewhere, &workspace);
     #[cfg(not(windows))]
-    let linked = std::os::unix::fs::symlink(&elsewhere, &workspace).is_ok();
-    if !linked {
-        eprintln!("skipped: this process cannot create directory symlinks");
-        return;
-    }
+    let linked = std::os::unix::fs::symlink(&elsewhere, &workspace);
+    linked.expect("UNVERIFIED: directory symlink capability is required for this security test");
     let outcome = host
         .drive_run(&created.run.run_id, &FakeEngine)
         .await

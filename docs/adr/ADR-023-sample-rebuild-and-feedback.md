@@ -16,7 +16,7 @@ A4a 已经能用 `flux trace` 按轮次读出 `request_ref` / `response_ref` 与
 
 2. **可重建性校验放在 `engine-custom::rebuild`。** 输入是已读出的 JSON / 字节，不依赖 `run-host`。规则 1–7 见执行方案 §4.12.1；结论三态 `consistent` / `inconsistent` / `unverifiable`。CLI：`flux trace --verify`；`--json` 时结果在 `rebuild` 字段。
 
-3. **`workspace_revision` 写入 `attempt.started` 的可选字段。** Host 在 `prepare_drive` 打开并核对工作区之后、开启写事务之前采集；直接执行 `git`，不经 shell，环境变量 `GIT_OPTIONAL_LOCKS=0`，单命令 5 秒超时；`-- .` pathspec 限定脏检查在工作区子树。失败记 `{ "vcs": "unknown" }`，不使 Run 失败。旧事件缺字段反序列化为 `None`。
+3. **`workspace_revision` 写入 `attempt.started` 的可选字段。** Host 在 `prepare_drive` 打开并核对工作区之后、开启写事务之前采集；直接执行 `git`，不经 shell，环境变量 `GIT_OPTIONAL_LOCKS=0`，单命令 5 秒超时；`-- .` pathspec 限定脏检查在工作区子树。每条命令额外传 `-c core.fsmonitor=false`，覆盖仓库/用户配置，避免采集触发 fsmonitor hook；不改写 Git 配置。失败记 `{ "vcs": "unknown" }`，不使 Run 失败。旧事件缺字段反序列化为 `None`。
 
 4. **人工反馈只追加。** 迁移 `0003_sample_feedback.sql`；`RunHost::add_feedback`；不写 event、不改 `last_sequence`。`verdict` 为 `usable` / `needs_edit` / `redo`；`note` 可选、限 2000 字符。
 
