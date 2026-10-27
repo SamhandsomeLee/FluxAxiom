@@ -1,6 +1,6 @@
 # ADR-024：A5 只读安全边界与负向证据
 
-- 状态：已采用（A5-01 / A5-02 / A5-03 落地）
+- 状态：已采用（A5-01 已有平台证据；A5-02/03 本机补强回归通过；最终 Done 清单仍按 G-A 报告核对）
 - 日期：2026-10-27
 - 依据：P0 执行方案 v1.1 §4.13、§4.13.1、§4.13.2、§12；V0.3 §14.1 A5 保证边界；ADR-022；boundaries.mdc；AGENTS.md
 
@@ -23,8 +23,8 @@ A0–A4b 已形成 Run / Event / Trace / Sample 闭环。P0a 还缺「只读安�
 
 4. **三个 PR 切片**  
    - **A5-01**（本 ADR 首次落地）：工具层路径 / 忽略 / 符号链接 / 非法参数回归；一条静态竞态用例。依赖 symlink 能力的测试默认显式标为 `ignored`，不计入通过；CI 单独运行，建链失败以 `UNVERIFIED` 和 OS 错误导致验收失败。  
-   - **A5-02**（已落地证据）：`engine-custom/tests/loop.rs` 用 FakeChat + 内存 HostPort；模型请求 `write_file` / `shell` / 根外 `read_file` 时无副作用；错误进工具结果与 observe；`AGENTS.md` 诱导不提升权限；blob / 后续请求不含根外密钥标记。  
-   - **A5-03**（已落地证据）：`apps/cli/tests/cli_privacy.rs`；Fake Run 扫描 `run` / `events` / `status` / `trace` / `sample export` 默认输出、`events.payload` 与 blob 语料；合成 `.env` 假密钥与 `HIDDEN_ENV_SECRET` 不得出现；Event 无 `reasoning_content` 键、默认 CLI 无思维链原文；`--show-request --include-reasoning` 出原文算有意披露。
+   - **A5-02**（补强证据）：`engine-custom/tests/loop.rs` 与 `apps/cli/tests/cli_privacy.rs`；先读取恶意文案并核对攻击轮历史；写入/命令使用绝对临时落点；真实 Host 重开后逐项核对调用 ID、错误结果、预算与终态。内存 Host 的 observe 不代替持久 Event 证据。
+   - **A5-03**（补强证据）：`apps/cli/tests/cli_privacy.rs` 显式读取 `.env` / `.git/config` / ignore 文件，搜索能命中敏感标记且有公开正向控制；扫描 CLI stdout/stderr、Event 和非空 blob 语料；子进程注入独立假凭据，实际 from_env 拒绝路径不得回显。所有轮次的请求/响应默认遮盖 reasoning，显式标志才允许原文。
 
 5. **静态竞态用例（失败受控）**  
    不用并发线程、不加 `resolve`/`open` 测试缝。步骤固定为：  
@@ -45,7 +45,7 @@ A0–A4b 已形成 Run / Event / Trace / Sample 闭环。P0a 还缺「只读安�
 
 ## 后果
 
-- A5-01/02/03 证据已齐；宣称「A5 验收通过」仍须对照执行方案 Done 清单与残余风险（含 TOCTOU、平台 symlink 能力门禁），不得写成 OS 沙箱或 Prompt Injection 免疫。  
+- 旧 A5-02/03 提交的测试通过不等同于证据已齐。本轮补强有本机回归，宣称「A5 验收通过」仍须对照执行方案 Done 清单与残余风险（含 TOCTOU、平台 symlink 能力门禁）；以 G-A 报告的未完成项为准，不得写成 OS 沙箱或 Prompt Injection 免疫。
 - 静态竞态用例依赖创建符号链接的能力；默认不执行且明确统计为 ignored，显式能力验收时 Windows 无权限会失败并标注未验证。  
 - 若将来要关闭单次调用内 TOCTOU，须另开改动（例如 openat / `O_NOFOLLOW` / 重新校验），并更新本 ADR 的「残余风险」条款。
 

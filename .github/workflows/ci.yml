@@ -24,3 +24,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p fluxaxiom-run-host --test drive -- --ignored
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify CLI Ctrl-C and process restart (loopback only)
+        shell: pwsh
+        run: ./.github/scripts/verify-cli-interrupt.ps1

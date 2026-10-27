@@ -35,3 +35,4 @@
 
 | 日期 | 模型 | 结果 | 备注 |
 |---|---|---|---|
+| 2026-10-27 | deepseek-flash / DeepSeek-V4.1-Flash-1017 / `p0a-loop-1` | Completed；verify=consistent；feedback=usable；事实 4/4；缺陷命中 remove 下溢 | G-A 门禁前质量基线，不计正式观察期；`ga-baseline-1` / `run_01a17b3f-8420-769a-90c2-9b682321646f`；model 6/8 tool 11/32；Sample 与 data_dir 仅本机，见 `docs/development/G-A验收报告.md` §3 |
