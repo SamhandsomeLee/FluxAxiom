@@ -95,6 +95,9 @@ where
     /// `stop` / `tool_calls` / `length` 时 → `Failed(ProviderError)`，更早轮次的文字只作 partial。只要本轮带工具调用就执行，不看 `stop`。
     /// 取消令牌在每轮模型前、每个工具前检查，工具执行期间触发也会立即返回 `Cancelled`。
     /// `latency_ms` 是 `execute` 的端到端耗时，含 429/5xx 的退避等待与失败重试。
+    /// 模型额度按 Loop 轮次预留，`execute` 内部的 429/5xx 重试不再预留。HTTP 失败（400、重试耗尽）、流中断、
+    /// 连接失败的调用占用已预留的额度，但不产生 `ModelCall` 观测：没有可信的用量与结束原因可记，Host 侧
+    /// 的模型调用数可能小于已预留数，成本报告不含这类调用。是否补写 `usage=Unknown` 的观测留待 EA-02 决定。
     async fn run(&self, request: EngineRunRequest, host: Arc<dyn HostPort>) -> EngineOutcome {
         let cancel = host.cancellation();
         let mut messages = vec![

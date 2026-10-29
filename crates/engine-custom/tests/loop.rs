@@ -1,10 +1,12 @@
 //! Engine A Loop：Fake Chat + 内存 HostPort。
 //!
-//! **作用**：覆盖一轮收尾、工具再收尾、额度耗尽、未知工具继续、非法 arguments 先 observe；
+//! **作用**：覆盖一轮收尾、工具再收尾、额度耗尽、未知工具继续、非法 arguments 与畸形 tool call 先 observe、流中断不 observe；
+//! EA-01：`ChatError` → 终态分类、重试只占一次额度、调用中/退避中取消、缺失 reasoning 回传、Unknown 用量；
 //! A5-02 对抗：`write_file` / `shell` / 根外 `read_file` 无副作用，观测与预算诚实记录。
 //! **边界**：不拨号，不启 `run-host`。预算计数器只在本测试 Host 里。
 //! 真 Host 的持久事件/终态回归见 `apps/cli/tests/cli_privacy.rs`。
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -197,7 +199,16 @@ async fn run_engine(
     host: Arc<MemoryHost>,
     workspace: WorkspaceRoot,
 ) -> EngineOutcome {
-    let engine = EngineA::new(FakeChat::script(steps), RecordingBackoff::default());
+    run_with(FakeChat::script(steps), host, workspace).await
+}
+
+/// 与 `run_engine` 相同，但传输层由调用方给，用来脚本化 Fake 做不到的错误与中途取消。
+async fn run_with<T: ChatTransport + Send>(
+    transport: T,
+    host: Arc<MemoryHost>,
+    workspace: WorkspaceRoot,
+) -> EngineOutcome {
+    let engine = EngineA::new(transport, RecordingBackoff::default());
     engine
         .run(
             EngineRunRequest {
@@ -208,6 +219,64 @@ async fn run_engine(
             host,
         )
         .await
+}
+
+/// `HookedChat` 的一步。
+enum Hooked {
+    /// 交给 Fake 处理（保留它对缺 `reasoning_content` 请求的 400 判断）。
+    Fake(FakeStep),
+    /// 原样交回传输层结果，用来给出 Fake 脚本表达不了的 `ChatError`。
+    Raw(Result<Round, ChatError>),
+    /// 先触发 Host 的取消令牌，再交回结果：模拟调用进行中或退避期间被取消。
+    CancelThen(Result<Round, ChatError>),
+}
+
+struct HookedChat {
+    steps: VecDeque<Hooked>,
+    cancel: CancellationToken,
+}
+
+impl HookedChat {
+    fn new(host: &MemoryHost, steps: Vec<Hooked>) -> Self {
+        Self {
+            steps: steps.into(),
+            cancel: host.cancel.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl ChatTransport for HookedChat {
+    async fn round(
+        &mut self,
+        request_json: &serde_json::Value,
+        cancel: &CancellationToken,
+    ) -> Result<Round, ChatError> {
+        match self
+            .steps
+            .pop_front()
+            .expect("hooked chat script has no step left")
+        {
+            Hooked::Fake(step) => FakeChat::script([step]).round(request_json, cancel).await,
+            Hooked::Raw(result) => result,
+            Hooked::CancelThen(result) => {
+                self.cancel.cancel();
+                result
+            }
+        }
+    }
+}
+
+/// 读 `note.txt` 的工具轮，带一句叙述，供“更早轮次的文字只作 partial”类断言。
+fn read_note_turn(narration: &str) -> FakeStep {
+    tool_turn(
+        vec![ToolCall {
+            id: "call_1".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: r#"{"path":"note.txt"}"#.to_owned(),
+        }],
+        narration,
+    )
 }
 
 /// 无工具、`stop`：Completed，报告为 assistant content。
@@ -459,6 +528,298 @@ async fn invalid_tool_arguments_observe_then_provider_error() {
         }
         other => panic!("expected ModelCall, got {other:?}"),
     }
+}
+
+/// 空工具调用 `id`：先 observe 用量，再 `Failed(ProviderError)`。
+///
+/// **作用**：证明 Loop 把 `MalformedToolCall` 收成带用量的失败，而不是流中断或继续执行工具。
+/// **边界**：不拨号。脚本只有这一步；不检查 SSE 分片拼接，那一层见 `sse.rs`。
+#[tokio::test]
+async fn malformed_tool_call_observes_usage_then_provider_error() {
+    let (_dir, root) = workspace();
+    let host = MemoryHost::new(4, 4);
+    let outcome = run_engine(
+        vec![tool_turn(
+            vec![ToolCall {
+                id: String::new(),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            }],
+            "",
+        )],
+        Arc::clone(&host),
+        root,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        EngineOutcome::Failed {
+            reason: FailureReason::ProviderError,
+            partial: None,
+        }
+    );
+    let observations = host.observations();
+    assert_eq!(observations.len(), 1);
+    match &observations[0] {
+        EngineObservation::ModelCall {
+            usage: recorded,
+            finish_reason,
+            ..
+        } => {
+            assert_eq!(*recorded, usage());
+            assert_eq!(finish_reason, "malformed_tool_call");
+        }
+        other => panic!("expected ModelCall, got {other:?}"),
+    }
+}
+
+/// 流在第一轮中断：`Failed(ProviderError)`，不写模型观测，但这次调用已占用模型额度。
+///
+/// **作用**：证明 Loop 不把流中断记成已完成的模型调用，也不把预留额度还回去。
+/// **边界**：不拨号，不重试。脚本耗尽后若实现去重试，Fake 会因没有下一步而 panic。
+/// 半截内容不进历史这一点由传输层保证（`Round::Interrupted` 不带片段），本测试不断言历史。
+#[tokio::test]
+async fn stream_interrupt_fails_without_model_observation() {
+    let (_dir, root) = workspace();
+    let host = MemoryHost::new(4, 4);
+    let outcome = run_engine(vec![FakeStep::Interrupt], Arc::clone(&host), root).await;
+    assert_eq!(
+        outcome,
+        EngineOutcome::Failed {
+            reason: FailureReason::ProviderError,
+            partial: None,
+        }
+    );
+    assert!(
+        host.observations().is_empty(),
+        "stream interrupt must not observe a model call"
+    );
+    assert_eq!(*host.remaining_model.lock().unwrap(), 3);
+}
+
+/// 第二轮流中断：更早轮次的文字作 partial，且不新增模型观测。
+///
+/// **作用**：证明 `last_content` 在流中断路径上被带出，也证明中断前的两条观测（模型 + 工具）保持不变。
+/// **边界**：不拨号，不重试。
+#[tokio::test]
+async fn stream_interrupt_after_tool_round_keeps_earlier_text_as_partial() {
+    let (_dir, root) = workspace();
+    let host = MemoryHost::new(4, 4);
+    let outcome = run_engine(
+        vec![read_note_turn("looking at note"), FakeStep::Interrupt],
+        Arc::clone(&host),
+        root,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        EngineOutcome::Failed {
+            reason: FailureReason::ProviderError,
+            partial: Some(ArtifactDraft::report("looking at note".to_owned())),
+        }
+    );
+    let kinds: Vec<&str> = host
+        .observations()
+        .iter()
+        .map(|observation| match observation {
+            EngineObservation::ModelCall { .. } => "model",
+            EngineObservation::ToolCall { .. } => "tool",
+        })
+        .collect();
+    assert_eq!(kinds, ["model", "tool"]);
+}
+
+/// Provider 与本地错误在 Loop 层的终态分类。
+///
+/// **作用**：钉住 `ChatError` → `FailureReason`：HTTP 拒绝、重试耗尽、流中断、连接失败是 `ProviderError`；缺密钥、本地无法编码是 `EngineError`。
+/// **边界**：每个用例都只占一次模型额度（重试发生在 `execute` 里，不重复预留），且没有模型观测。
+#[tokio::test]
+async fn chat_errors_map_to_failure_reasons() {
+    let cases: Vec<(&str, Vec<Hooked>, FailureReason)> = vec![
+        (
+            "400 rejected",
+            vec![Hooked::Fake(FakeStep::Status(400))],
+            FailureReason::ProviderError,
+        ),
+        (
+            "503 exhausted after three retries",
+            vec![
+                Hooked::Fake(FakeStep::Status(503)),
+                Hooked::Fake(FakeStep::Status(503)),
+                Hooked::Fake(FakeStep::Status(503)),
+                Hooked::Fake(FakeStep::Status(503)),
+            ],
+            FailureReason::ProviderError,
+        ),
+        (
+            "transport before a status",
+            vec![Hooked::Raw(Err(ChatError::Transport))],
+            FailureReason::ProviderError,
+        ),
+        (
+            "missing credential",
+            vec![Hooked::Raw(Err(ChatError::MissingCredential))],
+            FailureReason::EngineError,
+        ),
+        (
+            "not encodable",
+            vec![Hooked::Raw(Err(ChatError::NotEncodable))],
+            FailureReason::EngineError,
+        ),
+    ];
+    for (label, steps, expected) in cases {
+        let (_dir, root) = workspace();
+        let host = MemoryHost::new(4, 4);
+        let transport = HookedChat::new(&host, steps);
+        let outcome = run_with(transport, Arc::clone(&host), root).await;
+        assert_eq!(
+            outcome,
+            EngineOutcome::Failed {
+                reason: expected,
+                partial: None,
+            },
+            "{label}"
+        );
+        assert!(
+            host.observations().is_empty(),
+            "{label}: no model observation"
+        );
+        assert_eq!(*host.remaining_model.lock().unwrap(), 3, "{label}");
+    }
+}
+
+/// 429 重试后成功：只有一条模型观测，只占一次模型额度。
+#[tokio::test]
+async fn status_429_retry_then_success_costs_one_model_call() {
+    let (_dir, root) = workspace();
+    let host = MemoryHost::new(4, 4);
+    let outcome = run_engine(
+        vec![FakeStep::Status(429), stop_turn("done")],
+        Arc::clone(&host),
+        root,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        EngineOutcome::Completed {
+            report: ArtifactDraft::report("done".to_owned()),
+        }
+    );
+    assert_eq!(host.observations().len(), 1);
+    assert_eq!(*host.remaining_model.lock().unwrap(), 3);
+}
+
+/// 模型调用进行中被取消：`Cancelled`，更早轮次的文字作 partial，不新增模型观测。
+///
+/// **边界**：取消在传输层返回 `Round::Cancelled`；Loop 不得把它当成流中断（`ProviderError`）。
+#[tokio::test]
+async fn cancel_during_model_call_returns_cancelled_with_partial() {
+    let (_dir, root) = workspace();
+    let host = MemoryHost::new(4, 4);
+    let transport = HookedChat::new(
+        &host,
+        vec![
+            Hooked::Fake(read_note_turn("looking at note")),
+            Hooked::CancelThen(Ok(Round::Cancelled)),
+        ],
+    );
+    let outcome = run_with(transport, Arc::clone(&host), root).await;
+    assert_eq!(
+        outcome,
+        EngineOutcome::Cancelled {
+            partial: Some(ArtifactDraft::report("looking at note".to_owned())),
+        }
+    );
+    assert_eq!(host.observations().len(), 2);
+}
+
+/// 429/5xx 退避期间被取消：`Cancelled`，不进入下一次 `round`。
+///
+/// **边界**：`HookedChat` 只有一步；若实现在取消后仍重试，会因脚本耗尽而 panic。
+#[tokio::test]
+async fn cancel_during_backoff_returns_cancelled() {
+    let (_dir, root) = workspace();
+    let host = MemoryHost::new(4, 4);
+    let transport = HookedChat::new(
+        &host,
+        vec![Hooked::CancelThen(Ok(Round::Status {
+            status: 503,
+            summary: String::new(),
+        }))],
+    );
+    let outcome = run_with(transport, Arc::clone(&host), root).await;
+    assert_eq!(outcome, EngineOutcome::Cancelled { partial: None });
+    assert!(host.observations().is_empty());
+}
+
+/// 第一轮缺 `reasoning_content`：下一轮历史里补成 `""`，请求不会被 400。
+///
+/// **作用**：Fake 对“带 `tools` 且某条 assistant 缺 `reasoning_content`”回 400；Loop 若不回传，第二轮会 `Failed(ProviderError)`。
+#[tokio::test]
+async fn absent_reasoning_is_replayed_as_empty_string() {
+    let (_dir, root) = workspace();
+    let host = MemoryHost::new(4, 4);
+    let outcome = run_engine(
+        vec![
+            FakeStep::Turn(ScriptedTurn {
+                reasoning_deltas: vec![],
+                content_deltas: vec![],
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: r#"{"path":"note.txt"}"#.to_owned(),
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: usage(),
+            }),
+            stop_turn("done"),
+        ],
+        Arc::clone(&host),
+        root,
+    )
+    .await;
+    assert!(
+        matches!(outcome, EngineOutcome::Completed { .. }),
+        "{outcome:?}"
+    );
+}
+
+/// 用量缺失时如实写 Unknown，不用 0 冒充。
+///
+/// **作用**：观测里的 `ModelUsage` 与响应 blob 里的 `usage` 都保持 Unknown。
+#[tokio::test]
+async fn unknown_usage_is_observed_as_unknown() {
+    let (_dir, root) = workspace();
+    let host = MemoryHost::new(4, 4);
+    let unknown = ModelUsage {
+        prompt_tokens: TokenCount::Unknown,
+        completion_tokens: TokenCount::Unknown,
+        prompt_cache_hit_tokens: TokenCount::Unknown,
+        prompt_cache_miss_tokens: TokenCount::Unknown,
+    };
+    let outcome = run_engine(
+        vec![FakeStep::Turn(ScriptedTurn {
+            reasoning_deltas: vec![],
+            content_deltas: vec!["done".to_owned()],
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: unknown.clone(),
+        })],
+        Arc::clone(&host),
+        root,
+    )
+    .await;
+    assert!(matches!(outcome, EngineOutcome::Completed { .. }));
+    match &host.observations()[0] {
+        EngineObservation::ModelCall {
+            usage: recorded, ..
+        } => assert_eq!(*recorded, unknown),
+        other => panic!("expected ModelCall, got {other:?}"),
+    }
+    assert!(host
+        .blob_texts()
+        .iter()
+        .any(|body| body.contains(r#""prompt_tokens":"unknown""#)));
 }
 
 /// 取消令牌在进 Loop 前已触发 → Cancelled。
