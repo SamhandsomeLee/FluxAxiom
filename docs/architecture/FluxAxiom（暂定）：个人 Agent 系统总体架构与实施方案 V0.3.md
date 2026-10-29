@@ -1,5 +1,7 @@
 # FluxAxiom（暂定）：个人 Agent 系统总体架构与实施方案 V0.3
 
+> **2026-10-29 有效修订（ADR-025）**：V0.3 保留历史技术讨论，但不再执行 Engine B/Codex app-server、T/H/D、E-001；唯一正式 Agent Engine 是自研 Engine A。新路线为 G-A → EA-01～04/EA-G → M0/M1（独立 Agent Memory Engine 只读 Recall）→ M-EVAL → 条件 M2/M3。B3/B4/B6-A 仅为 Engine A 安全 Effect 支线，M1 不以 B3 为前置。本文的 Codex §8–9 与 E-001 §16 为**历史研究，不能据此开发**。依据 [ADR-025](../adr/ADR-025-engine-a-first-memory-integration.md)、[专项演进方案](../development/EngineA与AgentMemoryEngine演进方案.md)；真实仓库是 `SamhandsomeLee/FluxAxiom`，而非旧文中拟议仓库地址。
+
 > **本次修订**：项目命名与 Monorepo 研发组织补充版；保留 V0.3 原有运行时、治理、安全和实施设计。
 
 > **建议项目名称**：**FluxAxiom**（当前首选，尚待最终确认）  
@@ -499,7 +501,7 @@ P0 执行方案把上述替换边界落实为 `EngineAdapter::run` 与 `HostPort
 
 Blob 是 Host 按内容保存的原文。`put_blob` 接收字节，Host 以 sha256 作为地址写入自己的数据目录，并返回 `BlobRef`；相同内容只存一份。事件只保存 `request_ref`、`response_ref`、`result_ref` 这类引用。模型请求与响应、`reasoning_content`、工具结果和 Artifact 正文进入 blob；事件中的模型别名、用量、延迟和摘要不替代这些原文。样本必须能从 blob 重建完整模型请求。Blob 与样本使用同一保留和删除策略。该存储在 P0a 的持久化阶段实现，契约阶段只冻结引用字段。
 
-### 8.2 Engine B：Codex app-server
+### 8.2 Engine B：Codex app-server（历史研究，ADR-025 起停止实施）
 
 以 Codex app-server 作为 E-001 的 Engine B 候选，约定 `Host Session ↔ Codex Thread`、`Run Attempt ↔ Codex Turn` 的实际映射；兼容差异通过 Adapter 显式记录。Thread/Turn、审批回调、sandboxPolicy、interrupt、事件通知与原生工具不被强行抹平。
 
@@ -685,12 +687,13 @@ P0 提前记录 `run_id / attempt_id / model_id / provider_id / prompt_layout_ve
 
 ## 12. Memory、Multi-Agent 与 Evolution 的长期边界
 
-### 12.1 Memory
+### 12.1 Memory（2026-10-29 改为独立服务接入）
 
-- Working Context 属 Engine 当前任务；Execution Trace 可生成 episodic memory 索引；长期用户/项目事实在受权限约束的 Memory 服务中持久化；经验证的 Skill/Policy 为 procedural memory。
-- P0a 用用户可编辑的 `AGENTS.md`/项目说明文档作基线，同时把它视为输入注入面，不赋予绕过权限。
-- P1 对照 `无 Memory / 人工项目说明 / 自动 Memory`，衡量完成率、事实错误、Token/纠错成本。自动提取默认 Candidate，经确认才成为高可信记忆；SQLite+FTS 先行。
-- 暂不为了未来向量检索实现通用 Memory Plugin Registry。
+- P0a G-A 的无记忆基线先通过，随后深化 Engine A 的 Context/工具/质量；M0 以独立 Agent Memory Engine 的当前源码验证 API、安全和 scope。
+- Run/Attempt/Effect/Event 的权威事实属于 RunHost，Working Context 属 Engine A；长期 Memory 独立存储、检索和治理，**不在 FluxAxiom 再建 SQLite/FTS 记忆库**。
+- 未来 Engine A 通过薄 `MemoryClient` 在 Context 组装阶段只读召回，限 Scope/Token/条数/超时，带来源标识并视为低信任文本，不能提升工具或工作区权限。
+- 在相同任务/模型/预算下对照 `none/manual/memory-recall` 的事实准确率、成本、延迟和返工；自动写入候选必须去敏/授权/幂等/回执/删除与结果未知对账。
+- 既有 `agent-memory-engine-stage9` 仅为历史线索，M0 要核对最新代码；暂不实现通用 Memory Plugin Registry。
 
 ### 12.2 Multi-Agent
 
@@ -715,7 +718,7 @@ P0 提前记录 `run_id / attempt_id / model_id / provider_id / prompt_layout_ve
 | Contract | JSON Schema + Rust 类型 | Contract 源头与语言解耦 |
 | Store | SQLite（WAL） | 状态/事件同事务，不能跨外部操作事务 |
 | Model | 一个云端 Provider | 第一阶段不依赖 GPU |
-| Engine B | Codex app-server 子进程 | 锁二进制/Schema/配置与权限 |
+| Engine B（历史） | 不实施 | Codex 计划由 ADR-025 终止 |
 | 安全执行器 | OS 沙箱 + 可丢弃工作区 | 按宿主机平台验证 |
 | Evaluation | Python + pytest | 回放、故障注入、统计 |
 | MCP | rmcp；**P0b 仅按需探针** | 锁版本、显式生命周期、审批接管 |
@@ -744,7 +747,7 @@ FluxAxiom/
 │   ├── run-host/                    # Session/Run/Effect/命令/事件治理
 │   ├── engine-api/                  # Engine trait 与调用边界（按需要提取）
 │   ├── engine-custom/               # 自研 Loop / Context 策略
-│   ├── engine-codex/                # P0b: Codex app-server Adapter
+│   ├── engine-codex/                # 历史目标，现不创建（ADR-025）
 │   ├── inference/                   # Provider 接口，未来 SGLang/vLLM 适配
 │   ├── tool-gateway/                # P0b: 权限与副作用执行边界
 │   └── storage/                     # 重复使用时再提取；初期可内嵌 Host
@@ -898,35 +901,21 @@ FluxAxiom/
 
 **A5 保证边界**：复用现有路径、symlink、`.env`/ignore 和分页工具测试，重点新增 Fake Model → Engine Tool Dispatch → HostPort/Event → CLI/Sample 的越权/泄漏证明；用户文件、`README`/`AGENTS.md` 和 Model Tool Call 都不构成权限来源。`canonicalize` 再 `open` 不能构成 TOCTOU 免疫，更不能替代 P0b 经 OS 实证的沙箱。可执行切片与残余风险声明见执行方案 §4.13 与 **ADR-024**。
 
-### 14.2 P0b：先验证可靠性，再验证可替换性
+### 14.2 P0b / Engine A / Memory 当前路线
 
-| 顺序 | 工作包 | 交付及验收 |
-|---|---|---|
-| B3 | **Engine A + Effect Gateway** | `write_file`/`apply_patch`，审批仅 `once`，digest 检查，隔离工作区 |
-| B4 | **事务/取消/恢复** | 写前意图、Unknown、人工核对、取消进程核实、事件一致性 |
-| B6-A | **Engine A 安全测试** | 路径/权限/注入/凭据/网络边界通过 |
-| B1 | **Codex Adapter** | Schema 固定、方法白名单、独立 CODEX_HOME、外部 Thread/Turn 映射 |
-| B5 | **模式探针** | 先 T（独立隔离），后 H（Host 决定审批），最后 D（工具委托可行性） |
-| B6-B | **Codex 安全测试** | 特权 RPC 禁止、退出对账、自动放行覆盖率、误降级拒绝 |
-| B2 | **E-001 对照报告** | 同业务/任务 A/B，对保证差异、模拟语义和维护成本出具证据 |
+| 交付 | 验收 |
+| --- | --- |
+| G-A | 先完成 P0a 安全/事实与 5 实际使用日、≥10 任务观察期，Memory 关闭 |
+| EA-01～04 / EA-G | Engine A 的 Loop/Context/只读工具/失败与事实评测 |
+| M0 / M1 / M-EVAL | 核对外部 Memory API/授权，默认关闭的只读召回，none/manual/memory 可比评测 |
+| M2 / M3 | 有条件的记忆候选写回、幂等/回执/Unknown 核对、删除/跨系统安全 |
+| B3/B4/B6-A | Engine A 专属 Host Effect、Approval once、OS 沙箱与故障恢复（独立支线） |
 
-**阶段门槛**：B3/B4 的状态与恢复语义在 Engine A 测试通过前，暂停 B1/B5 的业务适配；避免分不清 Contract 错误与第三方模型限制。
+**不实施 B1/B5/B6-B/B2/E-001**；既有 §8–9、§16 为历史设计。B3/B4 的 Effect Contract/Ledger/Policy/受控写/Unknown/对账安全条件仍有效，但不成为 M1 只读接入的前置；宿主 OS 的强制隔离必须实测。
 
-#### 14.2.1 B3/B4 实施拆分与前置约束（2026-10-26）
+### 14.3 当前完成标准
 
-这不是新的状态机或新的 Contract v1 承诺；§7 的 Effect/Approval/Unknown 语义保持不变。通过 G-A 后依次交付：**B3-01 Effect Contract → B3-02 Host Ledger/事务事件 → B3-03 确定性 Policy/Approval once → B3-04 受控 `write_file` 再 `apply_patch` → B4-01 崩溃注入/Unknown → B4-02 对账/取消分级 → B6-A 安全回归/G-B**。每一项的测试证据与落点以 P0 执行方案 `5.4` 为准。
-
-- **B3 前必须锁定 OS 专项 ADR**：真实宿主 OS 的沙箱类型、授权写入路径、网络出口、环境变量/凭据隔离、进程组停止方式和可核验证据。可丢弃 worktree 是数据保护手段，不等于 OS 沙箱。
-- **Engine 不自行执行 Host-owned Effect**：`HostPort::propose_effect` 是候选意图入口；Host 校验规范参数、持久化 Intent、创建一次性 Approval、等待裁决、提交 Dispatching 后交给受控 Executor。批准时不持有 SQLite 长事务，等待审批不等于 Run `WaitingInput`。
-- **未知结果不能当失败**：SQLite 与外部写入没有跨系统原子性。`Dispatching` 后崩溃进入 `Unknown`，需核对 `Succeeded/Failed/NotApplied`；不使用同 Effect ID 自动重放。存在未决 Effect 的 Run 进入 `NeedsReconciliation`，不是简单沿用 P0a 的 `Failed(host_restart)`。
-- **强保证只来自实际强制点**：`args_digest` 绑定审批参数却不能阻止 symlink/TOCTOU；缺少 OS 证据时不开放不可信写入，不声称 `sandbox verified`。完成 B3/B4/B6-A 的 Engine A 实验后才启动 Codex 的 T/H/D 实测。
-
-### 14.3 P0 通过标准
-
-- P0a：日常仓库分析可用，存在可追踪的真实样本，并明确知道当前无法写入/恢复的限制。
-- P0b：对 Host-owned Effect 的授权/取消/未知副作用具备可复现证据；Codex T/H/D 分别报告真实保证，无严重越权通路；E-001 的业务修改量和 UI 特化分支能被审计。
-- 如果 B 只有 T 模式可用，则 E-001 判定为“**业务可替换、治理保证不等价**”，而非完整通过。
-- 若真实用户任务使用价值不足，重新审视场景，不以继续堆架构替代使用价值验证。
+P0a 看真实分析质量、持久事实与安全证据、观察期；EA-G 看单 Engine A 在固定任务上的质量与可靠性；Memory 看隔离/隐私及任务净收益；B3/B4 看 Host-owned Effect 的授权与未知结果恢复。不再要求第二引擎对照报告。
 
 ---
 
@@ -956,7 +945,9 @@ FluxAxiom/
 
 ---
 
-## 16. E-001：Engine 可替换性实验
+## 16. E-001：Engine 可替换性实验（历史存档，已停）
+
+> ADR-025 决定不执行本实验；未来对照只比较单 Engine A 的无/人工/自动记忆表现。
 
 ### 16.1 假设
 
@@ -986,7 +977,7 @@ H1：同一业务 Task，在 A/B 切换时不修改 Experience 核心代码；�
 
 | 阶段 | 主要工作 | 进入条件 | 退出证据 |
 |---|---|---|---|
-| P1 | Memory 对照、Session/Context 精细化、可选 Web/AG-UI | P0 有真实样本 | 自动 Memory 相比人工基线真实收益或否证 |
+| P1 | 深化 Engine A 的 Context 并接外部 Agent Memory Engine | G-A、EA-G 及 M0 API/授权核验完成 | none/manual/memory 可复验净收益或否证 |
 | P2 | Run Tree、Multi-Agent、必要时 A2A | 单 Run 稳定可控 | 同预算复杂任务的质量/时间增益 |
 | P3 | Evolution Candidate → Eval → Promote | 样本与独立保留集成熟 | 重复实验显示净收益，可回滚 |
 | P4 | SGLang/vLLM、本地 GPU、请求调度实验 | 模型/硬件/负载具体化 | 质量/吞吐/TTFT/p95/成本可比较 |
@@ -1042,7 +1033,7 @@ H1：同一业务 Task，在 A/B 切换时不修改 Experience 核心代码；�
 - 采用 Rust Workspace 主导的 Modular Monorepo；实验与正式依赖隔离；主干保持可运行，目录渐进创建。
 - Cordis 暂不引入；保留 EngineAdapter 作为系统级替换边界。
 - Host 拥有 Session、Run、Effect、Approval、Command 和 durable fact 记录；Engine 保留智能策略私有状态。
-- P0a 只读可用优先，P0b 先做 A 的 Effect/恢复，再做 Codex B。
+- P0a G-A 真实验收优先，随后深化自研 Engine A，再接独立 Agent Memory Engine。B3/B4 只服务 Engine A，不再执行 Codex B。
 - Codex 接入按 D/H/T 声明各自的执行保证，不混同。
 - Schema source of truth 为语言无关的 Agent Contract；第三方 Codex Schema 另行版本锁定。
 

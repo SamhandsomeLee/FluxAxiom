@@ -79,6 +79,12 @@ Ctrl-C 取消当前 Run（`Cancelled`），第二次 Ctrl-C 强制退出。进�
 | `crates/run-host` | SQLite 存储、事件、预算、租约与取消 |
 | `docs/` | 架构、阶段执行方案、ADR |
 
-## 进度
+## 进度与路线（2026-10-29）
 
-截至 2026-10-26（`main` 基线 `d6f1a384`），P0a 的 A0–A3、A4a（Trace / 报告读取）、A4b（请求链校验、Sample / Feedback）已实现并通过 CI；真实模型验收另计。**下一阶段是 A5 只读安全负向测试 → G-A 基础验收和至少 5 个实际使用日、10 次有记录的任务 → G-A 通过后才进入 P0b Effect Gateway。** B3 前还需确认宿主 OS 的沙箱/网络/凭据隔离方案。详细 PR、数据证据与阶段门禁见 `docs/development/P0阶段执行方案 v1.1.md` §4.13、§4.14、§5.4、§12；总体边界见 V0.3 §14。
+`main@2aed418` 已有 P0a A0～A4b、A5 只读安全回归；G-A 仍须完成正式签收和 **5 个实际使用日、至少 10 次真实任务**。最新状态见 [G-A 验收报告](docs/development/G-A验收报告.md)。
+
+**新决策：停止 Engine B/Codex app-server 对照实验**。后续先深化唯一自研 Engine A（EA-01～04/EA-G），再核对独立 Agent Memory Engine 的真实 API（M0）、接入默认关闭的只读召回（M1）、开展 Memory 对照评测（M-EVAL）；有授权、幂等和对账证据后才考虑 M2/M3 记忆写回。B3/B4/B6-A 安全 Effect 支线仅服务 Engine A，M1 不需要 B3。本次仅更新方案，Memory 尚未接入。
+
+- [ADR-025：Engine A 与独立 Memory 的边界](docs/adr/ADR-025-engine-a-first-memory-integration.md)
+- [Engine A 与 Agent Memory Engine 协同演进方案](docs/development/EngineA与AgentMemoryEngine演进方案.md)
+- [P0 阶段执行方案 v1.1（含新路线）](docs/development/P0阶段执行方案%20v1.1.md)

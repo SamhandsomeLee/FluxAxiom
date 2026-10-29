@@ -1,16 +1,14 @@
 ---
-description: FluxAxiom 当前阶段与明确不做的事
+description: FluxAxiom 当前阶段与不做项
 alwaysApply: true
 ---
 
-# 当前阶段
+# 当前阶段（2026-10-29）
 
-FluxAxiom 是个人 Agent 系统。架构看 `docs/architecture/` 的 V0.3，执行看 `docs/development/P0阶段执行方案 v1.1.md`。
+当前先完成 P0a 的 G-A 验收，包含 A5 证据、干净构建、真实任务，5 个实际使用日和至少 10 次记录。依据 `docs/development/G-A验收报告.md`。
 
-当前只做 P0a：只读仓库分析 CLI（Rust + Tokio + SQLite + DeepSeek）。
+现行路线：`docs/adr/ADR-025-engine-a-first-memory-integration.md` 与 `docs/development/EngineA与AgentMemoryEngine演进方案.md`。**不再执行 Engine B/Codex Adapter、B1/B5/B6-B/B2/E-001**。G-A 后先 EA-01～04/EA-G，才核对独立 Agent Memory Engine 的最新源码/API（M0）并开展默认关闭的只读召回（M1）与评测；Memory 写入需要另行授权、幂等、Unknown 对账。
 
-可以做：workspace、契约类型、Run Host、`engine-api`、Engine A、只读工具、CLI、样本与只读安全测试。
+RunHost 独占执行事实；Engine A 通过 HostPort 交互；未来 Memory 经薄 MemoryClient 访问独立服务，不直接碰 LanceDB。B3/B4/B6-A 的 Host-owned Effect 仅为 Engine A 以后的安全支线，G-A 前不实施，M1 不依赖它。
 
-不要提前做：Codex、Web、MCP、Cordis、长期 Memory、Multi-Agent、Evolution、本地 GPU、Effect Gateway、写文件、任意 Shell，以及没有使用点的空 crate。
-
-出现新的跨模块边界时写 ADR，不要把决策只留在对话里。
+当前不要提前建设：Codex、Web、MCP、Cordis、Multi-Agent、Evolution、本地 GPU、写文件/任意 Shell、没有使用点的空 crate。跨模块边界先写 ADR。
