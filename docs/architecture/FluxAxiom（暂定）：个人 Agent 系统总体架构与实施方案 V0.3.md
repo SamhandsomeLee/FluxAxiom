@@ -1,6 +1,6 @@
 # FluxAxiom（暂定）：个人 Agent 系统总体架构与实施方案 V0.3
 
-> **2026-10-29 有效修订（ADR-025）**：V0.3 保留历史技术讨论，但不再执行 Engine B/Codex app-server、T/H/D、E-001；唯一正式 Agent Engine 是自研 Engine A。新路线为 G-A → EA-01～04/EA-G → M0/M1（独立 Agent Memory Engine 只读 Recall）→ M-EVAL → 条件 M2/M3。B3/B4/B6-A 仅为 Engine A 安全 Effect 支线，M1 不以 B3 为前置。本文的 Codex §8–9 与 E-001 §16 为**历史研究，不能据此开发**。依据 [ADR-025](../adr/ADR-025-engine-a-first-memory-integration.md)、[专项演进方案](../development/EngineA与AgentMemoryEngine演进方案.md)；真实仓库是 `SamhandsomeLee/FluxAxiom`，而非旧文中拟议仓库地址。
+> **2026-10-29 有效修订（ADR-025）**：V0.3 保留历史技术讨论，但不再执行 Engine B/Codex app-server、T/H/D、E-001；唯一正式 Agent Engine 是自研 Engine A。当前路线为 EA-01～04/EA-G → M0/M1（独立 Agent Memory Engine 只读 Recall）→ M-EVAL → 条件 M2/M3。**G-A 于同日冻结且未签收，不再阻塞 EA**；5 个实际使用日与至少 10 次任务不启动，不得写成通过。B3/B4/B6-A 仅为 Engine A 安全 Effect 支线且未开工，M1 不以 B3 为前置。本文的 Codex §8–9 与 E-001 §16 为**历史研究，不能据此开发**。依据 [ADR-025](../adr/ADR-025-engine-a-first-memory-integration.md)、[专项演进方案](../development/EngineA与AgentMemoryEngine演进方案.md)；真实仓库是 `SamhandsomeLee/FluxAxiom`，而非旧文中拟议仓库地址。
 
 > **本次修订**：项目命名与 Monorepo 研发组织补充版；保留 V0.3 原有运行时、治理、安全和实施设计。
 
@@ -689,7 +689,7 @@ P0 提前记录 `run_id / attempt_id / model_id / provider_id / prompt_layout_ve
 
 ### 12.1 Memory（2026-10-29 改为独立服务接入）
 
-- P0a G-A 的无记忆基线先通过，随后深化 Engine A 的 Context/工具/质量；M0 以独立 Agent Memory Engine 的当前源码验证 API、安全和 scope。
+- 当前无记忆基线先保留。G-A 已于 2026-10-29 冻结且未签收，不再阻塞 Engine A 的 Context/工具/质量深化；M0 仍以独立 Agent Memory Engine 的当前源码验证 API、安全和 scope。Memory 不改写这条基线。
 - Run/Attempt/Effect/Event 的权威事实属于 RunHost，Working Context 属 Engine A；长期 Memory 独立存储、检索和治理，**不在 FluxAxiom 再建 SQLite/FTS 记忆库**。
 - 未来 Engine A 通过薄 `MemoryClient` 在 Context 组装阶段只读召回，限 Scope/Token/条数/超时，带来源标识并视为低信任文本，不能提升工具或工作区权限。
 - 在相同任务/模型/预算下对照 `none/manual/memory-recall` 的事实准确率、成本、延迟和返工；自动写入候选必须去敏/授权/幂等/回执/删除与结果未知对账。
@@ -895,9 +895,9 @@ FluxAxiom/
 
 **P0a 不要求**审批全流程、写操作的崩溃对账、Codex、Web、MCP、Cordis、Multi-Agent、长期 Memory、GPU、通用插件容器、多仓库发布流水线。只保留 Contract 中的必要语义和迁移空间。
 
-**实施状态同步（2026-10-26，main `d6f1a384`）**：本表是分阶段设计目标，不表示全部完成。A-1、A0–A3、A4a（Trace/报告）、A4b（Rebuild/Sample/Feedback）已有代码与回归测试；最新 CI 已通过。A4b 将 `tool_call_id` 作为工具执行证据透传，历史事件缺关联 ID 时不得推断一致；真实 DeepSeek Run 与安全边界仍需实机验收。下一主线为 **A5 只读负向测试 → G-A 实际使用门禁 → B3/B4**，其唯一可执行的 PR 级清单见《P0 阶段执行方案 v1.1》§4.13、§4.14、§5.4、§12。
+**实施状态同步（2026-10-26，main `d6f1a384`）**：本表是分阶段设计目标，不表示全部完成。A-1、A0–A3、A4a（Trace/报告）、A4b（Rebuild/Sample/Feedback）已有代码与回归测试；最新 CI 已通过。A4b 将 `tool_call_id` 作为工具执行证据透传，历史事件缺关联 ID 时不得推断一致；真实 DeepSeek Run 与安全边界仍需实机验收。写作当时的下一主线为 **A5 只读负向测试 → G-A 实际使用门禁 → B3/B4**。**2026-10-29 起 G-A 冻结，当前主线改从 EA-01 继续**；可执行清单以《P0 阶段执行方案 v1.1》文首冻结说明和 §12 为准。
 
-**P0a 的两种独立完成条件**：① 工程闭环（CI、Run/Attempt/Event、Trace、Sample）已经具备；② 可用且可信的验收（只读安全、真实模型的请求重建和报告事实、关闭/重启后的持久访问、5 个实际使用日且至少 10 次有记录任务）尚待形成证据。`Completed`、`rebuild=consistent`、事实正确各自证明不同性质，任何一项都不能替代另一项。若多数报告必须重做，暂停 P0b，优先修 Engine A 的工具/Prompt/结果质量。
+**P0a 的两种独立完成条件**：① 工程闭环（CI、Run/Attempt/Event、Trace、Sample）已经具备；② 可用且可信的验收（只读安全、真实模型的请求重建和报告事实、关闭/重启后的持久访问、5 个实际使用日且至少 10 次有记录任务）尚待形成证据。**2026-10-29：条件②冻结，未签收，不再阻塞 EA。** `Completed`、`rebuild=consistent`、事实正确各自证明不同性质，任何一项都不能替代另一项。若后续开发中多数报告必须重做，优先修 Engine A 的工具/Prompt/结果质量。
 
 **A5 保证边界**：复用现有路径、symlink、`.env`/ignore 和分页工具测试，重点新增 Fake Model → Engine Tool Dispatch → HostPort/Event → CLI/Sample 的越权/泄漏证明；用户文件、`README`/`AGENTS.md` 和 Model Tool Call 都不构成权限来源。`canonicalize` 再 `open` 不能构成 TOCTOU 免疫，更不能替代 P0b 经 OS 实证的沙箱。可执行切片与残余风险声明见执行方案 §4.13 与 **ADR-024**。
 
@@ -905,7 +905,7 @@ FluxAxiom/
 
 | 交付 | 验收 |
 | --- | --- |
-| G-A | 先完成 P0a 安全/事实与 5 实际使用日、≥10 任务观察期，Memory 关闭 |
+| G-A | 2026-10-29 冻结，未签收。5 实际使用日与 ≥10 任务不启动，不得写成通过，不再阻塞 EA。Memory 保持关闭 |
 | EA-01～04 / EA-G | Engine A 的 Loop/Context/只读工具/失败与事实评测 |
 | M0 / M1 / M-EVAL | 核对外部 Memory API/授权，默认关闭的只读召回，none/manual/memory 可比评测 |
 | M2 / M3 | 有条件的记忆候选写回、幂等/回执/Unknown 核对、删除/跨系统安全 |
@@ -915,7 +915,7 @@ FluxAxiom/
 
 ### 14.3 当前完成标准
 
-P0a 看真实分析质量、持久事实与安全证据、观察期；EA-G 看单 Engine A 在固定任务上的质量与可靠性；Memory 看隔离/隐私及任务净收益；B3/B4 看 Host-owned Effect 的授权与未知结果恢复。不再要求第二引擎对照报告。
+P0a 的使用观察期已冻结且未签收；EA-G 看单 Engine A 在固定任务上的质量与可靠性；Memory 看隔离/隐私及任务净收益；B3/B4 看 Host-owned Effect 的授权与未知结果恢复。不再要求第二引擎对照报告。
 
 ---
 
@@ -1033,7 +1033,7 @@ H1：同一业务 Task，在 A/B 切换时不修改 Experience 核心代码；�
 - 采用 Rust Workspace 主导的 Modular Monorepo；实验与正式依赖隔离；主干保持可运行，目录渐进创建。
 - Cordis 暂不引入；保留 EngineAdapter 作为系统级替换边界。
 - Host 拥有 Session、Run、Effect、Approval、Command 和 durable fact 记录；Engine 保留智能策略私有状态。
-- P0a G-A 真实验收优先，随后深化自研 Engine A，再接独立 Agent Memory Engine。B3/B4 只服务 Engine A，不再执行 Codex B。
+- P0a 的观察期已于 2026-10-29 冻结且未签收；当前先深化自研 Engine A，再接独立 Agent Memory Engine。B3/B4 只服务 Engine A，不因 G-A 冻结开工，不再执行 Codex B。
 - Codex 接入按 D/H/T 声明各自的执行保证，不混同。
 - Schema source of truth 为语言无关的 Agent Contract；第三方 Codex Schema 另行版本锁定。
 

@@ -81,9 +81,9 @@ Ctrl-C 取消当前 Run（`Cancelled`），第二次 Ctrl-C 强制退出。进�
 
 ## 进度与路线（2026-10-29）
 
-`main@2aed418` 已有 P0a A0～A4b、A5 只读安全回归；G-A 仍须完成正式签收和 **5 个实际使用日、至少 10 次真实任务**。最新状态见 [G-A 验收报告](docs/development/G-A验收报告.md)。
+`main@2aed418` 已有 P0a A0～A4b、A5 只读安全回归。**2026-10-29 冻结 G-A**：5 个实际使用日和至少 10 次真实任务不启动，正式签收未完成，不得写成通过。该未完成项不再阻塞 EA。最新状态见 [G-A 验收报告](docs/development/G-A验收报告.md)。
 
-**新决策：停止 Engine B/Codex app-server 对照实验**。后续先深化唯一自研 Engine A（EA-01～04/EA-G），再核对独立 Agent Memory Engine 的真实 API（M0）、接入默认关闭的只读召回（M1）、开展 Memory 对照评测（M-EVAL）；有授权、幂等和对账证据后才考虑 M2/M3 记忆写回。B3/B4/B6-A 安全 Effect 支线仅服务 Engine A，M1 不需要 B3。本次仅更新方案，Memory 尚未接入。
+**新决策：停止 Engine B/Codex app-server 对照实验**。后续直接深化唯一自研 Engine A（EA-01～04/EA-G），再核对独立 Agent Memory Engine 的真实 API（M0）、接入默认关闭的只读召回（M1）、开展 Memory 对照评测（M-EVAL）；有授权、幂等和对账证据后才考虑 M2/M3 记忆写回。冻结期间 Memory 不改写无记忆基线。B3/B4/B6-A 安全 Effect 支线仅服务 Engine A，不因本次冻结开工，M1 不需要 B3。Memory 尚未接入。
 
 - [ADR-025：Engine A 与独立 Memory 的边界](docs/adr/ADR-025-engine-a-first-memory-integration.md)
 - [Engine A 与 Agent Memory Engine 协同演进方案](docs/development/EngineA与AgentMemoryEngine演进方案.md)

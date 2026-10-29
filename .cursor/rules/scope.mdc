@@ -5,10 +5,10 @@ alwaysApply: true
 
 # 当前阶段（2026-10-29）
 
-当前先完成 P0a 的 G-A 验收，包含 A5 证据、干净构建、真实任务，5 个实际使用日和至少 10 次记录。依据 `docs/development/G-A验收报告.md`。
+**G-A 已冻结，未签收。** 5 个实际使用日和至少 10 次真实任务不启动，不得把 G-A 写成通过。该未完成项不再阻塞 EA-01 起的 Engine A 开发。依据 `docs/development/G-A验收报告.md`。
 
-现行路线：`docs/adr/ADR-025-engine-a-first-memory-integration.md` 与 `docs/development/EngineA与AgentMemoryEngine演进方案.md`。**不再执行 Engine B/Codex Adapter、B1/B5/B6-B/B2/E-001**。G-A 后先 EA-01～04/EA-G，才核对独立 Agent Memory Engine 的最新源码/API（M0）并开展默认关闭的只读召回（M1）与评测；Memory 写入需要另行授权、幂等、Unknown 对账。
+现行路线：`docs/adr/ADR-025-engine-a-first-memory-integration.md` 与 `docs/development/EngineA与AgentMemoryEngine演进方案.md`。**不再执行 Engine B/Codex Adapter、B1/B5/B6-B/B2/E-001**。当前从 EA-01～04/EA-G 继续；之后才核对独立 Agent Memory Engine 的最新源码/API（M0）并开展默认关闭的只读召回（M1）与评测。Memory 写入需要另行授权、幂等、Unknown 对账。冻结期间 Memory 不改写现有无记忆基线。
 
-RunHost 独占执行事实；Engine A 通过 HostPort 交互；未来 Memory 经薄 MemoryClient 访问独立服务，不直接碰 LanceDB。B3/B4/B6-A 的 Host-owned Effect 仅为 Engine A 以后的安全支线，G-A 前不实施，M1 不依赖它。
+RunHost 独占执行事实；Engine A 通过 HostPort 交互；未来 Memory 经薄 MemoryClient 访问独立服务，不直接碰 LanceDB。B3/B4/B6-A 的 Host-owned Effect 仅为 Engine A 以后的安全支线，不因 G-A 冻结而开工，M1 不依赖它。
 
 当前不要提前建设：Codex、Web、MCP、Cordis、Multi-Agent、Evolution、本地 GPU、写文件/任意 Shell、没有使用点的空 crate。跨模块边界先写 ADR。

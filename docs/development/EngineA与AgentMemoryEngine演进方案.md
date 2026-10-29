@@ -1,28 +1,29 @@
 # Engine A 与 Agent Memory Engine 协同演进方案
 
 > **2026-10-29 决议**：停止 Engine B/Codex Adapter/T-H-D/E-001。源码基线 `main@2aed418`；这是待实施计划。架构决策 [ADR-025](../adr/ADR-025-engine-a-first-memory-integration.md)，G-A 事实以 [验收报告](G-A验收报告.md) 为准。
+>
+> **2026-10-29 冻结 G-A**：观察期不启动，5 个实际使用日与至少 10 次真实任务未完成，不得写成通过。该未完成项不再阻塞 EA-01。Memory 不改写无记忆基线；B3/B4 受控写与交互界面不因本决定开工。
 
 ## 1. 路线
 
 ```mermaid
 flowchart TD
-  G["G-A：5个实际使用日 / ≥10次真实任务"] --> A["EA-01～04：强化 Engine A"]
-  A --> AG{"EA-G：质量与可靠性门禁"}
+  A["EA-01～04：强化 Engine A"] --> AG{"EA-G：质量与可靠性门禁"}
   AG --> M0["M0：核验外部 Memory 源码与契约"]
   M0 --> M1["M1：默认关闭的只读 Recall"]
   M1 --> EV["M-EVAL：none/manual/memory 对照"]
   EV --> MW["M2/M3：有条件写回及联合回归"]
-  G -.-> B["B3/B4/B6-A：仅 Engine A 的安全 Effect 支线"]
-  B -.-> MW
+  G["G-A：冻结，未签收，不阻塞 EA"]
+  B["B3/B4/B6-A：未开工"] -.-> MW
 ```
 
-G-A 前不引入 Memory，保留现有 P0a 无记忆基线。M1 不需要 B3；任何 Memory 持久写入必须另过授权、幂等、审计及对账。
+G-A 已冻结。Memory 仍不进入当前无记忆基线。M1 不需要 B3；任何 Memory 持久写入必须另过授权、幂等、审计及对账。
 
 ## 2. 开发包与证据
 
 | Issue/PR | 主要工作 | 必备验收 |
 | --- | --- | --- |
-| GA-00 | G-A 全部门禁与使用观察期 | 干净环境、真实 DeepSeek 质量、A5 负向安全、持久读取/中断恢复、5 天/10 次任务；CI success 不等于 G-A |
+| GA-00 | G-A 冻结，未签收 | 2026-10-29 决定不启动观察期，5 天/10 次不补记，不得写成通过，且不再阻塞 EA。干净环境、远端 CI 与 A5 Done 矩阵仍可缺；CI success 仍不等于 G-A 通过 |
 | EA-01 | `engine-custom` 的 Chat/SSE/Retry/Loop 协议稳健性 | malformed tool calls、usage/reasoning、流中断、length、取消/重试、错误分类 Fake/SSE 测试 |
 | EA-02 | Context Builder、历史与工具返回裁剪、Prompt Layout 与预算 | 请求可重建、Token/上下文约束、未知用量真实标注、模型/工具预留不超支 |
 | EA-03 | `WorkspaceRoot` 与只读 Tool 可用性/性能/安全 | ignore/symlink/TOCTOU/越界回归；大文件 `read_file` 分页性能基线，先测再优化（当前为 NUL 检查可能扫完整文件） |

@@ -6,8 +6,8 @@
 
 1. **停止 Engine B / Codex app-server 实验**。B1、B5-T/H/D、B6-B、B2/E-001 退出正式 P0/P1 路线，不建立 `engine-codex`，旧 V0.3 第 8–9、16 章只作为历史研究。
 2. **专注自研 Engine A**，以 `engine-custom` 的 Rust Loop 为唯一正式 Agent Engine；保留现有 `EngineAdapter` / `HostPort` 作为清晰的测试、Provider 与 Host 隔离边界，不为了第二引擎建空抽象。
-3. **新阶段门禁**：G-A 真实验收 → EA-01～04 和 EA-G（Loop/Context/工具/可靠性与质量）→ M0 核对独立 Agent Memory Engine 真实源码/API → M1 默认关闭的只读召回 → M-EVAL 对照 → 有条件 M2/M3 记忆写回与联合回归。G-A 仍要求 5 个实际使用日、至少 10 次真实任务；不得提前让 Memory 改变 G-A 基线。
-4. **保留 B3/B4/B6-A**：Host-owned Effect、一次性审批、沙箱、取消和 Unknown 对账仍作为 Engine A 的安全写操作支线，但不再为 Engine B 服务。G-A 和 OS 沙箱实机证据未完成时不实施不可信写入；M1 只读召回不以 B3 为前置。
+3. **新阶段门禁**：EA-01～04 和 EA-G（Loop/Context/工具/可靠性与质量）→ M0 核对独立 Agent Memory Engine 真实源码/API → M1 默认关闭的只读召回 → M-EVAL 对照 → 有条件 M2/M3 记忆写回与联合回归。**2026-10-29 补充**：G-A 冻结且未签收。5 个实际使用日与至少 10 次真实任务不启动，不得把 G-A 写成通过，该未完成项不再作为 EA-01 的前置。不得让 Memory 改变这条无记忆基线。
+4. **保留 B3/B4/B6-A**：Host-owned Effect、一次性审批、沙箱、取消和 Unknown 对账仍作为 Engine A 的安全写操作支线，但不再为 Engine B 服务。G-A 冻结不授权不可信写入；OS 沙箱实机证据未完成时不实施。M1 只读召回不以 B3 为前置。
 5. **Memory 独立部署、独立存储、共同迭代**。Engine A 仅通过薄 `MemoryClient` 调 API，不直接访问外部 LanceDB；Memory 服务不写 FluxAxiom SQLite，也不替代 Run/Attempt/Event/Blob 的权威事实。RunHost 不执行 Memory 排序/提取策略。
 
 ## 当前证据与待核验项目
