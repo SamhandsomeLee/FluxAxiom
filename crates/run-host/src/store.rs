@@ -1,3 +1,9 @@
+//! Host 的 SQLite 行读写。
+//!
+//! **作用**：`RunHost` 与 `DrivePort` 经这些函数插入、读取和更新 Session、Run、Attempt、反馈。
+//! **边界**：不写 durable event，不碰 blob 文件。状态是否允许迁移由调用方在事务里判断。
+//! 未知枚举和非法主键解码为 `HostError::Corrupt`，不把缺字段编成默认状态。
+
 use std::path::Path;
 use std::time::Duration;
 
@@ -10,13 +16,22 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use crate::error::HostError;
 use crate::time::now_utc;
 
-/// 打开文件、启用 WAL，并让写冲突等待 5 秒而不是立刻 `SQLITE_BUSY`。
+/// 打开 `host.db` 并套上 WAL 与写等待。
+///
+/// **作用**：`RunHost::open` 用它拿到进程内共享的那条连接。
+/// **参数**：`path` 是数据目录下的库文件；父目录须已存在。
+/// **边界**：文件打不开时返回 `Sqlite`。`journal_mode` 不是 WAL 时返回 `Corrupt`，不继续迁移。
 pub(crate) fn connect(path: &Path) -> Result<Connection, HostError> {
     let connection = Connection::open(path)?;
     configure(&connection)?;
     Ok(connection)
 }
 
+/// 给一条已打开的连接设置 WAL、外键和写锁等待。
+///
+/// **作用**：`connect` 在返回连接前调用；测试也可直接打在内存库上。
+/// **边界**：`journal_mode` 读回不是 `wal` 时返回 `Corrupt`，不把失败当成已启用 WAL。
+/// 等待上限固定 5 秒。不建表、不迁移。
 pub(crate) fn configure(connection: &Connection) -> Result<(), HostError> {
     // journal_mode 会返回当前模式，不能用只执行语句的 pragma_update。
     let journal_mode: String =
@@ -45,7 +60,11 @@ pub(crate) fn deferred(connection: &mut Connection) -> Result<Transaction<'_>, H
     Ok(connection.transaction_with_behavior(TransactionBehavior::Deferred)?)
 }
 
-/// 按版本顺序应用迁移。已记录的版本不会重跑，历史行不原地改写。
+/// 按版本顺序应用尚未记录的迁移。
+///
+/// **作用**：`RunHost::open` 在 `connect` 之后调用。版本记在 `schema_migrations`。
+/// **边界**：已记录的版本不重跑，历史行不原地改写。每一版各自提交；中途失败时该版回滚，已提交的更低版本保留。
+/// 不补写 durable event，也不校验业务行是否满足不变量。
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), HostError> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -79,6 +98,11 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), HostError> {
     Ok(())
 }
 
+/// 插入一行 Session。
+///
+/// **作用**：`RunHost::create_session` 在自己的事务里调用。Engine 不写这张表。
+/// **参数**：`session` 的主键和 `created_at` 原样入库。
+/// **边界**：主键冲突返回 `Sqlite` 约束错误。不创建 Run，不写 event。
 pub(crate) fn insert_session(
     transaction: &Transaction<'_>,
     session: &Session,
@@ -90,6 +114,12 @@ pub(crate) fn insert_session(
     Ok(())
 }
 
+/// 插入一条新建 Run 和它的第一条 Attempt。
+///
+/// **作用**：`RunHost::create_run` 在 `BEGIN IMMEDIATE` 里调用；`run.accepted` 由调用方紧接着写入。
+/// **参数**：`request_id` 是 Host 受理幂等键，不进入契约 `Run`。`run` / `attempt` 须已通过调用方的不变量检查。
+/// **边界**：重复 `request_id` 返回 `Sqlite` 约束错误，由调用方回滚后再读已有行。不写 event，不校验状态机。
+/// `session_id` 指向不存在的 Session 时同样是约束错误。
 pub(crate) fn insert_created(
     transaction: &Transaction<'_>,
     run: &Run,
@@ -120,6 +150,10 @@ pub(crate) fn insert_created(
     Ok(())
 }
 
+/// 插入一行 Attempt。
+///
+/// **作用**：只被 `insert_created` 用来写下第一条 Attempt。
+/// **边界**：`run_id` 必须已在本事务里存在，否则外键失败返回 `Sqlite`。不续租、不写 event。
 fn insert_attempt(transaction: &Transaction<'_>, attempt: &Attempt) -> Result<(), HostError> {
     transaction.execute(
         "INSERT INTO attempts (
@@ -141,6 +175,10 @@ fn insert_attempt(transaction: &Transaction<'_>, attempt: &Attempt) -> Result<()
     Ok(())
 }
 
+/// 按主键读 Session。
+///
+/// **作用**：`get_session`，以及 `create_run` 在建 Run 前确认调用方给出的 Session 存在。
+/// **边界**：没有行返回 `NotFound`。主键或时间戳无法解析返回 `Corrupt`，不造一个空 Session。
 pub(crate) fn load_session(
     connection: &Connection,
     session_id: &SessionId,
@@ -156,6 +194,10 @@ pub(crate) fn load_session(
     session_from_raw(raw)
 }
 
+/// 按主键读 Run。
+///
+/// **作用**：状态查询、drive、取消、收尸和 `DrivePort` 都从这里取权威行。
+/// **边界**：没有行返回 `NotFound`。状态、终态原因、预算或时间戳非法返回 `Corrupt`。不附带 Attempt 或 event。
 pub(crate) fn load_run(connection: &Connection, run_id: &RunId) -> Result<Run, HostError> {
     let raw = connection
         .query_row(
@@ -170,6 +212,10 @@ pub(crate) fn load_run(connection: &Connection, run_id: &RunId) -> Result<Run, H
     run_from_raw(raw)
 }
 
+/// 按主键读 Attempt。
+///
+/// **作用**：`RunHost::get_attempt`。驱动路径用 `latest_attempt`，不用这个函数选“当前”Attempt。
+/// **边界**：没有行返回 `NotFound`。状态、结局或租约时间非法返回 `Corrupt`。
 pub(crate) fn load_attempt(
     connection: &Connection,
     attempt_id: &AttemptId,
@@ -187,6 +233,11 @@ pub(crate) fn load_attempt(
     attempt_from_raw(raw)
 }
 
+/// 按受理幂等键读已创建的 Run 及其最新 Attempt。
+///
+/// **作用**：`create_run` 在插入前、以及唯一约束冲突后，用来返回已有记录。
+/// **参数**：`request_id` 允许任意非空字符串；是否合法由 `create_run` 事先检查。
+/// **边界**：没有 Run 返回 `Ok(None)`。有 Run 但没有 Attempt 返回 `NotFound`。不比较这次请求的工作区或预算。
 pub(crate) fn load_created_by_request_id(
     connection: &Connection,
     request_id: &str,
@@ -208,6 +259,10 @@ pub(crate) fn load_created_by_request_id(
     Ok(Some((run, attempt)))
 }
 
+/// 取该 Run 下 `attempt_id` 最大的一行。
+///
+/// **作用**：快照、drive、取消、收尸和预算检查都把它当作当前 Attempt。A1.1 每个 Run 只有一行。
+/// **边界**：没有行返回 `NotFound`。不按 `lease_expires_at` 或状态过滤；过期与否由调用方判断。
 pub(crate) fn latest_attempt(
     connection: &Connection,
     run_id: &RunId,
@@ -321,16 +376,25 @@ pub(crate) fn list_active_drive_attempts(
     Ok(out)
 }
 
+/// 读当前 `journal_mode`，供打开库后的测试断言。
+///
+/// **作用**：`RunHost::journal_mode` 转发到这里。
+/// **边界**：只在测试构建存在。不修改 pragma。
 #[cfg(test)]
 pub(crate) fn journal_mode(connection: &Connection) -> Result<String, HostError> {
     Ok(connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?)
 }
 
+/// 读当前 `busy_timeout`（毫秒），供打开库后的测试断言。
+///
+/// **作用**：`RunHost::busy_timeout_ms` 转发到这里。
+/// **边界**：只在测试构建存在。不修改 pragma。
 #[cfg(test)]
 pub(crate) fn busy_timeout_ms(connection: &Connection) -> Result<i64, HostError> {
     Ok(connection.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?)
 }
 
+/// `runs` 表的一行原文，尚未做主键和枚举校验。
 struct RunRow {
     run_id: String,
     session_id: Option<String>,
@@ -344,6 +408,7 @@ struct RunRow {
     updated_at: String,
 }
 
+/// `attempts` 表的一行原文，尚未做主键和枚举校验。
 struct AttemptRow {
     attempt_id: String,
     run_id: String,
@@ -356,6 +421,10 @@ struct AttemptRow {
     error_reason: Option<String>,
 }
 
+/// 把 `runs` 的 SELECT 列收成 [`RunRow`]。
+///
+/// **作用**：`load_run`、`load_created_by_request_id` 共用列顺序。
+/// **边界**：只传递 SQLite 读错误。非法状态留到 `run_from_raw`。
 fn map_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
     Ok(RunRow {
         run_id: row.get(0)?,
@@ -371,6 +440,10 @@ fn map_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
     })
 }
 
+/// 把 `attempts` 的 SELECT 列收成 [`AttemptRow`]。
+///
+/// **作用**：`load_attempt` 与 `latest_attempt` 共用列顺序。
+/// **边界**：只传递 SQLite 读错误。非法状态留到 `attempt_from_raw`。
 fn map_attempt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
     Ok(AttemptRow {
         attempt_id: row.get(0)?,
@@ -385,6 +458,10 @@ fn map_attempt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
     })
 }
 
+/// 把 Session 两列解析成契约类型。
+///
+/// **作用**：`load_session` 的唯一解码点。
+/// **边界**：`session_id` 或 `created_at` 不合格返回 `Corrupt`，字段名写在错误里。
 fn session_from_raw((session_id, created_at): (String, String)) -> Result<Session, HostError> {
     Ok(Session {
         session_id: SessionId::parse(session_id).map_err(|_| HostError::Corrupt("session_id"))?,
@@ -392,6 +469,10 @@ fn session_from_raw((session_id, created_at): (String, String)) -> Result<Sessio
     })
 }
 
+/// 把 [`RunRow`] 解析成契约 `Run`。
+///
+/// **作用**：所有 Run 读取的唯一解码点。
+/// **边界**：未知状态、未知终态原因、预算超出 `u32`、时间戳不合格都返回 `Corrupt`。不检查状态与 `terminal_reason` 是否配套。
 fn run_from_raw(row: RunRow) -> Result<Run, HostError> {
     Ok(Run {
         run_id: RunId::parse(row.run_id).map_err(|_| HostError::Corrupt("run_id"))?,
@@ -419,6 +500,10 @@ fn run_from_raw(row: RunRow) -> Result<Run, HostError> {
     })
 }
 
+/// 把 [`AttemptRow`] 解析成契约 `Attempt`。
+///
+/// **作用**：所有 Attempt 读取的唯一解码点。
+/// **边界**：未知状态或结局、主键或租约时间不合格返回 `Corrupt`。不检查租约是否已过期。
 fn attempt_from_raw(row: AttemptRow) -> Result<Attempt, HostError> {
     Ok(Attempt {
         attempt_id: AttemptId::parse(row.attempt_id)
@@ -438,10 +523,17 @@ fn attempt_from_raw(row: AttemptRow) -> Result<Attempt, HostError> {
     })
 }
 
+/// 把预算列从 SQLite 整数收成 `u32`。
+///
+/// **作用**：`run_from_raw` 解码 `max_model_calls` 与 `max_tool_calls`。
+/// **边界**：负数或超过 `u32::MAX` 返回 `Corrupt("budget")`，不用 0 代替。
 fn parse_u32(value: i64) -> Result<u32, HostError> {
     u32::try_from(value).map_err(|_| HostError::Corrupt("budget"))
 }
 
+/// Run 状态的库存文本：与枚举名相同的 PascalCase。
+///
+/// **作用**：`insert_created` 与 `update_run_and_attempt` 写入 `runs.status`。
 fn encode_run_status(status: RunStatus) -> &'static str {
     match status {
         RunStatus::Accepted => "Accepted",
@@ -453,6 +545,9 @@ fn encode_run_status(status: RunStatus) -> &'static str {
     }
 }
 
+/// 把 `runs.status` 还原成枚举。
+///
+/// **边界**：不是六种已知文本时返回 `Corrupt("run status")`，不默认成 `Failed` 或 `Accepted`。
 fn decode_run_status(value: &str) -> Result<RunStatus, HostError> {
     match value {
         "Accepted" => Ok(RunStatus::Accepted),
@@ -465,6 +560,9 @@ fn decode_run_status(value: &str) -> Result<RunStatus, HostError> {
     }
 }
 
+/// 终态原因的库存文本：小写蛇形，与事件里的 `terminal_reason` 用词一致。
+///
+/// **作用**：写入 `runs.terminal_reason`。`None` 由调用方省略，不经过这里。
 fn encode_terminal_reason(reason: TerminalReason) -> &'static str {
     match reason {
         TerminalReason::Completed => "completed",
@@ -476,6 +574,9 @@ fn encode_terminal_reason(reason: TerminalReason) -> &'static str {
     }
 }
 
+/// 把 `runs.terminal_reason` 还原成枚举。
+///
+/// **边界**：未知文本返回 `Corrupt("terminal reason")`。空列由调用方当成 `None`，不进这个函数。
 fn decode_terminal_reason(value: &str) -> Result<TerminalReason, HostError> {
     match value {
         "completed" => Ok(TerminalReason::Completed),
@@ -488,6 +589,9 @@ fn decode_terminal_reason(value: &str) -> Result<TerminalReason, HostError> {
     }
 }
 
+/// Attempt 状态的库存文本：与枚举名相同的 PascalCase。
+///
+/// **作用**：写入 `attempts.status`。
 fn encode_attempt_status(status: AttemptStatus) -> &'static str {
     match status {
         AttemptStatus::Starting => "Starting",
@@ -497,6 +601,9 @@ fn encode_attempt_status(status: AttemptStatus) -> &'static str {
     }
 }
 
+/// 把 `attempts.status` 还原成枚举。
+///
+/// **边界**：未知文本返回 `Corrupt("attempt status")`。
 fn decode_attempt_status(value: &str) -> Result<AttemptStatus, HostError> {
     match value {
         "Starting" => Ok(AttemptStatus::Starting),
@@ -507,6 +614,9 @@ fn decode_attempt_status(value: &str) -> Result<AttemptStatus, HostError> {
     }
 }
 
+/// Attempt 结局的库存文本：小写蛇形。
+///
+/// **作用**：写入 `attempts.outcome`。进行中的 Attempt 没有结局，调用方传 `None`。
 fn encode_attempt_outcome(outcome: AttemptOutcome) -> &'static str {
     match outcome {
         AttemptOutcome::Completed => "completed",
@@ -515,6 +625,9 @@ fn encode_attempt_outcome(outcome: AttemptOutcome) -> &'static str {
     }
 }
 
+/// 把 `attempts.outcome` 还原成枚举。
+///
+/// **边界**：未知文本返回 `Corrupt("attempt outcome")`。空列由调用方当成 `None`。
 fn decode_attempt_outcome(value: &str) -> Result<AttemptOutcome, HostError> {
     match value {
         "completed" => Ok(AttemptOutcome::Completed),
@@ -583,6 +696,9 @@ pub(crate) fn list_feedback(
     Ok(out)
 }
 
+/// 反馈总评的库存文本：`usable` / `needs_edit` / `redo`。
+///
+/// **作用**：`insert_feedback` 写入 `sample_feedback.verdict`。
 fn encode_verdict(verdict: fluxaxiom_contract::FeedbackVerdict) -> &'static str {
     match verdict {
         fluxaxiom_contract::FeedbackVerdict::Usable => "usable",
@@ -591,6 +707,9 @@ fn encode_verdict(verdict: fluxaxiom_contract::FeedbackVerdict) -> &'static str 
     }
 }
 
+/// 把 `sample_feedback.verdict` 还原成枚举。
+///
+/// **边界**：未知文本返回 `Corrupt("feedback verdict")`，不默认成 `redo`。
 fn decode_verdict(value: &str) -> Result<fluxaxiom_contract::FeedbackVerdict, HostError> {
     match value {
         "usable" => Ok(fluxaxiom_contract::FeedbackVerdict::Usable),
