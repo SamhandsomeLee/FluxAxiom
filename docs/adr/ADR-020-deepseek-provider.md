@@ -17,7 +17,7 @@ P0 需要一个云端模型完成只读仓库分析。执行方案已经排除 A
 3. 每个样本记录请求的模型别名、调用时间，以及当时文档所列的模型版本。评测不把不同模型版本混在一起计算。
 4. 请求带 `tools` 时，历史 assistant 消息必须回传 `reasoning_content`。要回传时字段用字符串并始终序列化，空内容写成 `""`，不省略，也不写成 `null`。不带 `tools` 的请求不把思维链放进下一轮。它写入 Host blob，供重建上下文。它不进入 durable event payload，也不进入普通日志。保留期限与样本保留策略一致。失败或流中断的响应不进入历史。
 5. 思考强度使用 `reasoning_effort`，取值为 `low`、`high`、`max`，默认 `high`，并记入样本。P0a 不把 `temperature` 与 penalty 当作实验变量。
-6. `prompt_cache_hit_tokens` 与 `prompt_cache_miss_tokens` 按返回值记录，缺失记为 `unknown`。系统提示与工具 schema 固定在前并版本化为 `prompt_layout_version`，历史只追加。
+6. `prompt_cache_hit_tokens` 与 `prompt_cache_miss_tokens` 按返回值记录，缺失记为 `unknown`。系统提示与工具 schema 固定在前并版本化为 `prompt_layout_version`。事实只追加；每次请求是事实与 context 记录的确定函数（2026-10-30 由 ADR-026 修订，原文为“历史只追加”）。
 7. 样本保存原始 usage 与调用时间。费用用版本化价格表离线计算，运行时不写死单价。
 8. 只发送已授权工作区的内容。敏感仓库在确认服务条款前不作为 P0a 样本。
 
@@ -54,3 +54,7 @@ A2.1 再实现薄客户端、流式响应和 Fake Provider。本 ADR 不包含 H
 ## 补充（2026-10-26 / A4b）
 
 样本导出所需的「别名 → 文档版本、核对日期」落在 `engine-custom::doc_version` 小表，初始仅 `deepseek-flash → DeepSeek-V4.1-Flash-1017（2026-10-21）`。别名改指或增行时，与本 ADR 同一次提交更新该表；未知别名导出为 `unknown`。详见 ADR-023。
+
+## 补充（2026-10-30 / ADR-026）
+
+第 6 条的“历史只追加”改为“事实只追加”：事件与 blob 不因压缩而删除或改写，请求允许是对事实的确定性编辑，编辑记录存为 context 记录 blob。`prompt_layout_version` 只覆盖 system 与工具 schema，上下文策略另用 `context_strategy` 版本。第 4 条的 `reasoning_content` 回传规则不变；是否允许清除旧轮思维链，待 EA-CTX 的 T7 实测后另行决定。详见 [ADR-026](ADR-026-context-module.md)。

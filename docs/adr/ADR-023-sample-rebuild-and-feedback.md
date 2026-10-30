@@ -40,3 +40,7 @@ A4a 已经能用 `flux trace` 按轮次读出 `request_ref` / `response_ref` 与
 - 第二套 VCS 或跨机可复现的工作区快照。
 - 反馈需要结构化分项或评分制，而不只是三档总评。
 - DeepSeek 别名改指或文档版本字段形状变化（与 ADR-020 同次更新 `doc_version` 表）。
+
+## 补充（2026-10-30 / ADR-026）
+
+第 2 条的规则 1、3 改为：由 blob 构造对话记录，调用上下文模块的 `replay`，与请求逐字节比较（`req_k.messages == serialize(replay(T_k, R_k))`）。规则 2、4、5、6、7 不变。旧事件没有 `context_ref` / `context_strategy`，按恒等策略校验，结论与原规则相同。记录中的策略标识在当前代码中不存在，或记录标记不可重放时，结论为 `unverifiable`。样本导出保留这两个字段。第 6 条的 `doc_version` 小表暂不并入模型档案。详见 [ADR-026](ADR-026-context-module.md)。
