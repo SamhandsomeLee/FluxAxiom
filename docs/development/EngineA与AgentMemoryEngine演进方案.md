@@ -4,7 +4,7 @@
 >
 > **2026-10-29 冻结 G-A**：观察期不启动，5 个实际使用日与至少 10 次真实任务未完成，不得写成通过。该未完成项不再阻塞 EA-01。Memory 不改写无记忆基线；B3/B4 受控写与交互界面不因本决定开工。
 >
-> **2026-10-30 上下文压缩专题**：上下文管理作为独立模块迭代，EA-02 只交付其 P1。架构决策 [ADR-026](../adr/ADR-026-context-module.md)，计划见 [EA-CTX 执行方案](上下文压缩专题执行方案（EA-CTX）.md)。
+> **2026-10-30 上下文压缩专题**：上下文管理作为独立模块迭代，EA-02 只交付其 P1。P1 之后先做实测轮，把 DeepSeek Flash 的不确定项测完。架构决策 [ADR-026](../adr/ADR-026-context-module.md)，计划见 [EA-CTX 执行方案](上下文压缩专题执行方案（EA-CTX）.md) §8、§9。
 
 ## 1. 路线
 
@@ -28,7 +28,7 @@ G-A 已冻结。Memory 仍不进入当前无记忆基线。M1 不需要 B3；任
 | GA-00 | G-A 冻结，未签收 | 2026-10-29 决定不启动观察期，5 天/10 次不补记，不得写成通过，且不再阻塞 EA。干净环境、远端 CI 与 A5 Done 矩阵仍可缺；CI success 仍不等于 G-A 通过 |
 | EA-01 | `engine-custom` 的 Chat/SSE/Retry/Loop 协议稳健性 | malformed tool calls、usage/reasoning、流中断、length、取消/重试、错误分类 Fake/SSE 测试 |
 | EA-02 | = EA-CTX P1：独立上下文模块（恒等策略）、模型档案 v1、估算器、硬上限、`context_exhausted`、context 记录与校验经 `replay`（ADR-026） | 现有样本请求逐字节不变且 `trace --verify` 仍为 `consistent`；依赖检查通过；估算来源真实标注（`usage` / `estimated`）；硬上限与服务端超限归类有测试 |
-| EA-CTX | 上下文压缩专题 P2–P5：实测档案未知字段、决策等价评测、`mask@1` 遮蔽、软触发校准、按证据加入新策略 | 见 [EA-CTX 执行方案](上下文压缩专题执行方案（EA-CTX）.md) §9；编辑上线前决策等价损失不超过门槛 |
+| EA-CTX | 上下文压缩专题：P1 之后的实测轮（T0、T2–T11），再是 P2–P5 的离线统计、决策等价、`mask@1`、软触发校准与按证据加入的新策略 | 不确定项没有记录就保持未知；编辑上线前决策等价损失不超过门槛。见 [EA-CTX 执行方案](上下文压缩专题执行方案（EA-CTX）.md) §8、§9 |
 | EA-03 | `WorkspaceRoot` 与只读 Tool 可用性/性能/安全 | ignore/symlink/TOCTOU/越界回归；大文件 `read_file` 分页性能基线，先测再优化（当前为 NUL 检查可能扫完整文件） |
 | EA-04 | Trace/Artifact/Report 质量评测 | 固定仓库任务集的事实断言、路径证据、成本/耗时/调用数/人工返工与失败归因；区分一致性和答案正确性 |
 | EA-G | Engine A 成熟度门禁 | 相同模型/仓库 commit/Prompt/预算下可复现基线，失败案例入样本，安全与可靠性不倒退 |
