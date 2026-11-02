@@ -1,9 +1,13 @@
-//! 可重建性校验（A4b / §4.12.1）。
+//! 可重建性校验（A4b / §4.12.1，ADR-026）。
 //!
-//! **作用**：检查第 k 次请求的消息历史是否等于前一轮请求 + assistant(resp_k) + tool 结果；
-//! 以及跨轮 `model` / `tools` / system 一致性、尾轮规则、事件与响应字段一致。
-//! **边界**：纯函数，输入已是 JSON / 字节；不依赖 `run-host`。读不到 blob 时为 `unverifiable`，不猜成一致。
+//! **作用**：检查第 k 次请求的 `messages` 是否等于 `serialize(replay(T_k, R_k))`，
+//! 以及规则 2、4、5、6、7。
+//! **边界**：纯函数，输入已是 JSON / 字节；不依赖 `run-host`。读不到 blob、记录不可解析或不可重放时为 `unverifiable`，不猜成一致。
 
+use fluxaxiom_context::{
+    AssistantTurn, ContextManager, ContextRecord, ContextSpec, Estimate, EstimateSource,
+    ReplayError, Round, ToolCall as ContextToolCall, ToolResult, Transcript, IDENTITY_STRATEGY,
+};
 use fluxaxiom_contract::{ModelUsage, RebuildResult, TokenCount};
 use serde_json::Value;
 
@@ -26,6 +30,24 @@ pub struct RebuildCall {
     pub event_finish_reason: String,
     /// 事件里的 `usage`。
     pub event_usage: ModelUsage,
+    /// 事件声明的策略名。有 context 引用时必须与记录的策略名相同；旧事件无引用时为 None。
+    pub event_context_strategy: Option<String>,
+    /// 该轮 `context_ref` 的处理结果。没有引用时是恒等策略。
+    pub context: RebuildContext,
+}
+
+/// 一轮模型调用带给 `replay` 的 context 记录。
+///
+/// **作用**：区分旧事件、读不到的引用和已解析记录。
+/// **边界**：Host 不解析记录。调用方把 blob 字节解析后再放进 [`RebuildContext::Parsed`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebuildContext {
+    /// 事件没有 `context_ref`。按恒等策略重放，不读记录。
+    Identity,
+    /// 事件有引用，但 blob 读不到或不是合法记录。
+    Unreadable,
+    /// 已解析的记录。策略未知或 `replayable = false` 时 `replay` 会拒绝。
+    Parsed(ContextRecord),
 }
 
 /// 已读出的工具事件。身份用于核对前缀，正文用于核对下一轮 tool 消息。
@@ -127,7 +149,6 @@ pub fn verify(calls: &[RebuildCall]) -> RebuildResult {
             return inconsistent(k, 7, detail);
         }
 
-        let req_has_tools = req.get("tools").is_some();
         let resp_tool_calls = resp_tool_calls(resp).expect("validated response");
         let tool_event_count = call.tool_results.len();
 
@@ -159,15 +180,225 @@ pub fn verify(calls: &[RebuildCall]) -> RebuildResult {
             if let Err(detail) = tools_are_prefix(&resp_tool_calls, &call.tool_results) {
                 return inconsistent(k, 4, detail);
             }
-            let next = calls[pos + 1].request.as_ref().expect("checked");
-            if let Err((rule, detail)) =
-                check_history_extension(req, next, resp, &call.tool_results, req_has_tools)
-            {
-                return inconsistent(k, rule, detail);
-            }
+        }
+
+        if let Err(result) = replay_matches(calls, pos, req) {
+            return result;
         }
     }
     RebuildResult::Consistent
+}
+
+/// 第 `pos` 次请求的消息必须等于 `replay` 再序列化的结果。
+///
+/// **作用**：替换原来的规则 1 和 3。规则 2 仍在消息不一致时单独返回。
+/// **参数**：`calls` 是整次 Run 的模型轮，按下标从旧到新。`pos` 是正在核对的下标，从 0 起。`req` 是该轮请求 JSON。
+/// **边界**：旧事件没有 context 字段时用恒等记录。先核对事件与记录的策略名，矛盾按规则 1 返回 inconsistent。
+/// 引用读不到、不支持的 schema 或策略、明确不可重放时为 unverifiable；已知策略的非法编辑或估算按规则 1 返回 inconsistent。
+/// 比较的是 JSON 值，键序和空白不算不一致。
+fn replay_matches(calls: &[RebuildCall], pos: usize, req: &Value) -> Result<(), RebuildResult> {
+    let call = &calls[pos];
+    let record = match &call.context {
+        RebuildContext::Identity => {
+            if call.event_context_strategy.is_some() {
+                return Err(inconsistent(
+                    call.index,
+                    1,
+                    "context strategy without context record",
+                ));
+            }
+            identity_record()
+        }
+        RebuildContext::Unreadable => {
+            return Err(RebuildResult::Unverifiable {
+                missing: format!("context_ref#{}", call.index),
+            });
+        }
+        RebuildContext::Parsed(record) => {
+            if call.event_context_strategy.as_deref() != Some(record.context_strategy.as_str()) {
+                return Err(inconsistent(
+                    call.index,
+                    1,
+                    "context strategy differs between event and record",
+                ));
+            }
+            record.clone()
+        }
+    };
+    let transcript = transcript_before(calls, pos)?;
+    let view = ContextManager::replay(&transcript, &record).map_err(|error| match error {
+        ReplayError::IdentityHasEdits => {
+            inconsistent(call.index, 1, "identity context record contains edits")
+        }
+        ReplayError::InvalidEstimate => {
+            inconsistent(call.index, 1, "invalid context estimate anchor")
+        }
+        ReplayError::UnsupportedSchema { .. }
+        | ReplayError::UnknownStrategy { .. }
+        | ReplayError::NotReplayable => RebuildResult::Unverifiable {
+            missing: format!("context_replay#{}", call.index),
+        },
+    })?;
+    let expected =
+        serde_json::to_value(crate::engine::messages_from_view(&view)).expect("messages serialize");
+    let actual = req.get("messages").cloned().unwrap_or(Value::Null);
+    if expected == actual {
+        return Ok(());
+    }
+    let (rule, detail) = classify_messages(&expected, &actual);
+    Err(inconsistent(call.index, rule, detail))
+}
+
+/// 用第一次请求的 system、user，以及更早轮次的响应和工具正文，拼出 `T_k`。
+///
+/// **作用**：`replay_matches` 的事实输入。不含正在核对的这一轮响应。
+/// **参数**：`calls` 是全部模型轮。`pos` 是正在核对的下标；只读取它之前的轮次。
+/// **边界**：工具正文不是 UTF-8 时，这一轮请求按规则 1 不一致。更早轮次的响应形状已由 `verify` 检查过。
+fn transcript_before(calls: &[RebuildCall], pos: usize) -> Result<Transcript, RebuildResult> {
+    let first = calls[0].request.as_ref().expect("checked");
+    let (system, user) = system_and_user(first).ok_or_else(|| {
+        inconsistent(
+            calls[0].index,
+            1,
+            "first request is missing system and user",
+        )
+    })?;
+    let mut rounds = Vec::new();
+    for prior in &calls[..pos] {
+        rounds.push(round_from_prior(prior, calls[pos].index)?);
+    }
+    Ok(Transcript {
+        system,
+        user,
+        rounds,
+    })
+}
+
+/// 把更早一轮的响应和工具结果收成一条 [`Round`]。
+///
+/// **作用**：供恒等 `replay` 生成下一轮应有的 assistant 和 tool 消息。
+/// **参数**：`prior` 是更早的模型轮。`reporting_index` 是正在核对的请求序号，工具正文无法解码时记在这一轮上。
+/// **边界**：用量不参与消息比较，这里填未知。`trailing_user` 为空串。
+fn round_from_prior(prior: &RebuildCall, reporting_index: u32) -> Result<Round, RebuildResult> {
+    let resp = prior.response.as_ref().expect("checked");
+    let calls = resp_tool_calls(resp).expect("validated response");
+    let mut tools = Vec::new();
+    for (j, tool) in prior.tool_results.iter().enumerate() {
+        let bytes = tool.result.as_ref().expect("checked");
+        let Ok(body) = String::from_utf8(bytes.clone()) else {
+            return Err(inconsistent(
+                reporting_index,
+                1,
+                "tool content bytes != result_ref blob",
+            ));
+        };
+        let call = calls.get(j);
+        tools.push(ToolResult {
+            call_id: tool.tool_call_id.clone().unwrap_or_default(),
+            name: call.map(|call| call.name.clone()).unwrap_or_default(),
+            arguments: call.map(|call| call.arguments.clone()).unwrap_or_default(),
+            result_ref: String::new(),
+            byte_count: body.len() as u64,
+            body,
+        });
+    }
+    Ok(Round {
+        assistant: AssistantTurn {
+            content: text_field(resp.get("content")),
+            reasoning: text_field(resp.get("reasoning_content")),
+            tool_calls: calls
+                .into_iter()
+                .map(|call| ContextToolCall {
+                    id: call.id,
+                    name: call.name,
+                    arguments: call.arguments,
+                })
+                .collect(),
+        },
+        tools,
+        usage: ModelUsage {
+            prompt_tokens: TokenCount::Unknown,
+            completion_tokens: TokenCount::Unknown,
+            prompt_cache_hit_tokens: TokenCount::Unknown,
+            prompt_cache_miss_tokens: TokenCount::Unknown,
+        },
+        trailing_user: String::new(),
+    })
+}
+
+/// 旧事件使用的恒等记录。
+///
+/// **作用**：没有 `context_ref` 时仍走 `replay`，使规则 1、3 的公式保持一条路径。
+/// **边界**：不代表当时真的写过记录。`hard_limit` 为 0 只是占位，重放不读它。
+fn identity_record() -> ContextRecord {
+    ContextRecord {
+        schema_version: 1,
+        profile_version: 1,
+        profile_hash: "0".repeat(64),
+        context_strategy: IDENTITY_STRATEGY.to_owned(),
+        spec: ContextSpec { hard_limit: 0 },
+        estimate: Estimate {
+            tokens: 0,
+            source: EstimateSource::Estimated,
+            anchor_round: None,
+        },
+        edits: Vec::new(),
+        replayable: true,
+    }
+}
+
+/// 从第一次请求取出 system 和首条 user。
+///
+/// **作用**：后续轮次的 `Transcript` 不再从各自请求里抄这两条。
+/// **参数**：`req` 是第一次模型请求。
+/// **边界**：角色不是 system、user，或缺少这两条时返回 `None`。
+fn system_and_user(req: &Value) -> Option<(String, String)> {
+    let messages = messages_array(req)?;
+    let system = messages.first()?;
+    let user = messages.get(1)?;
+    if system.get("role").and_then(Value::as_str) != Some("system")
+        || user.get("role").and_then(Value::as_str) != Some("user")
+    {
+        return None;
+    }
+    Some((
+        text_field(system.get("content")),
+        text_field(user.get("content")),
+    ))
+}
+
+/// 在两条消息列表的第一处差异上选择规则号。
+///
+/// **作用**：消息整体不一致时，工具调用的 id、名字或参数仍报规则 2，其余报规则 1。
+/// **参数**：`expected` 是 `messages_from_view` 的 JSON。`actual` 是请求里的 `messages`。
+/// **边界**：缺一边、条数不同、正文或 tool 消息不同都是规则 1。键序不参与判断。
+fn classify_messages(expected: &Value, actual: &Value) -> (u8, String) {
+    let (Some(expected), Some(actual)) = (expected.as_array(), actual.as_array()) else {
+        return (1, "request messages are not an array".into());
+    };
+    for index in 0..expected.len().max(actual.len()) {
+        let (Some(expected), Some(actual)) = (expected.get(index), actual.get(index)) else {
+            return (
+                1,
+                format!("message count {} != {}", actual.len(), expected.len()),
+            );
+        };
+        if expected.get("role") != actual.get("role") {
+            return (1, format!("message {index} role differs"));
+        }
+        if expected.get("role").and_then(Value::as_str) == Some("assistant")
+            && text_field(expected.get("content")) == text_field(actual.get("content"))
+            && text_field(expected.get("reasoning_content"))
+                == text_field(actual.get("reasoning_content"))
+            && expected.get("tool_calls") != actual.get("tool_calls")
+        {
+            return (2, format!("message {index} assistant.tool_calls differ"));
+        }
+        if expected != actual {
+            return (1, format!("message {index} differs"));
+        }
+    }
+    (1, "messages differ".into())
 }
 
 /// 把三态收成 CLI 一行文本。
@@ -212,127 +443,6 @@ fn first_system_message(req: &Value) -> Option<&Value> {
         .and_then(Value::as_array)
         .and_then(|messages| messages.first())
         .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
-}
-
-/// 核对下一轮请求是否只在上一轮消息之后追加了 assistant 和 tool。
-///
-/// **作用**：非尾轮由 [`verify`] 调用。`Err` 的第一个分量是规则号。
-/// **参数**：`prev` / `next` 是相邻请求；`resp` 是上一轮响应；工具正文已经读到，顺序已经核对。
-/// **边界**：`messages` 缺失按规则 5 返回。历史前缀被改、后缀条数不对、assistant 的 `content` / `reasoning_content` 不符按规则 1；`tool_calls` 的 id、name、arguments 或顺序不符按规则 2；tool 的 id 或正文字节不符按规则 3。没有下一轮时不要调用。
-fn check_history_extension(
-    prev: &Value,
-    next: &Value,
-    resp: &Value,
-    tool_results: &[RebuildTool],
-    req_has_tools: bool,
-) -> Result<(), (u8, String)> {
-    let prev_messages = messages_array(prev).ok_or((5, "prev messages missing".into()))?;
-    let next_messages = messages_array(next).ok_or((5, "next messages missing".into()))?;
-    if next_messages.len() < prev_messages.len() {
-        return Err((1, "next messages shorter than prev".into()));
-    }
-    if next_messages[..prev_messages.len()] != *prev_messages {
-        return Err((1, "next messages do not start with prev messages".into()));
-    }
-    let suffix = &next_messages[prev_messages.len()..];
-    let expected_tools = tool_results.len();
-    if suffix.len() != 1 + expected_tools {
-        return Err((
-            1,
-            format!(
-                "suffix len {} != 1+{} tool messages",
-                suffix.len(),
-                expected_tools
-            ),
-        ));
-    }
-    let assistant = &suffix[0];
-    check_assistant(assistant, resp, req_has_tools)?;
-    let resp_calls = resp_tool_calls(resp).expect("validated response");
-    for (j, tool_msg) in suffix[1..].iter().enumerate() {
-        check_tool_message(
-            tool_msg,
-            &resp_calls,
-            j,
-            tool_results[j].result.as_ref().unwrap(),
-        )?;
-    }
-    Ok(())
-}
-
-/// 核对追加的 assistant 消息是否等于该轮响应。
-///
-/// **作用**：规则 1 比较 `content` 与 `reasoning_content`；规则 2 比较 `tool_calls`。
-/// **参数**：`assistant` 是下一轮请求里新追加的第一条；`resp` 是上一轮响应；`req_has_tools` 为真时要求 `reasoning_content` 键存在，空串合法。
-/// **边界**：`content` 缺省或 `null` 当成空串。响应里 `reasoning_content` 为 `null`、请求里是 `""` 视为相同。不带 `tools` 的请求不要求 `reasoning_content` 键。
-fn check_assistant(
-    assistant: &Value,
-    resp: &Value,
-    req_has_tools: bool,
-) -> Result<(), (u8, String)> {
-    if assistant.get("role").and_then(Value::as_str) != Some("assistant") {
-        return Err((1, "expected assistant role".into()));
-    }
-    let content = text_field(assistant.get("content"));
-    let resp_content = text_field(resp.get("content"));
-    if content != resp_content {
-        return Err((1, "assistant content != response content".into()));
-    }
-    if req_has_tools {
-        match assistant.get("reasoning_content") {
-            Some(Value::String(text)) => {
-                let resp_reasoning = text_field(resp.get("reasoning_content"));
-                if text != &resp_reasoning {
-                    // Host 在 Absent 时补 `""`；响应 blob 可能是 null。
-                    if !(text.is_empty() && resp.get("reasoning_content") == Some(&Value::Null)) {
-                        return Err((1, "assistant reasoning_content != response".into()));
-                    }
-                }
-            }
-            _ => return Err((1, "assistant missing reasoning_content key".into())),
-        }
-    }
-    let assistant_calls =
-        assistant_tool_calls(assistant).ok_or((2, "invalid assistant.tool_calls".into()))?;
-    let resp_calls = resp_tool_calls(resp).expect("validated response");
-    if assistant_calls != resp_calls {
-        return Err((2, "assistant.tool_calls != response.tool_calls".into()));
-    }
-    Ok(())
-}
-
-/// 核对一条 tool 消息的 `tool_call_id` 与正文。
-///
-/// **作用**：规则 3。由 [`check_history_extension`] 按该轮工具顺序调用。
-/// **参数**：`j` 是该轮内从 0 起的序号；`bytes` 是对应 `result_ref` blob 的原始字节；`resp_calls` 是响应里已摊平的 `tool_calls`。
-/// **边界**：`content` 按 UTF-8 字符串的字节与 blob 比较。id 不符、字节不符、或响应里没有第 `j` 个 tool_call，都返回规则 3。
-fn check_tool_message(
-    tool_msg: &Value,
-    resp_calls: &[FlatToolCall],
-    j: usize,
-    bytes: &[u8],
-) -> Result<(), (u8, String)> {
-    if tool_msg.get("role").and_then(Value::as_str) != Some("tool") {
-        return Err((3, "expected tool role".into()));
-    }
-    let Some(expected) = resp_calls.get(j) else {
-        return Err((3, format!("no response tool_call at index {j}")));
-    };
-    let id = tool_msg
-        .get("tool_call_id")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if id != expected.id {
-        return Err((3, format!("tool_call_id {id} != {}", expected.id)));
-    }
-    let content = tool_msg
-        .get("content")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if content.as_bytes() != bytes {
-        return Err((3, "tool content bytes != result_ref blob".into()));
-    }
-    Ok(())
 }
 
 /// 工具事件的调用 ID 与工具名必须逐项等于响应的前缀。
@@ -402,11 +512,27 @@ fn resp_tool_calls(resp: &Value) -> Option<Vec<FlatToolCall>> {
     }
 }
 
+/// 解析一个响应侧工具调用；任一必需字段非法时失败，不过滤条目。
+fn flat_tool_call(item: &Value) -> Option<FlatToolCall> {
+    let arguments = item.get("arguments")?.as_str()?;
+    serde_json::from_str::<Value>(arguments).ok()?;
+    Some(FlatToolCall {
+        id: nonempty_string(item.get("id"))?.to_owned(),
+        name: nonempty_string(item.get("name"))?.to_owned(),
+        arguments: arguments.to_owned(),
+    })
+}
+
+/// 读取非空字符串。只用于结构校验，不输出字段内容。
+fn nonempty_string(value: Option<&Value>) -> Option<&str> {
+    value?.as_str().filter(|text| !text.is_empty())
+}
+
 /// 从请求里的 assistant 消息读取 `tool_calls`。
 ///
-/// **作用**：规则 2，与 [`resp_tool_calls`] 的结果按顺序比较。
+/// **作用**：结构校验接受 function 嵌套形状。
 /// **参数**：`assistant` 是一条 `role=assistant` 的消息。
-/// **边界**：只接受请求的 function 嵌套形状，不能用平铺字段掩盖损坏的嵌套字段。
+/// **边界**：只接受请求的 function 嵌套形状。缺 `tool_calls` 视为空列表。
 fn assistant_tool_calls(assistant: &Value) -> Option<Vec<FlatToolCall>> {
     match assistant.get("tool_calls") {
         None => Some(Vec::new()),
@@ -428,22 +554,6 @@ fn assistant_tool_calls(assistant: &Value) -> Option<Vec<FlatToolCall>> {
             })
             .collect(),
     }
-}
-
-/// 解析一个响应侧工具调用；任一必需字段非法时失败，不过滤条目。
-fn flat_tool_call(item: &Value) -> Option<FlatToolCall> {
-    let arguments = item.get("arguments")?.as_str()?;
-    serde_json::from_str::<Value>(arguments).ok()?;
-    Some(FlatToolCall {
-        id: nonempty_string(item.get("id"))?.to_owned(),
-        name: nonempty_string(item.get("name"))?.to_owned(),
-        arguments: arguments.to_owned(),
-    })
-}
-
-/// 读取非空字符串。只用于结构校验，不输出字段内容。
-fn nonempty_string(value: Option<&Value>) -> Option<&str> {
-    value?.as_str().filter(|text| !text.is_empty())
 }
 
 /// 校验完整请求的基本结构；跨轮相等和 reasoning 必需键仍由规则 1–5 判断。
@@ -687,6 +797,8 @@ mod tests {
             tool_results,
             event_finish_reason: finish.to_owned(),
             event_usage: usage_known(),
+            event_context_strategy: None,
+            context: RebuildContext::Identity,
         }
     }
 
@@ -710,9 +822,9 @@ mod tests {
         assert_eq!(result, RebuildResult::Consistent);
     }
 
-    /// 下一轮丢掉 tool 消息时，第一轮按规则 1 失败。
+    /// 下一轮丢掉 tool 消息时，被核对的是第二轮请求，规则 1。
     ///
-    /// **边界**：后缀长度不是 `1 + 工具数`，不误报成规则 3。
+    /// **边界**：条数不对，不误报成规则 2。
     #[test]
     fn drop_tool_message_is_rule_1() {
         let tool_body = b"files";
@@ -728,14 +840,14 @@ mod tests {
             call(2, req2, resp2, vec![], "stop"),
         ]) {
             RebuildResult::Inconsistent { call, rule, .. } => {
-                assert_eq!(call, 1);
+                assert_eq!(call, 2);
                 assert_eq!(rule, 1);
             }
             other => panic!("{other:?}"),
         }
     }
 
-    /// 两条 tool 消息对调 id 时按规则 3 失败。
+    /// 两条 tool 消息对调 id 时按规则 1 失败。
     ///
     /// **边界**：条数仍正确，所以不能落成规则 1 的后缀长度错误。
     #[test]
@@ -768,12 +880,12 @@ mod tests {
             call(1, req1, resp1, vec![b"A", b"B"], "tool_calls"),
             call(2, req2, resp2, vec![], "stop"),
         ]) {
-            RebuildResult::Inconsistent { rule, .. } => assert_eq!(rule, 3),
+            RebuildResult::Inconsistent { rule, .. } => assert_eq!(rule, 1),
             other => panic!("{other:?}"),
         }
     }
 
-    /// tool 正文与 `result_ref` 差一个字节时按规则 3 失败。
+    /// tool 正文与 `result_ref` 差一个字节时按规则 1 失败。
     #[test]
     fn change_tool_byte_is_rule_3() {
         let req1 = base_req(system_user());
@@ -787,12 +899,12 @@ mod tests {
             call(1, req1, resp1, vec![b"files"], "tool_calls"),
             call(2, req2, resp2, vec![], "stop"),
         ]) {
-            RebuildResult::Inconsistent { rule, .. } => assert_eq!(rule, 3),
+            RebuildResult::Inconsistent { rule, .. } => assert_eq!(rule, 1),
             other => panic!("{other:?}"),
         }
     }
 
-    /// `tool_call_id` 与响应 tool_call 不一致时按规则 3 失败。
+    /// `tool_call_id` 与响应 tool_call 不一致时按规则 1 失败。
     #[test]
     fn wrong_tool_call_id_is_rule_3() {
         let req1 = base_req(system_user());
@@ -806,7 +918,120 @@ mod tests {
             call(1, req1, resp1, vec![b"files"], "tool_calls"),
             call(2, req2, resp2, vec![], "stop"),
         ]) {
-            RebuildResult::Inconsistent { rule, .. } => assert_eq!(rule, 3),
+            RebuildResult::Inconsistent { rule, .. } => assert_eq!(rule, 1),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 有引用但记录读不到时不猜成一致。
+    #[test]
+    fn missing_context_record_is_unverifiable() {
+        let mut first = call(
+            1,
+            base_req(system_user()),
+            resp_stop("done", "r"),
+            vec![],
+            "stop",
+        );
+        first.context = RebuildContext::Unreadable;
+        first.event_context_strategy = Some(IDENTITY_STRATEGY.to_owned());
+        match verify(&[first]) {
+            RebuildResult::Unverifiable { missing } => {
+                assert_eq!(missing, "context_ref#1");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 事件与记录双向一致才能重放；策略未知也不能掩盖两份元数据已经矛盾。
+    #[test]
+    fn context_strategy_metadata_must_match_before_replay() {
+        for (event_strategy, record_strategy, consistent) in [
+            (Some(IDENTITY_STRATEGY), IDENTITY_STRATEGY, true),
+            (Some("mask@999"), IDENTITY_STRATEGY, false),
+            (Some(IDENTITY_STRATEGY), "mask@999", false),
+            (None, IDENTITY_STRATEGY, false),
+        ] {
+            let mut first = call(
+                1,
+                base_req(system_user()),
+                resp_stop("done", "r"),
+                vec![],
+                "stop",
+            );
+            let mut record = identity_record();
+            record.context_strategy = record_strategy.to_owned();
+            first.event_context_strategy = event_strategy.map(str::to_owned);
+            first.context = RebuildContext::Parsed(record);
+            assert_eq!(
+                verify(&[first]),
+                if consistent {
+                    RebuildResult::Consistent
+                } else {
+                    inconsistent(1, 1, "context strategy differs between event and record")
+                }
+            );
+        }
+        let mut legacy = call(
+            1,
+            base_req(system_user()),
+            resp_stop("done", "r"),
+            vec![],
+            "stop",
+        );
+        legacy.event_context_strategy = Some(IDENTITY_STRATEGY.to_owned());
+        assert_eq!(
+            verify(&[legacy]),
+            inconsistent(1, 1, "context strategy without context record")
+        );
+    }
+
+    /// 当前代码没有的策略不能重放。
+    #[test]
+    fn unknown_context_strategy_is_unverifiable() {
+        let mut record = identity_record();
+        record.context_strategy = "mask@1".to_owned();
+        let mut first = call(
+            1,
+            base_req(system_user()),
+            resp_stop("done", "r"),
+            vec![],
+            "stop",
+        );
+        first.event_context_strategy = Some(record.context_strategy.clone());
+        first.context = RebuildContext::Parsed(record);
+        match verify(&[first]) {
+            RebuildResult::Unverifiable { missing } => {
+                assert_eq!(missing, "context_replay#1");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// assistant 的 tool_calls 与响应不一致时仍是规则 2。
+    #[test]
+    fn changed_tool_arguments_are_rule_2() {
+        let req1 = base_req(system_user());
+        let resp1 = resp_with_tools("c1", "", "r1");
+        let mut msgs2 = system_user();
+        msgs2.push(json!({
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "r1",
+            "tool_calls": [{
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "list_files", "arguments": "{\"path\":\"x\"}"}
+            }]
+        }));
+        msgs2.push(tool_msg("c1", "files"));
+        let req2 = base_req(msgs2);
+        let resp2 = resp_stop("done", "r2");
+        match verify(&[
+            call(1, req1, resp1, vec![b"files"], "tool_calls"),
+            call(2, req2, resp2, vec![], "stop"),
+        ]) {
+            RebuildResult::Inconsistent { rule, .. } => assert_eq!(rule, 2),
             other => panic!("{other:?}"),
         }
     }
@@ -884,6 +1109,8 @@ mod tests {
             tool_results: vec![],
             event_finish_reason: "stop".to_owned(),
             event_usage: usage_known(),
+            event_context_strategy: None,
+            context: RebuildContext::Identity,
         }]);
         assert_eq!(
             result,

@@ -28,8 +28,46 @@ pub struct RunTrace {
     pub budget: Budget,
     /// 轮次列表。`index == 0` 仅含首个模型调用之前的工具；模型轮从 1 起。
     pub rounds: Vec<TraceRound>,
+    /// 发送前耗尽的诊断。没有这条事件时为 `None`。多次出现时保留最后一条。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_exhausted: Option<TraceContextExhausted>,
     pub artifacts: Vec<TraceArtifact>,
     pub totals: TraceTotals,
+}
+
+/// 一次 `context.exhausted` 诊断。
+///
+/// **作用**：没有模型轮时，`trace` 仍能显示这次准备的策略和估算。
+/// **边界**：不是模型调用，不计入 `model_calls`。估算由 CLI 填入；Host 只抄引用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceContextExhausted {
+    /// 事件序号，从 1 起。
+    pub seq: u64,
+    /// 记录 blob 引用。非空。`Debug` 会打印。
+    pub context_ref: String,
+    /// 事件里的策略标识，例如 `identity@1`。
+    pub context_strategy: String,
+    /// 记录里的估算和硬上限。`None` 表示 CLI 还没读记录。`Unavailable` 表示引用在但记录读不到。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_estimate: Option<TraceContextEstimate>,
+}
+
+/// 展示用的估算。
+///
+/// **作用**：区分读到的数字和读不到记录。
+/// **边界**：没有 `context_ref` 时不要用本类型，外层保持 `None`。未知不是 0。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TraceContextEstimate {
+    /// 记录已解析。
+    Known {
+        /// 估算 token。0 表示没有可计数内容，不是未知。
+        tokens: u64,
+        /// 硬上限 token。0 表示输出预留占满了窗口。
+        hard_limit: u64,
+    },
+    /// 引用在，记录读不到或不是合法 JSON。
+    Unavailable,
 }
 
 /// 一个分组轮次。
@@ -52,6 +90,15 @@ pub struct TraceModelCall {
     pub usage: ModelUsage,
     pub request_ref: String,
     pub response_ref: String,
+    /// 该轮 context 记录引用。旧事件没有时为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_ref: Option<String>,
+    /// 事件里的策略标识。与 `context_ref` 一起缺席或一起出现。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_strategy: Option<String>,
+    /// CLI 读记录后填入。Host 组装 trace 时保持 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_estimate: Option<TraceContextEstimate>,
 }
 
 /// 一轮内的一次工具调用。
@@ -107,6 +154,7 @@ pub fn build_trace(
     let mut rounds: Vec<TraceRound> = Vec::new();
     let mut pending_tools: Vec<TraceToolCall> = Vec::new();
     let mut artifacts: Vec<TraceArtifact> = Vec::new();
+    let mut context_exhausted: Option<TraceContextExhausted> = None;
     let mut started_at: Option<&Timestamp> = None;
     let mut ended_at: Option<&Timestamp> = None;
 
@@ -132,6 +180,9 @@ pub fn build_trace(
                         usage: payload.usage.clone(),
                         request_ref: payload.request_ref.clone(),
                         response_ref: payload.response_ref.clone(),
+                        context_ref: payload.context_ref.clone(),
+                        context_strategy: payload.context_strategy.clone(),
+                        context_estimate: None,
                     }),
                     tools: Vec::new(),
                 });
@@ -146,6 +197,14 @@ pub fn build_trace(
                     byte_count: payload.byte_count,
                     truncated: payload.truncated,
                     duration_ms: payload.duration_ms,
+                });
+            }
+            EventBody::ContextExhausted(payload) => {
+                context_exhausted = Some(TraceContextExhausted {
+                    seq: event.sequence,
+                    context_ref: payload.context_ref.clone(),
+                    context_strategy: payload.context_strategy.clone(),
+                    context_estimate: None,
                 });
             }
             EventBody::ArtifactCreated(payload) => {
@@ -201,9 +260,37 @@ pub fn build_trace(
         attempt_outcome: attempt.outcome,
         budget: snapshot.budget.clone(),
         rounds,
+        context_exhausted,
         artifacts,
         totals,
     }
+}
+
+/// 有 context 引用时拼出策略、估算和硬上限。
+///
+/// **作用**：模型轮和 `context.exhausted` 共用同一段文本。
+/// **参数**：`context_ref` 是记录引用，`None` 表示旧事件没有这个字段。`context_strategy` 是事件里的策略名，可以单独缺席。`estimate` 是 CLI 填入的结果；有引用但仍为 `None` 时按读不到处理。
+/// **边界**：三者都空时返回 `None`。读不到记录时写 `unavailable`，不写 0。
+fn context_suffix(
+    context_ref: Option<&str>,
+    context_strategy: Option<&str>,
+    estimate: Option<&TraceContextEstimate>,
+) -> Option<String> {
+    if context_ref.is_none() && context_strategy.is_none() && estimate.is_none() {
+        return None;
+    }
+    let strategy = context_strategy.unwrap_or("unavailable");
+    let (tokens, limit) = match estimate {
+        Some(TraceContextEstimate::Known { tokens, hard_limit }) => {
+            (tokens.to_string(), hard_limit.to_string())
+        }
+        Some(TraceContextEstimate::Unavailable) | None => {
+            ("unavailable".to_owned(), "unavailable".to_owned())
+        }
+    };
+    Some(format!(
+        "context_strategy={strategy} estimate={tokens} hard_limit={limit}"
+    ))
 }
 
 /// 把 [`RunTrace`] 收成 §4.11 默认人类可读文本。
@@ -246,6 +333,16 @@ pub fn format_trace(trace: &RunTrace) -> String {
                 format_tokens(model.usage.prompt_cache_miss_tokens),
                 format_tokens(model.usage.completion_tokens),
             ));
+            if let Some(suffix) = context_suffix(
+                model.context_ref.as_deref(),
+                model.context_strategy.as_deref(),
+                model.context_estimate.as_ref(),
+            ) {
+                out.pop();
+                out.push(' ');
+                out.push_str(&suffix);
+                out.push('\n');
+            }
         } else {
             out.push_str(&format!(
                 "#{} (tools before first model call)\n",
@@ -261,6 +358,18 @@ pub fn format_trace(trace: &RunTrace) -> String {
                 tool.byte_count,
                 tool.truncated,
                 tool.duration_ms
+            ));
+        }
+    }
+    if let Some(exhausted) = &trace.context_exhausted {
+        if let Some(suffix) = context_suffix(
+            Some(&exhausted.context_ref),
+            Some(&exhausted.context_strategy),
+            exhausted.context_estimate.as_ref(),
+        ) {
+            out.push_str(&format!(
+                "context.exhausted seq={} {suffix}\n",
+                exhausted.seq
             ));
         }
     }
@@ -684,6 +793,55 @@ mod tests {
         assert_eq!(trace.artifacts[0].bytes, None);
         assert_eq!(trace.artifacts[1].bytes, Some(42));
         assert!(format_trace(&trace).contains("bytes=unavailable"));
+    }
+
+    /// 有记录的模型轮和单独的耗尽诊断都打出策略、估算和硬上限。
+    #[test]
+    fn trace_shows_context_estimate_and_exhausted_diagnostic() {
+        let (snapshot, attempt) = snapshot_and_attempt();
+        let events = vec![
+            event(
+                1,
+                "2026-10-26T00:00:00Z",
+                EventBody::ModelCallCompleted(ModelCallCompletedPayload {
+                    model_alias: "m".to_owned(),
+                    usage: usage(
+                        TokenCount::Known(1),
+                        TokenCount::Known(0),
+                        TokenCount::Known(1),
+                        TokenCount::Known(1),
+                    ),
+                    finish_reason: "stop".to_owned(),
+                    latency_ms: 2,
+                    request_ref: "sha256:a".to_owned(),
+                    response_ref: "sha256:b".to_owned(),
+                    context_ref: Some("sha256:c".to_owned()),
+                    context_strategy: Some("identity@1".to_owned()),
+                }),
+            ),
+            event(
+                2,
+                "2026-10-26T00:00:01Z",
+                EventBody::ContextExhausted(fluxaxiom_contract::ContextExhaustedPayload {
+                    context_ref: "sha256:d".to_owned(),
+                    context_strategy: "identity@1".to_owned(),
+                }),
+            ),
+        ];
+        let mut trace = build_trace(&snapshot, &attempt, &events, &HashMap::new());
+        trace.rounds[0].model.as_mut().unwrap().context_estimate =
+            Some(TraceContextEstimate::Known {
+                tokens: 12,
+                hard_limit: 711_065,
+            });
+        trace.context_exhausted.as_mut().unwrap().context_estimate =
+            Some(TraceContextEstimate::Unavailable);
+        let text = format_trace(&trace);
+        assert!(text.contains("context_strategy=identity@1 estimate=12 hard_limit=711065"));
+        assert!(text.contains(
+            "context.exhausted seq=2 context_strategy=identity@1 estimate=unavailable hard_limit=unavailable"
+        ));
+        assert_eq!(trace.totals.model_calls, 1);
     }
 
     /// 显示时去掉 `\\?\` 前缀；UNC 形式与普通路径不动。

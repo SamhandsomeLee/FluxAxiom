@@ -47,7 +47,7 @@ EA-02 要求裁剪历史与工具返回，但 ADR-020 第 6 条规定“历史�
 
    `T_k` 是由第 1 至 k−1 轮事实构造的 `Transcript`，`R_k` 是第 k 次调用的 context 记录。本条修订 ADR-020 第 6 条的“历史只追加”。恒等策略下 `replay(T) = T`，上式与原规则 1 等价。
 
-5. **校验器不理解编辑。** `engine-custom::rebuild` 由 blob 构造 `Transcript`，调用 `replay`，与请求逐字节比较。执行方案 §4.12.1 的规则 1、3 并入此式，规则 2、4、5、6、7 不变。记录中的策略标识在当前代码中不存在，或记录标记 `replayable = false` 时，结论为 `unverifiable`，不猜。
+5. **校验器不理解编辑。** `engine-custom::rebuild` 由 blob 构造 `Transcript`，调用 `replay`，与请求逐字节比较。执行方案 §4.12.1 的规则 1、3 并入此式，规则 2、4、5、6、7 不变。记录中的策略标识在当前代码中不存在，或记录标记 `replayable = false` 时，结论为 `unverifiable`，不猜。2026-11-02 P1-4 审查修订：先比较事件与记录的 `context_strategy`，不一致按规则 1 报 `inconsistent`，不因策略名未知而忽略已经确定的矛盾。`replay` 返回已知策略的非法编辑（`IdentityHasEdits`）或非法估算锚点（`InvalidEstimate`）时同样按规则 1 报 `inconsistent`；不支持的 schema、未知策略和明确不可重放仍为 `unverifiable`。旧事件没有 context 字段时继续按恒等策略校验。
 
 6. **context 记录是独立 blob。** 结构归上下文模块所有，带自己的 `schema_version`，不进入 `agent-contract`。内容只有引用与数值：`profile_version`、`profile_hash`、策略链标识、`spec`、`estimate`（数值、来源 `usage` / `estimated`、锚点轮次）、`edits[]`（各策略自定义）、`replayable`。不含 prompt、工具正文或 `reasoning_content`。
 

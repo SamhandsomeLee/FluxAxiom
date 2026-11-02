@@ -477,6 +477,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "dotenvy",
+ "fluxaxiom-context",
  "fluxaxiom-contract",
  "fluxaxiom-engine-api",
  "fluxaxiom-engine-custom",

@@ -176,6 +176,123 @@ fn model_blob(data: &Path, key: &str) -> PathBuf {
         .join(hex)
 }
 
+/// 比较 trace 校验和样本导出的完整三态结果，同时核对 trace 的退出码。
+///
+/// **作用**：context 篡改回归经过 CLI、Host 与校验器，防止只修一条读取路径。
+/// **参数**：`data` 是独立测试数据目录；`run_id` 是已终态的 Run；`expected` 是期望的完整 rebuild JSON。
+/// **边界**：只有 consistent 的 trace 应零退出；sample export 对三态都正常导出。
+fn assert_rebuild_result(data: &Path, run_id: &str, expected: Value) {
+    let output = flux()
+        .args(["trace", run_id, "--json", "--verify", "--data-dir"])
+        .arg(data)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.success(), expected["status"] == "consistent");
+    let trace: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(trace["rebuild"], expected);
+    assert_eq!(exported(data, run_id)["rebuild"], expected);
+}
+
+/// 在独立测试库中保存修改后的 context 记录，并把事件引用指向新的内容哈希。
+///
+/// **作用**：构造可读取但语义矛盾的记录，排除原 blob 内容与哈希不符的干扰。
+/// **参数**：`data` 是夹具目录；`edit` 只修改首轮记录的 JSON，事件上的策略名保持原值。
+/// **边界**：不改原 blob，不接触开发数据；坏记录仅供本测试的校验路径读取。
+fn replace_context_record(data: &Path, edit: impl FnOnce(&mut Value)) {
+    let mut record: Value =
+        serde_json::from_slice(&fs::read(model_blob(data, "context_ref")).unwrap()).unwrap();
+    edit(&mut record);
+    let host = fluxaxiom_run_host::RunHost::open(data).unwrap();
+    let reference = host
+        .put_blob(&serde_json::to_vec(&record).unwrap(), "application/json")
+        .unwrap();
+    edit_event(data, "model.call_completed", |payload| {
+        payload["context_ref"] = json!(reference.as_str());
+    });
+}
+
+/// 事件宣称未知策略而记录仍是 identity 时，trace 与 sample 都必须报记录矛盾。
+#[test]
+fn context_strategy_mismatch_is_inconsistent() {
+    let (data, _workspace, run_id) = fixture(&["--max-model-calls", "1"]);
+    assert_rebuild_result(data.path(), &run_id, json!({"status": "consistent"}));
+    edit_event(data.path(), "model.call_completed", |payload| {
+        payload["context_strategy"] = json!("mask@999");
+    });
+    assert_rebuild_result(
+        data.path(),
+        &run_id,
+        json!({
+            "status": "inconsistent", "call": 1, "rule": 1,
+            "detail": "context strategy differs between event and record"
+        }),
+    );
+}
+
+/// 可解析的 identity 非法编辑和越界用量轮次是明确矛盾，不是缺少校验能力。
+#[test]
+fn invalid_known_context_records_are_inconsistent() {
+    for invalid_edits in [true, false] {
+        let (data, _workspace, run_id) = fixture(&["--max-model-calls", "1"]);
+        replace_context_record(data.path(), |record| {
+            if invalid_edits {
+                record["edits"] = json!([{"op": "unexpected-edit"}]);
+            } else {
+                record["estimate"]["source"] = json!("usage");
+                record["estimate"]["anchor_round"] = json!(1);
+            }
+        });
+        assert_rebuild_result(
+            data.path(),
+            &run_id,
+            json!({
+                "status": "inconsistent", "call": 1, "rule": 1,
+                "detail": if invalid_edits { "identity context record contains edits" } else { "invalid context estimate anchor" }
+            }),
+        );
+    }
+}
+
+/// 未知策略、未知 schema 与明确不可重放仍为 unverifiable；旧事件仍按恒等策略校验。
+#[test]
+fn unsupported_and_legacy_context_records_keep_their_classification() {
+    for kind in [
+        "unknown_strategy",
+        "unsupported_schema",
+        "not_replayable",
+        "legacy",
+    ] {
+        let (data, _workspace, run_id) = fixture(&["--max-model-calls", "1"]);
+        if kind == "legacy" {
+            edit_event(data.path(), "model.call_completed", |payload| {
+                let payload = payload.as_object_mut().unwrap();
+                payload.remove("context_ref");
+                payload.remove("context_strategy");
+            });
+            assert_rebuild_result(data.path(), &run_id, json!({"status": "consistent"}));
+        } else {
+            replace_context_record(data.path(), |record| match kind {
+                "unknown_strategy" => record["context_strategy"] = json!("mask@999"),
+                "unsupported_schema" => record["schema_version"] = json!(2),
+                "not_replayable" => record["replayable"] = json!(false),
+                _ => unreachable!(),
+            });
+            if kind == "unknown_strategy" {
+                edit_event(data.path(), "model.call_completed", |payload| {
+                    payload["context_strategy"] = json!("mask@999");
+                });
+            }
+            assert_rebuild_result(
+                data.path(),
+                &run_id,
+                json!({
+                    "status": "unverifiable", "missing": "context_replay#1"
+                }),
+            );
+        }
+    }
+}
+
 /// 尾轮错误 ID、错误工具名不能通过；旧事件没有 ID 时明确不可验证。
 #[test]
 fn tail_tool_identity_and_legacy_events_are_checked() {

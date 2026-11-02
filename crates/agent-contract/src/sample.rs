@@ -81,6 +81,12 @@ pub struct SampleCall {
     pub usage: ModelUsage,
     pub request_ref: String,
     pub response_ref: String,
+    /// 该轮 context 记录引用。旧样本没有时省略，不写成 null。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_ref: Option<String>,
+    /// 该轮策略标识。与 `context_ref` 一起缺席或一起出现。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_strategy: Option<String>,
     pub tools: Vec<SampleToolCall>,
 }
 

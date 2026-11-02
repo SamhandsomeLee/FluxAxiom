@@ -224,6 +224,23 @@ fn context_exhausted_is_a_terminal_reason() {
     assert_eq!(serde_json::to_value(&parsed).unwrap(), event);
 }
 
+/// 新样本可以带 context 引用；空串仍然非法。旧样本省略这两个键。
+#[test]
+fn sample_call_keeps_optional_context_fields() {
+    let mut sample = read_json("contracts/examples/sample.json");
+    assert_valid("contracts/schemas/sample.schema.json", &sample);
+    sample["calls"][0]["context_ref"] = Value::String("sha256:abc".to_owned());
+    sample["calls"][0]["context_strategy"] = Value::String("identity@1".to_owned());
+    assert_valid("contracts/schemas/sample.schema.json", &sample);
+    let parsed: Sample = serde_json::from_value(sample.clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&parsed).unwrap()["calls"][0]["context_strategy"],
+        "identity@1"
+    );
+    sample["calls"][0]["context_ref"] = Value::String(String::new());
+    assert_invalid("contracts/schemas/sample.schema.json", &sample);
+}
+
 #[test]
 fn running_run_cannot_carry_a_terminal_reason() {
     let mut run = read_json("contracts/examples/run.json");

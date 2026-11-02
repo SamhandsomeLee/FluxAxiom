@@ -130,6 +130,8 @@
           "usage": { "$ref": "#/$defs/usage" },
           "request_ref": { "type": "string", "minLength": 1 },
           "response_ref": { "type": "string", "minLength": 1 },
+          "context_ref": { "type": "string", "minLength": 1 },
+          "context_strategy": { "type": "string", "minLength": 1 },
           "tools": {
             "type": "array",
             "items": {

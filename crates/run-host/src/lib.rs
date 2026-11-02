@@ -18,5 +18,6 @@ mod workspace_revision;
 pub use error::HostError;
 pub use host::{CreateRun, CreatedRun, RunHost};
 pub use trace::{
-    format_trace, RunTrace, TraceArtifact, TraceModelCall, TraceRound, TraceToolCall, TraceTotals,
+    format_trace, RunTrace, TraceArtifact, TraceContextEstimate, TraceContextExhausted,
+    TraceModelCall, TraceRound, TraceToolCall, TraceTotals,
 };

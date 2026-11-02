@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use fluxaxiom_context::ContextRecord;
 use fluxaxiom_contract::{
     ArtifactId, Budget, Event, EventBody, FeedbackVerdict, ModelUsage, RebuildResult, RunId,
     RunStatus, Sample, SampleArtifact, SampleCall, SampleModel, SampleRun, SampleToolCall,
@@ -19,10 +20,12 @@ use fluxaxiom_contract::{
 use fluxaxiom_engine_api::{EngineAdapter, EngineDescriptor};
 use fluxaxiom_engine_custom::{
     format_rebuild_line, lookup_doc_version, verify_rebuild, DeepSeekClient, EngineA, FakeChat,
-    FakeStep, FinishReason, RebuildCall, RebuildTool, RecordingBackoff, ScriptedTurn, SleepBackoff,
-    ToolCall, API_KEY_ENV,
+    FakeStep, FinishReason, RebuildCall, RebuildContext, RebuildTool, RecordingBackoff,
+    ScriptedTurn, SleepBackoff, ToolCall, API_KEY_ENV,
 };
-use fluxaxiom_run_host::{format_trace, CreateRun, HostError, RunHost, RunTrace};
+use fluxaxiom_run_host::{
+    format_trace, CreateRun, HostError, RunHost, RunTrace, TraceContextEstimate,
+};
 use serde_json::Value;
 
 /// FluxAxiom 只读仓库分析 CLI（P0a / A4a）。
@@ -530,7 +533,8 @@ fn cmd_trace(
 ) -> Result<(), String> {
     let host = open_host(data_dir)?;
     let id = parse_run_id(&run_id)?;
-    let trace = host.trace(&id).map_err(host_err)?;
+    let mut trace = host.trace(&id).map_err(host_err)?;
+    fill_context_estimates(&host, &mut trace);
     let rebuild = if verify {
         Some(rebuild_from_trace(&host, &trace))
     } else {
@@ -847,6 +851,8 @@ fn rebuild_from_trace(host: &RunHost, trace: &RunTrace) -> RebuildResult {
             tool_results,
             event_finish_reason: model.finish_reason.clone(),
             event_usage: model.usage.clone(),
+            event_context_strategy: model.context_strategy.clone(),
+            context: context_for_rebuild(host, model.context_ref.as_deref()),
         });
     }
     verify_rebuild(&calls)
@@ -862,6 +868,58 @@ fn read_json_blob(host: &RunHost, storage_ref: &str) -> Option<Value> {
 fn read_bytes_blob(host: &RunHost, storage_ref: &str) -> Option<Vec<u8>> {
     host.read_blob(&fluxaxiom_engine_api::BlobRef::new(storage_ref.to_owned()))
         .ok()
+}
+
+/// 把事件上的 context 引用收成校验输入。
+///
+/// **作用**：`rebuild_from_trace` 使用。没有引用时按恒等策略。
+/// **参数**：`host` 读取 blob。`context_ref` 是事件里的引用，`None` 表示旧事件。
+/// **边界**：读不到或 JSON 不是记录时为 `Unreadable`，不猜成恒等。
+fn context_for_rebuild(host: &RunHost, context_ref: Option<&str>) -> RebuildContext {
+    let Some(context_ref) = context_ref else {
+        return RebuildContext::Identity;
+    };
+    match read_bytes_blob(host, context_ref)
+        .and_then(|bytes| serde_json::from_slice::<ContextRecord>(&bytes).ok())
+    {
+        Some(record) => RebuildContext::Parsed(record),
+        None => RebuildContext::Unreadable,
+    }
+}
+
+/// 用记录 blob 填上估算和硬上限。
+///
+/// **作用**：`flux trace` 在打印前调用。Host 不解析记录。
+/// **参数**：`host` 读取 `context_ref`。`trace` 里的模型轮和耗尽诊断会被改写估算字段。
+/// **边界**：没有引用时保持 `None`。有引用但读不到或解析失败时写成 `Unavailable`，不写成 0。
+fn fill_context_estimates(host: &RunHost, trace: &mut RunTrace) {
+    for round in &mut trace.rounds {
+        if let Some(model) = &mut round.model {
+            model.context_estimate = estimate_from_ref(host, model.context_ref.as_deref());
+        }
+    }
+    if let Some(exhausted) = &mut trace.context_exhausted {
+        exhausted.context_estimate = estimate_from_ref(host, Some(&exhausted.context_ref));
+    }
+}
+
+/// 读取一条记录的估算和硬上限。
+///
+/// **作用**：[`fill_context_estimates`] 的单条引用。
+/// **参数**：`context_ref` 为 `None` 时表示事件没有记录，返回 `None`。
+/// **边界**：有引用但 blob 缺失或不是记录时返回 `Unavailable`。
+fn estimate_from_ref(host: &RunHost, context_ref: Option<&str>) -> Option<TraceContextEstimate> {
+    let context_ref = context_ref?;
+    let Some(bytes) = read_bytes_blob(host, context_ref) else {
+        return Some(TraceContextEstimate::Unavailable);
+    };
+    match serde_json::from_slice::<ContextRecord>(&bytes) {
+        Ok(record) => Some(TraceContextEstimate::Known {
+            tokens: record.estimate.tokens,
+            hard_limit: record.spec.hard_limit,
+        }),
+        Err(_) => Some(TraceContextEstimate::Unavailable),
+    }
 }
 
 /// 组装一次样本导出。
@@ -920,6 +978,8 @@ fn build_sample(host: &RunHost, run_id: &RunId) -> Result<Sample, String> {
             usage: model.usage.clone(),
             request_ref: model.request_ref.clone(),
             response_ref: model.response_ref.clone(),
+            context_ref: model.context_ref.clone(),
+            context_strategy: model.context_strategy.clone(),
             tools: round
                 .tools
                 .iter()

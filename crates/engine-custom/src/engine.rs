@@ -381,7 +381,7 @@ fn put_context_record(
 /// **作用**：`prepare` 成功后交给 `ChatRequest`。
 /// **参数**：`view` 是这次要发送的视图。system 与首条 user 原样放入。各轮 assistant 使用正文、思维链和工具调用。工具结果只使用正文和调用 ID。
 /// **边界**：`trailing_user` 为空串时不另起 user 消息。工具名、参数和 `result_ref` 不进入 tool 消息。空的工具调用列表由 `Message` 省略。
-fn messages_from_view(view: &View) -> Vec<Message> {
+pub(crate) fn messages_from_view(view: &View) -> Vec<Message> {
     let mut messages = vec![
         Message::System {
             content: view.system.clone(),
