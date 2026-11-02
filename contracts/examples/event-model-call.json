@@ -17,6 +17,8 @@
     "finish_reason": "stop",
     "latency_ms": 350,
     "request_ref": "request_001",
-    "response_ref": "response_001"
+    "response_ref": "response_001",
+    "context_ref": "context_001",
+    "context_strategy": "identity@1"
   }
 }

@@ -1144,6 +1144,11 @@ fn load_created(
     Ok(Some(CreatedRun { run, attempt }))
 }
 
+/// 把 Engine 的终态写进 Run 和 Attempt。
+///
+/// **作用**：`finish_drive` 在同一事务里提交状态前调用。
+/// **参数**：`run` 与 `attempt` 必须还能转入终态。`outcome` 决定状态、`terminal_reason` 和 Attempt 的 `error_reason`；`Failed` 的部分报告不在这里写入。
+/// **边界**：`ContextExhausted` 与 `BudgetExhausted` 都进入 `Failed`，原因字符串分别是 `context_exhausted` 和 `budget_exhausted`。不能转移时返回 `Invalid`，不改内存中的状态。
 fn apply_outcome(
     run: &mut Run,
     attempt: &mut Attempt,
@@ -1163,6 +1168,9 @@ fn apply_outcome(
                 }
                 FailureReason::EngineError => (TerminalReason::EngineError, "engine_error"),
                 FailureReason::ProviderError => (TerminalReason::ProviderError, "provider_error"),
+                FailureReason::ContextExhausted => {
+                    (TerminalReason::ContextExhausted, "context_exhausted")
+                }
             };
             (
                 RunStatus::Failed,

@@ -43,7 +43,8 @@
             "budget_exhausted",
             "host_restart",
             "engine_error",
-            "provider_error"
+            "provider_error",
+            "context_exhausted"
           ]
         }
       ]
@@ -83,7 +84,8 @@
               "budget_exhausted",
               "host_restart",
               "engine_error",
-              "provider_error"
+              "provider_error",
+              "context_exhausted"
             ]
           }
         }

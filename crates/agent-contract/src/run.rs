@@ -22,6 +22,8 @@ pub enum TerminalReason {
     HostRestart,
     EngineError,
     ProviderError,
+    /// 上下文超过硬上限。事件与 `runs.terminal_reason` 里的文本是 `context_exhausted`。
+    ContextExhausted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

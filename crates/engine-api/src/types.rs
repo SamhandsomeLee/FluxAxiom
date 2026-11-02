@@ -86,6 +86,7 @@ impl BlobRef {
 /// **边界**：不能用来发 `run.*` / `attempt.*`。空字符串和空 `BlobRef` 视为缺字段，Host 返回 `Invalid` 且不写 event。
 /// `latency_ms` 与 `duration_ms` 允许为 0。`byte_count` 为 0 表示交给模型的内容为空，不是未知长度。
 /// `usage` 里缺失的 token 用契约的 `TokenCount::Unknown`，不要填 0 冒充。
+/// `context_ref` 与 `context_strategy` 成对：同为 `None`，或同为有值。只填一个是 `Invalid`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineObservation {
     /// 一次模型调用完成。请求和响应原文在两个 blob 引用里，不在本结构里。
@@ -102,6 +103,10 @@ pub enum EngineObservation {
         request_ref: BlobRef,
         /// 完整响应 blob，含 `reasoning_content`。空引用是 `Invalid`。
         response_ref: BlobRef,
+        /// context 记录 blob。`None` 表示这次调用没有记录，不是空引用。有值时必须已经 `put_blob`，空引用是 `Invalid`。与 `context_strategy` 同有同无。
+        context_ref: Option<BlobRef>,
+        /// 策略标识，例如 `identity@1`。`None` 表示没有记录。有值时不能是空串。与 `context_ref` 同有同无。
+        context_strategy: Option<String>,
     },
     /// 一次只读工具调用完成。结果原文在 `result_ref`，不在本结构里。
     ToolCall {
@@ -166,11 +171,15 @@ pub enum InputOutcome {
 }
 
 /// Engine 未能完成时的原因。Host 用它决定 Run 的 `terminal_reason`。
+///
+/// **边界**：`ContextExhausted` 只表示上下文硬上限。调用次数预算仍是 `BudgetExhausted`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureReason {
     BudgetExhausted,
     EngineError,
     ProviderError,
+    /// 估算超过硬上限，或硬上限为 0。Host 写成 `context_exhausted`。可带部分 Artifact。
+    ContextExhausted,
 }
 
 /// Engine 一次 `run` 的返回值。Host 据此写入 Attempt 结束和 Run 终态。

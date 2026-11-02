@@ -181,8 +181,10 @@ pub(crate) fn list_artifacts(
 /// 把观测变成契约 payload。
 ///
 /// **作用**：确认字段和 blob 都齐，再交给 `record` 写入。本函数不写库。
+/// **参数**：`root` 是 Host 数据目录，用来确认 blob 已落盘。`observation` 是 Engine 交来的模型或工具摘要；模型观测的两个 context 字段同为缺席或同为有值。
 /// **边界**：空字符串、空引用、引用格式不对、blob 不存在，都是 `Invalid`。
 /// 工具 `byte_count` 必须等于 `result_ref` 内容的长度，也就是返回给模型的字节数。
+/// `context_ref` 与 `context_strategy` 必须同为缺席，或同为非空；有引用时 blob 必须已经落盘。
 pub(crate) fn observation_body(
     root: &std::path::Path,
     observation: &EngineObservation,
@@ -195,11 +197,15 @@ pub(crate) fn observation_body(
             latency_ms,
             request_ref,
             response_ref,
+            context_ref,
+            context_strategy,
         } => {
             require_text(model_alias, "model_alias")?;
             require_text(finish_reason, "finish_reason")?;
             require_stored(root, request_ref)?;
             require_stored(root, response_ref)?;
+            let (context_ref, context_strategy) =
+                context_pair(root, context_ref.as_ref(), context_strategy.as_deref())?;
             Ok(EventBody::ModelCallCompleted(ModelCallCompletedPayload {
                 model_alias: model_alias.clone(),
                 usage: usage.clone(),
@@ -207,6 +213,8 @@ pub(crate) fn observation_body(
                 latency_ms: *latency_ms,
                 request_ref: request_ref.as_str().to_owned(),
                 response_ref: response_ref.as_str().to_owned(),
+                context_ref,
+                context_strategy,
             }))
         }
         EngineObservation::ToolCall {
@@ -312,7 +320,7 @@ pub(crate) fn attempt_ended(
 ///
 /// **作用**：让 Host 只传原因，不必在每个调用点重复 match。
 /// **参数**：`reason` 写入 payload 的 `terminal_reason`。
-/// **边界**：`HostRestart` / `EngineError` / `ProviderError` / `BudgetExhausted` 都映射到 `run.failed`。
+/// **边界**：`HostRestart` / `EngineError` / `ProviderError` / `BudgetExhausted` / `ContextExhausted` 都映射到 `run.failed`。
 pub(crate) fn terminal(reason: fluxaxiom_contract::TerminalReason) -> EventBody {
     let payload = RunTerminalPayload {
         terminal_reason: reason,
@@ -323,7 +331,8 @@ pub(crate) fn terminal(reason: fluxaxiom_contract::TerminalReason) -> EventBody 
         fluxaxiom_contract::TerminalReason::BudgetExhausted
         | fluxaxiom_contract::TerminalReason::HostRestart
         | fluxaxiom_contract::TerminalReason::EngineError
-        | fluxaxiom_contract::TerminalReason::ProviderError => EventBody::RunFailed(payload),
+        | fluxaxiom_contract::TerminalReason::ProviderError
+        | fluxaxiom_contract::TerminalReason::ContextExhausted => EventBody::RunFailed(payload),
     }
 }
 
@@ -356,10 +365,37 @@ fn require_text(value: &str, label: &'static str) -> Result<(), HostError> {
 
 /// 确认 blob 引用在磁盘上存在。
 ///
-/// **作用**：观测里的 `request_ref` / `response_ref` 必须先 `put_blob`。
-/// **边界**：不存在或路径非法时透传 `blob::stored_len` 的错误。
+/// **作用**：观测里的 `request_ref`、`response_ref` 和有值的 `context_ref` 必须先 `put_blob`。
+/// **参数**：`root` 是 Host 数据目录。`blob_ref` 是 `sha256:` 加 64 位小写十六进制；空串和其它写法都是 `Invalid`。
+/// **边界**：不存在或路径非法时透传 `blob::stored_len` 的错误。不读取正文。
 fn require_stored(root: &std::path::Path, blob_ref: &BlobRef) -> Result<(), HostError> {
     blob::stored_len(root, blob_ref).map(|_| ())
+}
+
+/// 收下成对的 context 字段。
+///
+/// **作用**：`observation_body` 在写 `model.call_completed` 前调用。
+/// **参数**：`root` 是 Host 数据目录，用来确认记录 blob 已落盘。`context_ref` 是观测上的引用，`None` 表示没有记录。`context_strategy` 是策略标识，`None` 表示没有记录；空串不是缺席。
+/// **边界**：两个都缺席时不查 blob，返回 `(None, None)`。都有值时引用必须非空且已落盘，策略必须非空。只出现一个时返回 `Invalid`，不写 event。
+fn context_pair(
+    root: &std::path::Path,
+    context_ref: Option<&BlobRef>,
+    context_strategy: Option<&str>,
+) -> Result<(Option<String>, Option<String>), HostError> {
+    match (context_ref, context_strategy) {
+        (None, None) => Ok((None, None)),
+        (Some(context_ref), Some(context_strategy)) => {
+            require_text(context_ref.as_str(), "context_ref")?;
+            require_text(context_strategy, "context_strategy")?;
+            require_stored(root, context_ref)?;
+            Ok((
+                Some(context_ref.as_str().to_owned()),
+                Some(context_strategy.to_owned()),
+            ))
+        }
+        (Some(_), None) => Err(HostError::Invalid("context_strategy")),
+        (None, Some(_)) => Err(HostError::Invalid("context_ref")),
+    }
 }
 
 /// events 表一行的原始列，尚未校验契约。

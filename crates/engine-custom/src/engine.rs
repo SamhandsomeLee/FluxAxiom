@@ -285,6 +285,7 @@ where
 ///
 /// **参数**：`request_bytes` 是已序列化的 Chat 请求；`usage` 与 `finish_reason` 进观测；`response` 是响应 blob 的 JSON。
 /// **边界**：失败时返回已构造好的 `EngineOutcome`，调用方直接 return。
+/// `context_ref` 与 `context_strategy` 在这一层保持 `None`；填写它们是后续接入 `prepare` 的事。
 fn observe_model(
     host: &Arc<dyn HostPort>,
     request_bytes: &[u8],
@@ -314,6 +315,8 @@ fn observe_model(
             latency_ms,
             request_ref,
             response_ref,
+            context_ref: None,
+            context_strategy: None,
         },
         last_content,
     )

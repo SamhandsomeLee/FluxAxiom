@@ -66,7 +66,8 @@
         "budget_exhausted",
         "host_restart",
         "engine_error",
-        "provider_error"
+        "provider_error",
+        "context_exhausted"
       ]
     },
     "tokenCount": {
@@ -227,8 +228,36 @@
               "finish_reason": { "type": "string", "minLength": 1 },
               "latency_ms": { "type": "integer", "minimum": 0 },
               "request_ref": { "type": "string", "minLength": 1 },
-              "response_ref": { "type": "string", "minLength": 1 }
-            }
+              "response_ref": { "type": "string", "minLength": 1 },
+              "context_ref": {
+                "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }]
+              },
+              "context_strategy": {
+                "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": { "context_ref": { "type": "string" } },
+                  "required": ["context_ref"]
+                },
+                "then": {
+                  "properties": { "context_strategy": { "type": "string", "minLength": 1 } },
+                  "required": ["context_strategy"]
+                }
+              },
+              {
+                "if": {
+                  "properties": { "context_strategy": { "type": "string" } },
+                  "required": ["context_strategy"]
+                },
+                "then": {
+                  "properties": { "context_ref": { "type": "string", "minLength": 1 } },
+                  "required": ["context_ref"]
+                }
+              }
+            ]
           }
         }
       }

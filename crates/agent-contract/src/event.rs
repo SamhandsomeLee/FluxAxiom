@@ -129,15 +129,106 @@ pub struct ModelUsage {
     pub prompt_cache_miss_tokens: TokenCount,
 }
 
+/// 一次 `model.call_completed` 的 payload。
+///
+/// **作用**：Host 把模型观测落成事件。以后的校验器用 `context_ref` 找到 context 记录。
+/// **边界**：不含 prompt、思维链或工具正文。`context_ref` 与 `context_strategy` 成对。
+/// 同为缺席时 JSON 仍写出这两个键，值是 `null`。缺键和 `null` 都读成 `None`。
+/// 只出现一个，或出现空串，反序列化失败。这里不检查 blob 是否存在。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "WireModelCallCompleted")]
 pub struct ModelCallCompletedPayload {
+    /// 模型别名。空串在这里不拒绝；Host 写入前拒绝。
     pub model_alias: String,
+    /// 四项用量。未知项是 `unknown`，不是 0。
     pub usage: ModelUsage,
+    /// Provider 的结束原因，或 Loop 写入的畸形标记。空串在这里不拒绝。
     pub finish_reason: String,
+    /// 本次调用墙钟毫秒。0 合法。
     pub latency_ms: u64,
+    /// 请求 blob 引用。通常是 `sha256:` 加十六进制。空串在这里不拒绝。
     pub request_ref: String,
+    /// 响应 blob 引用。正文在 blob 里，可以含思维链。空串在这里不拒绝。
     pub response_ref: String,
+    /// context 记录 blob。`None` 表示没有记录，JSON 为 `null`，不是省略键。不会是空串。
+    pub context_ref: Option<String>,
+    /// 策略标识，例如 `identity@1`。与 `context_ref` 同有同无。`None` 的 JSON 是 `null`。不会是空串。
+    pub context_strategy: Option<String>,
+}
+
+/// `model.call_completed` 的反序列化形状。
+///
+/// **作用**：先收下缺键和 `null`，再由 [`TryFrom`] 检查两个 context 字段是否成对。
+/// **边界**：未知键拒绝。`context_ref`、`context_strategy` 缺席时是 `None`，不是空串。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireModelCallCompleted {
+    /// 与 [`ModelCallCompletedPayload::model_alias`] 相同。
+    model_alias: String,
+    /// 与 [`ModelCallCompletedPayload::usage`] 相同。
+    usage: ModelUsage,
+    /// 与 [`ModelCallCompletedPayload::finish_reason`] 相同。
+    finish_reason: String,
+    /// 与 [`ModelCallCompletedPayload::latency_ms`] 相同。
+    latency_ms: u64,
+    /// 与 [`ModelCallCompletedPayload::request_ref`] 相同。
+    request_ref: String,
+    /// 与 [`ModelCallCompletedPayload::response_ref`] 相同。
+    response_ref: String,
+    /// 缺键或 JSON `null` 都是 `None`。空串留给 [`TryFrom`] 拒绝。
+    #[serde(default)]
+    context_ref: Option<String>,
+    /// 缺键或 JSON `null` 都是 `None`。必须与 `context_ref` 同有同无。
+    #[serde(default)]
+    context_strategy: Option<String>,
+}
+
+impl TryFrom<WireModelCallCompleted> for ModelCallCompletedPayload {
+    type Error = &'static str;
+
+    /// 把线上对象收成成对的 context 字段。
+    ///
+    /// **作用**：`model.call_completed` 反序列化时调用。
+    /// **参数**：`wire` 是 JSON 对象。缺键和 JSON `null` 都已经变成 `None`。
+    /// **边界**：两个字段必须同为 `None`，或同为非空字符串。空串、只出现一个时返回错误，不写成已知值。不检查 blob 是否存在。
+    fn try_from(wire: WireModelCallCompleted) -> Result<Self, Self::Error> {
+        context_pair(&wire.context_ref, &wire.context_strategy)?;
+        Ok(Self {
+            model_alias: wire.model_alias,
+            usage: wire.usage,
+            finish_reason: wire.finish_reason,
+            latency_ms: wire.latency_ms,
+            request_ref: wire.request_ref,
+            response_ref: wire.response_ref,
+            context_ref: wire.context_ref,
+            context_strategy: wire.context_strategy,
+        })
+    }
+}
+
+/// 判断两个 context 字段是同缺席还是同为非空字符串。
+///
+/// **作用**：反序列化时拒绝半对。
+/// **参数**：`context_ref` 是记录引用，`None` 表示缺席。`context_strategy` 是策略标识，`None` 表示缺席。空串不是缺席。
+/// **边界**：空串返回对应字段名。只出现一个时，返回缺席的那一个的名字。不访问 blob。
+fn context_pair(
+    context_ref: &Option<String>,
+    context_strategy: &Option<String>,
+) -> Result<(), &'static str> {
+    match (context_ref, context_strategy) {
+        (None, None) => Ok(()),
+        (Some(context_ref), Some(context_strategy)) => {
+            if context_ref.is_empty() {
+                Err("context_ref")
+            } else if context_strategy.is_empty() {
+                Err("context_strategy")
+            } else {
+                Ok(())
+            }
+        }
+        (Some(_), None) => Err("context_strategy"),
+        (None, Some(_)) => Err("context_ref"),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +332,118 @@ mod tests {
                 assert!(payload.workspace_revision.is_none());
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// 没有 context 字段的模型事件读成 `None`，再写出显式 `null`。
+    #[test]
+    fn model_call_payload_writes_null_for_absent_context_fields() {
+        let usage = json!({
+            "prompt_tokens": 1,
+            "completion_tokens": 2,
+            "prompt_cache_hit_tokens": "unknown",
+            "prompt_cache_miss_tokens": "unknown"
+        });
+        let legacy = json!({
+            "model_alias": "deepseek-flash",
+            "usage": usage,
+            "finish_reason": "stop",
+            "latency_ms": 3,
+            "request_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "response_ref": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        });
+        let payload: ModelCallCompletedPayload =
+            serde_json::from_value(legacy).expect("legacy payload");
+        assert_eq!(payload.context_ref, None);
+        assert_eq!(payload.context_strategy, None);
+        assert_eq!(
+            serde_json::to_value(&payload).expect("json"),
+            json!({
+                "model_alias": "deepseek-flash",
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                    "prompt_cache_hit_tokens": "unknown",
+                    "prompt_cache_miss_tokens": "unknown"
+                },
+                "finish_reason": "stop",
+                "latency_ms": 3,
+                "request_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "response_ref": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "context_ref": null,
+                "context_strategy": null
+            })
+        );
+
+        let recorded = json!({
+            "model_alias": "deepseek-flash",
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 2,
+                "prompt_cache_hit_tokens": "unknown",
+                "prompt_cache_miss_tokens": "unknown"
+            },
+            "finish_reason": "stop",
+            "latency_ms": 3,
+            "request_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "response_ref": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "context_ref": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "context_strategy": "identity@1"
+        });
+        let parsed: ModelCallCompletedPayload =
+            serde_json::from_value(recorded.clone()).expect("recorded");
+        assert_eq!(serde_json::to_value(&parsed).expect("json"), recorded);
+
+        for broken in [
+            json!({
+                "model_alias": "deepseek-flash",
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                    "prompt_cache_hit_tokens": "unknown",
+                    "prompt_cache_miss_tokens": "unknown"
+                },
+                "finish_reason": "stop",
+                "latency_ms": 3,
+                "request_ref": "sha256:aa",
+                "response_ref": "sha256:bb",
+                "context_ref": "sha256:cc",
+                "context_strategy": null
+            }),
+            json!({
+                "model_alias": "deepseek-flash",
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                    "prompt_cache_hit_tokens": "unknown",
+                    "prompt_cache_miss_tokens": "unknown"
+                },
+                "finish_reason": "stop",
+                "latency_ms": 3,
+                "request_ref": "sha256:aa",
+                "response_ref": "sha256:bb",
+                "context_strategy": "identity@1"
+            }),
+            json!({
+                "model_alias": "deepseek-flash",
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                    "prompt_cache_hit_tokens": "unknown",
+                    "prompt_cache_miss_tokens": "unknown"
+                },
+                "finish_reason": "stop",
+                "latency_ms": 3,
+                "request_ref": "sha256:aa",
+                "response_ref": "sha256:bb",
+                "context_ref": "",
+                "context_strategy": "identity@1"
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<ModelCallCompletedPayload>(broken).is_err(),
+                "broken context pair"
+            );
         }
     }
 }

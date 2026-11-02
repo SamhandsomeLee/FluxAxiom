@@ -470,6 +470,8 @@ mod tests {
                     latency_ms: 100,
                     request_ref: "sha256:r1".to_owned(),
                     response_ref: "sha256:s1".to_owned(),
+                    context_ref: None,
+                    context_strategy: None,
                 }),
             ),
             event(
@@ -509,6 +511,8 @@ mod tests {
                 latency_ms: 1,
                 request_ref: "sha256:a".to_owned(),
                 response_ref: "sha256:b".to_owned(),
+                context_ref: None,
+                context_strategy: None,
             }),
         )];
         let trace = build_trace(&snapshot, &attempt, &events, &HashMap::new());
@@ -538,6 +542,8 @@ mod tests {
                 latency_ms: 2,
                 request_ref: "sha256:a".to_owned(),
                 response_ref: "sha256:b".to_owned(),
+                context_ref: None,
+                context_strategy: None,
             }),
         )];
         let trace = build_trace(&snapshot, &attempt, &events, &HashMap::new());
@@ -581,6 +587,8 @@ mod tests {
                     latency_ms: 1,
                     request_ref: "sha256:a".to_owned(),
                     response_ref: "sha256:b".to_owned(),
+                    context_ref: None,
+                    context_strategy: None,
                 }),
             ),
             tool(2, "."),
@@ -618,6 +626,8 @@ mod tests {
                     latency_ms: 1,
                     request_ref: "sha256:a".to_owned(),
                     response_ref: "sha256:b".to_owned(),
+                    context_ref: None,
+                    context_strategy: None,
                 }),
             ),
             event(

@@ -560,7 +560,7 @@ fn decode_run_status(value: &str) -> Result<RunStatus, HostError> {
     }
 }
 
-/// 终态原因的库存文本：小写蛇形，与事件里的 `terminal_reason` 用词一致。
+/// 终态原因的库存文本：小写蛇形，与事件里的 `terminal_reason` 用词一致。`ContextExhausted` 写成 `context_exhausted`。
 ///
 /// **作用**：写入 `runs.terminal_reason`。`None` 由调用方省略，不经过这里。
 fn encode_terminal_reason(reason: TerminalReason) -> &'static str {
@@ -571,6 +571,7 @@ fn encode_terminal_reason(reason: TerminalReason) -> &'static str {
         TerminalReason::HostRestart => "host_restart",
         TerminalReason::EngineError => "engine_error",
         TerminalReason::ProviderError => "provider_error",
+        TerminalReason::ContextExhausted => "context_exhausted",
     }
 }
 
@@ -585,6 +586,7 @@ fn decode_terminal_reason(value: &str) -> Result<TerminalReason, HostError> {
         "host_restart" => Ok(TerminalReason::HostRestart),
         "engine_error" => Ok(TerminalReason::EngineError),
         "provider_error" => Ok(TerminalReason::ProviderError),
+        "context_exhausted" => Ok(TerminalReason::ContextExhausted),
         _ => Err(HostError::Corrupt("terminal reason")),
     }
 }

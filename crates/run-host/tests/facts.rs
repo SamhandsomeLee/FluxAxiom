@@ -7,8 +7,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use fluxaxiom_contract::{EventBody, RunStatus, TerminalReason};
 use fluxaxiom_engine_api::{
-    BlobRef, EngineAdapter, EngineDescriptor, EngineObservation, EngineOutcome, EngineRunRequest,
-    FailureReason, HostPort, HostPortError,
+    ArtifactDraft, BlobRef, EngineAdapter, EngineDescriptor, EngineObservation, EngineOutcome,
+    EngineRunRequest, FailureReason, HostPort, HostPortError, ModelUsage, TokenCount,
 };
 use fluxaxiom_run_host::RunHost;
 
@@ -291,6 +291,8 @@ impl EngineAdapter for RejectingEngine {
                 latency_ms: 1,
                 request_ref: stored.clone(),
                 response_ref: stored.clone(),
+                context_ref: None,
+                context_strategy: None,
             },
         ] {
             assert_eq!(host.observe(observation), Err(HostPortError::Invalid));
@@ -299,6 +301,160 @@ impl EngineAdapter for RejectingEngine {
             reason: FailureReason::EngineError,
             partial: None,
         }
+    }
+}
+
+/// 成对的 context 字段落进事件；半对、空引用和未落盘引用不写事件。终态是 `context_exhausted`。
+#[tokio::test]
+async fn context_fields_persist_as_a_pair_and_exhaustion_is_terminal() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let workspace = common::authorized_workspace(path);
+    let host = RunHost::open(path).unwrap();
+    let created = host
+        .create_run(common::create_run("req_context", &workspace))
+        .unwrap();
+    host.drive_run(&created.run.run_id, &ContextEngine)
+        .await
+        .unwrap();
+
+    let events = host.events_after(&created.run.run_id, 0).unwrap();
+    let models: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.body {
+            EventBody::ModelCallCompleted(payload) => Some(payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0].context_ref, None);
+    assert_eq!(models[0].context_strategy, None);
+    let absent = serde_json::to_value(models[0]).unwrap();
+    assert_eq!(absent["context_ref"], serde_json::Value::Null);
+    assert_eq!(absent["context_strategy"], serde_json::Value::Null);
+    assert_eq!(models[1].context_strategy.as_deref(), Some("identity@1"));
+    let context_ref = models[1].context_ref.as_deref().expect("context ref");
+    assert_eq!(
+        host.read_blob(&BlobRef::new(context_ref)).unwrap(),
+        b"SENTINEL_CONTEXT_BODY"
+    );
+    let encoded = serde_json::to_string(&events).unwrap();
+    assert!(!encoded.contains("SENTINEL_CONTEXT_BODY"));
+    assert!(events.iter().any(|event| matches!(
+        &event.body,
+        EventBody::RunFailed(payload)
+            if payload.terminal_reason == TerminalReason::ContextExhausted
+    )));
+
+    let run = host.get_run(&created.run.run_id).unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(run.terminal_reason, Some(TerminalReason::ContextExhausted));
+    let artifacts = host.list_artifacts(&created.run.run_id).unwrap();
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].summary, "partial report");
+}
+
+struct ContextEngine;
+
+#[async_trait]
+impl EngineAdapter for ContextEngine {
+    fn descriptor(&self) -> EngineDescriptor {
+        EngineDescriptor {
+            engine_id: common::FAKE_ENGINE_ID.to_owned(),
+            version: common::FAKE_ENGINE_VERSION.to_owned(),
+        }
+    }
+
+    /// 先写两条合法模型观测，再确认非法 context 组合不会落事件。
+    ///
+    /// **作用**：证明 Host 把成对字段写入 `model.call_completed`，并把 `ContextExhausted` 收成失败终态。
+    /// **参数**：`request` 是这次 drive 的任务，测试不读它。`host` 是正在 Running 的端口，blob 和观测都写在这里。
+    /// **边界**：拒绝的观测必须是 `Invalid`。返回带部分报告的 `ContextExhausted`。
+    async fn run(&self, _request: EngineRunRequest, host: Arc<dyn HostPort>) -> EngineOutcome {
+        let request_ref = host
+            .put_blob(bytes::Bytes::from_static(b"request"), "application/json")
+            .expect("request blob");
+        let response_ref = host
+            .put_blob(bytes::Bytes::from_static(b"response"), "application/json")
+            .expect("response blob");
+        let context_ref = host
+            .put_blob(
+                bytes::Bytes::from_static(b"SENTINEL_CONTEXT_BODY"),
+                "application/json",
+            )
+            .expect("context blob");
+        let usage = ModelUsage {
+            prompt_tokens: TokenCount::Unknown,
+            completion_tokens: TokenCount::Unknown,
+            prompt_cache_hit_tokens: TokenCount::Unknown,
+            prompt_cache_miss_tokens: TokenCount::Unknown,
+        };
+        host.observe(model_call(
+            request_ref.clone(),
+            response_ref.clone(),
+            usage.clone(),
+            None,
+            None,
+        ))
+        .expect("absent context");
+        host.observe(model_call(
+            request_ref.clone(),
+            response_ref.clone(),
+            usage.clone(),
+            Some(context_ref.clone()),
+            Some("identity@1".to_owned()),
+        ))
+        .expect("stored context");
+        let missing = BlobRef::new(format!("sha256:{}", "0".repeat(64)));
+        for (context_ref, context_strategy) in [
+            (Some(context_ref.clone()), None),
+            (None, Some("identity@1".to_owned())),
+            (
+                Some(BlobRef::new(String::new())),
+                Some("identity@1".to_owned()),
+            ),
+            (Some(context_ref), Some(String::new())),
+            (Some(missing), Some("identity@1".to_owned())),
+        ] {
+            assert_eq!(
+                host.observe(model_call(
+                    request_ref.clone(),
+                    response_ref.clone(),
+                    usage.clone(),
+                    context_ref,
+                    context_strategy,
+                )),
+                Err(HostPortError::Invalid)
+            );
+        }
+        EngineOutcome::Failed {
+            reason: FailureReason::ContextExhausted,
+            partial: Some(ArtifactDraft::report("partial report".to_owned())),
+        }
+    }
+}
+
+/// 组装一条模型观测。
+///
+/// **作用**：context 落库测试少写重复字段。
+/// **参数**：`request_ref` 与 `response_ref` 是已准备好的 blob 引用，调用方决定它们是否已落盘。`usage` 原样进入观测。`context_ref` 为 `None` 表示没有记录。`context_strategy` 为 `None` 表示没有策略；空串留给 Host 拒绝。
+/// **边界**：不访问 Host。别名和 `finish_reason` 固定为非空短字符串。
+fn model_call(
+    request_ref: BlobRef,
+    response_ref: BlobRef,
+    usage: ModelUsage,
+    context_ref: Option<BlobRef>,
+    context_strategy: Option<String>,
+) -> EngineObservation {
+    EngineObservation::ModelCall {
+        model_alias: "deepseek-flash".to_owned(),
+        usage,
+        finish_reason: "stop".to_owned(),
+        latency_ms: 1,
+        request_ref,
+        response_ref,
+        context_ref,
+        context_strategy,
     }
 }
 

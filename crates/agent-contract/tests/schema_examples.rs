@@ -135,6 +135,62 @@ fn tool_call_id_is_optional_but_preserved_in_full_event_json() {
     assert_invalid("contracts/schemas/event.schema.json", &invalid);
 }
 
+/// 旧模型事件省略 context 字段仍合法，读回后写出显式 null。半对和空串拒绝。
+#[test]
+fn model_call_context_fields_are_a_pair() {
+    let current = read_json("contracts/examples/event-model-call.json");
+    assert_valid("contracts/schemas/event.schema.json", &current);
+    let event: Event = serde_json::from_value(current.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&event).unwrap(), current);
+
+    let mut legacy = current.clone();
+    let payload = legacy["payload"].as_object_mut().unwrap();
+    payload.remove("context_ref");
+    payload.remove("context_strategy");
+    assert_valid("contracts/schemas/event.schema.json", &legacy);
+    let parsed: Event = serde_json::from_value(legacy).unwrap();
+    let rewritten = serde_json::to_value(&parsed).unwrap();
+    assert_eq!(rewritten["payload"]["context_ref"], Value::Null);
+    assert_eq!(rewritten["payload"]["context_strategy"], Value::Null);
+    assert_valid("contracts/schemas/event.schema.json", &rewritten);
+
+    let mut one_sided = current.clone();
+    one_sided["payload"]["context_strategy"] = Value::Null;
+    assert_invalid("contracts/schemas/event.schema.json", &one_sided);
+    assert!(serde_json::from_value::<Event>(one_sided).is_err());
+
+    let mut empty = current;
+    empty["payload"]["context_ref"] = Value::String(String::new());
+    assert_invalid("contracts/schemas/event.schema.json", &empty);
+    assert!(serde_json::from_value::<Event>(empty).is_err());
+}
+
+/// `context_exhausted` 能通过 Run、快照、样本和失败事件的 schema。
+#[test]
+fn context_exhausted_is_a_terminal_reason() {
+    let mut run = read_json("contracts/examples/run.json");
+    run["status"] = Value::String("Failed".to_owned());
+    run["terminal_reason"] = Value::String("context_exhausted".to_owned());
+    assert_valid("contracts/schemas/run.schema.json", &run);
+
+    let mut snapshot = read_json("contracts/examples/run-snapshot.json");
+    snapshot["status"] = Value::String("Failed".to_owned());
+    snapshot["terminal_reason"] = Value::String("context_exhausted".to_owned());
+    assert_valid("contracts/schemas/run-snapshot.schema.json", &snapshot);
+
+    let mut sample = read_json("contracts/examples/sample.json");
+    sample["run"]["status"] = Value::String("Failed".to_owned());
+    sample["run"]["terminal_reason"] = Value::String("context_exhausted".to_owned());
+    assert_valid("contracts/schemas/sample.schema.json", &sample);
+
+    let mut event = read_json("contracts/examples/event-run-accepted.json");
+    event["event_type"] = Value::String("run.failed".to_owned());
+    event["payload"] = serde_json::json!({ "terminal_reason": "context_exhausted" });
+    assert_valid("contracts/schemas/event.schema.json", &event);
+    let parsed: Event = serde_json::from_value(event.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), event);
+}
+
 #[test]
 fn running_run_cannot_carry_a_terminal_reason() {
     let mut run = read_json("contracts/examples/run.json");
