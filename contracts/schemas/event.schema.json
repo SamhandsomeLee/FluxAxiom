@@ -40,6 +40,7 @@
         "attempt.ended",
         "attempt.orphaned",
         "model.call_completed",
+        "context.exhausted",
         "tool.call_completed",
         "artifact.created"
       ]
@@ -258,6 +259,25 @@
                 }
               }
             ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "event_type": { "const": "context.exhausted" } },
+        "required": ["event_type"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["context_ref", "context_strategy"],
+            "properties": {
+              "context_ref": { "type": "string", "minLength": 1 },
+              "context_strategy": { "type": "string", "minLength": 1 }
+            }
           }
         }
       }

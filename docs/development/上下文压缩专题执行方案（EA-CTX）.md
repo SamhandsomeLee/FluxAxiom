@@ -191,7 +191,7 @@ T6、T7、T9 比较的是模型的下一步决策，需要可重复的测量方�
 
 1. **P1-1 `context` crate**：`Transcript`、`View`、`ContextStrategy`、`ContextManager`、`identity@1`、档案加载与 `deepseek-flash` 档案、估算器、`ContextSpec` 派生、context 记录 schema。纯函数与单元测试；依赖检查确认不依赖 `engine-api` / `engine-custom` / `run-host`。
 2. **P1-2 契约**：`FailureReason::ContextExhausted`、`TerminalReason::ContextExhausted`；`ModelCall` 观测与 `model.call_completed` 的 `context_ref`、`context_strategy`；`event.schema.json` 与样例；旧事件反序列化测试；`run-host` 落库与终态映射。
-3. **P1-3 Engine A 接入**：每次调用前 `prepare`，视图序列化为 Chat Completions，写记录 blob 并随观测提交；硬上限返回 `ContextExhausted`（可带部分报告）；服务端超限错误归类（识别规则待真实错误样本，未识别仍为 `ProviderError`）。更新 `p0a-runtime.mdc` 的终态说明。
+3. **P1-3 Engine A 接入**：每次调用前 `prepare`，视图序列化为 Chat Completions，写记录 blob 并随观测提交；硬上限返回 `ContextExhausted`（可带部分报告）；服务端超限错误归类（识别规则待真实错误样本，未识别仍为 `ProviderError`）。更新 `p0a-runtime.mdc` 的终态说明。2026-11-02 审查补充：发送前耗尽也必须保存 `ContextExhausted.record`，通过独立 `context.exhausted` 事件的必需 `context_ref`、`context_strategy` 关联到 Run/Attempt，不伪造模型调用，不预留模型额度。Host 只检查引用已落盘，不解析记录。写记录或诊断失败时返回 `EngineError`。覆盖首次及后续轮耗尽、已有部分报告、非法/未落盘诊断引用、存储失败以及重开 Host 后的记录读回；失败 prepare 的记录不得被上一次已发出请求的记录代替。
 4. **P1-4 校验与展示**：`rebuild` 改为经 `replay` 逐字节比较；`trace` 显示 `context_strategy` 与每轮估算值、硬上限；`sample export` 保留两个字段。
 
 **各阶段验收**

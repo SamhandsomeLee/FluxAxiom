@@ -108,6 +108,13 @@ pub enum EngineObservation {
         /// 策略标识，例如 `identity@1`。`None` 表示没有记录。有值时不能是空串。与 `context_ref` 同有同无。
         context_strategy: Option<String>,
     },
+    /// 请求发送前 prepare 判定上下文耗尽。Host 保存诊断引用，不计为模型调用，也不直接改变 Run 状态。
+    ContextExhausted {
+        /// 失败 prepare 的记录 blob，必须已经 put_blob。空引用、非法引用或未落盘时为 Invalid。
+        context_ref: BlobRef,
+        /// 记录的策略标识，必须非空。未知策略允许保存，Host 不解析记录内容。
+        context_strategy: String,
+    },
     /// 一次只读工具调用完成。结果原文在 `result_ref`，不在本结构里。
     ToolCall {
         /// 响应中的调用 ID，用于核对工具执行顺序；不能为空。

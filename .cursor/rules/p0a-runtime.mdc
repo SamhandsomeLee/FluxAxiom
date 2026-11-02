@@ -8,7 +8,7 @@ alwaysApply: false
 
 改这些路径时以执行方案 §4 为准，不要在这里重写架构。
 
-- Run：`Accepted → Running → Completed/Failed`，以及 `Running → Cancelling → Cancelled`。预算耗尽是 `Failed(budget_exhausted)`，可带部分 Artifact。
+- Run：`Accepted → Running → Completed/Failed`，以及 `Running → Cancelling → Cancelled`。预算耗尽是 `Failed(budget_exhausted)`，可带部分 Artifact。上下文超过硬上限时先保存记录并发 `context.exhausted` 诊断，再返回 `Failed(context_exhausted)`，可带部分 Artifact；诊断不计模型调用，写记录或诊断失败返回 `Failed(engine_error)`。
 - 先提交 `run.started` 和带租约的 `attempt.started`，再启动 Engine。
 - Ctrl-C 可以进入 `Cancelled`。强杀后只把租约过期的 Attempt 标为 `Orphaned`，Run 标为 `Failed(host_restart)`。不要把仍在运行的 Run 判成孤儿。
 - DeepSeek 请求带 tools 时，历史 assistant 消息必须回传 `reasoning_content`；内容为空也保留该字段。它只进 blob。

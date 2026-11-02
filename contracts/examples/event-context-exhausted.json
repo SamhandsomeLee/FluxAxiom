@@ -1,0 +1,13 @@
+{
+  "event_id": "evt_01936c2f-8a4b-7c3d-9e1f-2a3b4c5d6e94",
+  "schema_version": "0.3-draft",
+  "run_id": "run_01936c2f-8a4b-7c3d-9e1f-2a3b4c5d6e7f",
+  "sequence": 4,
+  "subject_id": "attempt_01936c2f-8a4b-7c3d-9e1f-2a3b4c5d6e91",
+  "occurred_at": "2026-11-02T04:00:00Z",
+  "event_type": "context.exhausted",
+  "payload": {
+    "context_ref": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "context_strategy": "identity@1"
+  }
+}

@@ -40,7 +40,7 @@ impl std::error::Error for HostPortError {}
 /// Engine 不写数据库，也不发 `run.*` / `attempt.*`。Run 终态由 Host 根据 `EngineOutcome` 决定。
 #[async_trait]
 pub trait HostPort: Send + Sync {
-    /// 提交一次模型或工具调用观测。
+    /// 提交一次模型、工具调用或上下文耗尽诊断观测。
     ///
     /// **作用**：校验后写入 durable event。返回 `Ok` 时该 event 已经 COMMIT。
     ///

@@ -797,6 +797,7 @@ fn event_kind(body: &EventBody) -> &'static str {
         EventBody::AttemptEnded(_) => "attempt.ended",
         EventBody::AttemptOrphaned(_) => "attempt.orphaned",
         EventBody::ModelCallCompleted(_) => "model.call_completed",
+        EventBody::ContextExhausted(_) => "context.exhausted",
         EventBody::ToolCallCompleted(_) => "tool.call_completed",
         EventBody::ArtifactCreated(_) => "artifact.created",
     }

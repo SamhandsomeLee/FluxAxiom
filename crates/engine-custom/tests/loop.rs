@@ -23,6 +23,26 @@ use fluxaxiom_engine_custom::{
 };
 use tempfile::TempDir;
 
+/// 交回一条带“上下文超限”字样、但本轮不识别的 400。
+struct UnrecognizedOverflow;
+
+#[async_trait]
+impl ChatTransport for UnrecognizedOverflow {
+    /// **作用**：让 Loop 收到一条尚未有样本的服务端拒绝。
+    /// **参数**：`_request_json` 是已序列化的请求，这里不检查。`_cancel` 是取消令牌，这里不看。
+    /// **边界**：不访问网络。摘要只是测试用的说明，不是真实 API 的错误正文。
+    async fn round(
+        &mut self,
+        _request_json: &serde_json::Value,
+        _cancel: &CancellationToken,
+    ) -> Result<fluxaxiom_engine_custom::Round, ChatError> {
+        Ok(fluxaxiom_engine_custom::Round::Status {
+            status: 400,
+            summary: "maximum context length is 1048576 tokens".to_owned(),
+        })
+    }
+}
+
 /// 记录 observe / put_blob / reserve，并按上限扣减。
 struct MemoryHost {
     cancel: CancellationToken,
@@ -30,6 +50,10 @@ struct MemoryHost {
     remaining_tool: Mutex<u32>,
     observations: Mutex<Vec<EngineObservation>>,
     blobs: Mutex<Vec<(String, Vec<u8>)>>,
+    /// 成功保存指定份数后，后续 put_blob 返回 Storage。None 不注入错误；Some(0) 从首次写入失败。
+    fail_put_after: Option<usize>,
+    /// 为 true 时只拒绝耗尽诊断观测；正常模型和工具观测不受影响。
+    fail_exhaustion_observation: bool,
 }
 
 impl MemoryHost {
@@ -40,6 +64,8 @@ impl MemoryHost {
             remaining_tool: Mutex::new(tool),
             observations: Mutex::new(Vec::new()),
             blobs: Mutex::new(Vec::new()),
+            fail_put_after: None,
+            fail_exhaustion_observation: false,
         })
     }
 
@@ -56,6 +82,28 @@ impl MemoryHost {
             .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
             .collect()
     }
+
+    /// 按引用取回 blob 正文。
+    ///
+    /// **作用**：断言 context 记录不含 prompt。
+    /// **参数**：`blob_ref` 是 `put_blob` 返回的引用。测试里形如 `blob:1`。
+    /// **边界**：没有这份引用时 panic。不做 UTF-8 校验，有损解码。
+    fn blob_text(&self, blob_ref: &BlobRef) -> String {
+        let blobs = self.blobs.lock().unwrap();
+        let (_, bytes) = blobs
+            .iter()
+            .find(|(id, _)| id == blob_ref.as_str())
+            .expect("blob");
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    /// 还没扣掉的模型额度。
+    ///
+    /// **作用**：证明超限发生在 `reserve` 之前。
+    /// **边界**：0 表示额度用完或一开始就是 0。
+    fn remaining_model(&self) -> u32 {
+        *self.remaining_model.lock().unwrap()
+    }
 }
 
 #[async_trait]
@@ -63,13 +111,26 @@ impl HostPort for MemoryHost {
     /// **作用**：记下观测，供断言模型/工具顺序与用量。
     /// **边界**：不做契约字段校验；空字段仍接受，好测 Loop 自己有没有漏填。
     fn observe(&self, observation: EngineObservation) -> Result<(), HostPortError> {
+        if self.fail_exhaustion_observation
+            && matches!(&observation, EngineObservation::ContextExhausted { .. })
+        {
+            return Err(HostPortError::Storage);
+        }
         self.observations.lock().unwrap().push(observation);
         Ok(())
     }
 
     /// **作用**：按序号生成 `blob:` 引用并保存字节。
+    /// **参数**：`bytes` 是要保存的正文；`_media_type` 在内存夹具中不校验或保存。
+    /// **边界**：达到 fail_put_after 指定的成功份数后返回 Storage，不保存新正文。
     fn put_blob(&self, bytes: Bytes, _media_type: &str) -> Result<BlobRef, HostPortError> {
         let mut blobs = self.blobs.lock().unwrap();
+        if self
+            .fail_put_after
+            .is_some_and(|limit| blobs.len() >= limit)
+        {
+            return Err(HostPortError::Storage);
+        }
         let id = format!("blob:{}", blobs.len() + 1);
         blobs.push((id.clone(), bytes.to_vec()));
         Ok(BlobRef::new(id))
@@ -303,6 +364,213 @@ async fn stop_without_tools_completes_with_report() {
     assert_eq!(PROMPT_LAYOUT_VERSION, "p0a-loop-1");
 }
 
+/// 首次 prepare 超限时只保存诊断记录，不调用模型，也不占用模型额度。
+#[tokio::test]
+async fn context_over_the_hard_limit_does_not_call_the_model() {
+    let (_dir, root) = workspace();
+    let host = MemoryHost::new(4, 4);
+    let engine = EngineA::new(
+        FakeChat::script(Vec::<FakeStep>::new()),
+        RecordingBackoff::default(),
+    );
+    let outcome = engine
+        .run(
+            EngineRunRequest {
+                run_id: RunId::generate(),
+                input: "a".repeat(2_400_000),
+                workspace: root,
+            },
+            host.clone(),
+        )
+        .await;
+    assert_eq!(
+        outcome,
+        EngineOutcome::Failed {
+            reason: FailureReason::ContextExhausted,
+            partial: None,
+        }
+    );
+    let observations = host.observations();
+    assert_eq!(observations.len(), 1);
+    let EngineObservation::ContextExhausted {
+        context_ref,
+        context_strategy,
+    } = &observations[0]
+    else {
+        panic!("expected exhaustion diagnostic");
+    };
+    assert_eq!(context_strategy, "identity@1");
+    let record: fluxaxiom_context::ContextRecord =
+        serde_json::from_str(&host.blob_text(context_ref)).unwrap();
+    assert_eq!(record.context_strategy, *context_strategy);
+    assert_eq!(record.spec.hard_limit, 711_065);
+    assert!(record.estimate.tokens > record.spec.hard_limit);
+    assert_eq!(
+        record.estimate.source,
+        fluxaxiom_context::EstimateSource::Estimated
+    );
+    assert_eq!(record.estimate.anchor_round, None);
+    assert_eq!(host.blob_texts().len(), 1);
+    assert_eq!(host.remaining_model(), 4);
+}
+
+/// 已有一轮模型和工具调用后超限，只追加失败准备的诊断，并保留已有部分报告。
+#[tokio::test]
+async fn later_context_exhaustion_keeps_partial_and_the_failed_estimate() {
+    let (_dir, root) = workspace();
+    let host = MemoryHost::new(4, 4);
+    let mut step = match read_note_turn("partial analysis") {
+        FakeStep::Turn(turn) => turn,
+        _ => unreachable!(),
+    };
+    step.usage.prompt_tokens = TokenCount::Known(710_000);
+    step.usage.completion_tokens = TokenCount::Known(2_000);
+    let outcome = run_engine(vec![FakeStep::Turn(step)], Arc::clone(&host), root).await;
+    assert_eq!(
+        outcome,
+        EngineOutcome::Failed {
+            reason: FailureReason::ContextExhausted,
+            partial: Some(ArtifactDraft::report("partial analysis")),
+        }
+    );
+    let observations = host.observations();
+    assert_eq!(observations.len(), 3);
+    assert!(matches!(
+        &observations[0],
+        EngineObservation::ModelCall { .. }
+    ));
+    assert!(matches!(
+        &observations[1],
+        EngineObservation::ToolCall { .. }
+    ));
+    let EngineObservation::ContextExhausted { context_ref, .. } = &observations[2] else {
+        panic!("expected exhaustion diagnostic");
+    };
+    let record: fluxaxiom_context::ContextRecord =
+        serde_json::from_str(&host.blob_text(context_ref)).unwrap();
+    assert!(record.estimate.tokens >= 712_000);
+    assert_eq!(
+        record.estimate.source,
+        fluxaxiom_context::EstimateSource::Usage
+    );
+    assert_eq!(record.estimate.anchor_round, Some(1));
+    assert_eq!(host.remaining_model(), 3);
+}
+
+/// 诊断 blob 或事件写失败时诚实返回 EngineError，不伪装成已保存证据的 ContextExhausted。
+#[tokio::test]
+async fn exhaustion_persistence_failure_is_engine_error() {
+    for fail_blob in [true, false] {
+        let (_dir, root) = workspace();
+        let mut host = MemoryHost::new(4, 4);
+        let mutable = Arc::get_mut(&mut host).unwrap();
+        mutable.fail_put_after = fail_blob.then_some(0);
+        mutable.fail_exhaustion_observation = !fail_blob;
+        let engine = EngineA::new(FakeChat::script([]), RecordingBackoff::default());
+        let outcome = engine
+            .run(
+                EngineRunRequest {
+                    run_id: RunId::generate(),
+                    input: "a".repeat(2_400_000),
+                    workspace: root,
+                },
+                host.clone(),
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            EngineOutcome::Failed {
+                reason: FailureReason::EngineError,
+                partial: None
+            }
+        );
+        assert!(host.observations().is_empty());
+        assert_eq!(host.blob_texts().len(), if fail_blob { 0 } else { 1 });
+        assert_eq!(host.remaining_model(), 4);
+    }
+}
+
+/// 后续轮的耗尽诊断写失败仍保留已有报告，且不会再占模型额度或提交成功诊断。
+#[tokio::test]
+async fn later_exhaustion_persistence_failure_keeps_partial_report() {
+    for fail_blob in [true, false] {
+        let (_dir, root) = workspace();
+        let mut host = MemoryHost::new(4, 4);
+        let mutable = Arc::get_mut(&mut host).unwrap();
+        // 首轮请求、响应、context 记录及工具结果共四份；只让失败 prepare 的记录写入失败。
+        mutable.fail_put_after = fail_blob.then_some(4);
+        mutable.fail_exhaustion_observation = !fail_blob;
+        let FakeStep::Turn(mut step) = read_note_turn("partial analysis") else {
+            unreachable!();
+        };
+        step.usage.prompt_tokens = TokenCount::Known(710_000);
+        step.usage.completion_tokens = TokenCount::Known(2_000);
+        let outcome = run_engine(vec![FakeStep::Turn(step)], Arc::clone(&host), root).await;
+        assert_eq!(
+            outcome,
+            EngineOutcome::Failed {
+                reason: FailureReason::EngineError,
+                partial: Some(ArtifactDraft::report("partial analysis")),
+            }
+        );
+        let observations = host.observations();
+        assert_eq!(observations.len(), 2);
+        assert!(matches!(
+            observations[0],
+            EngineObservation::ModelCall { .. }
+        ));
+        assert!(matches!(
+            observations[1],
+            EngineObservation::ToolCall { .. }
+        ));
+        assert_eq!(host.blob_texts().len(), if fail_blob { 4 } else { 5 });
+        assert_eq!(host.remaining_model(), 3);
+    }
+}
+
+/// 没有真实样本可识别的超限说明仍是 `ProviderError`，不写 context 记录。
+#[tokio::test]
+async fn unrecognized_context_overflow_stays_provider_error() {
+    let (_dir, root) = workspace();
+    let host = MemoryHost::new(4, 4);
+    let outcome = run_with(UnrecognizedOverflow, Arc::clone(&host), root).await;
+    assert_eq!(
+        outcome,
+        EngineOutcome::Failed {
+            reason: FailureReason::ProviderError,
+            partial: None,
+        }
+    );
+    assert!(host.observations().is_empty());
+    assert!(host.blob_texts().is_empty());
+    assert_eq!(host.remaining_model(), 3);
+}
+
+/// 成功的模型调用把 context 记录写成 blob，记录里没有 prompt 和思维链。
+#[tokio::test]
+async fn prepared_call_stores_context_record_without_prompt_text() {
+    let (_dir, root) = workspace();
+    let host = MemoryHost::new(4, 4);
+    let outcome = run_engine(vec![stop_turn("final answer")], Arc::clone(&host), root).await;
+    assert!(matches!(outcome, EngineOutcome::Completed { .. }));
+    match &host.observations()[0] {
+        EngineObservation::ModelCall {
+            request_ref,
+            context_ref: Some(context_ref),
+            context_strategy: Some(strategy),
+            ..
+        } => {
+            assert_eq!(strategy, "identity@1");
+            let record = host.blob_text(context_ref);
+            assert!(record.contains("identity@1"));
+            assert!(!record.contains("summarize note.txt"));
+            assert!(!record.contains("think"));
+            assert!(host.blob_text(request_ref).contains("summarize note.txt"));
+        }
+        other => panic!("expected a prepared model call, got {other:?}"),
+    }
+}
+
 /// 一轮 list_files，再 stop。
 ///
 /// **边界**：两次模型 observe、一次工具 observe；工具 reserve 在模型之后。
@@ -521,10 +789,14 @@ async fn invalid_tool_arguments_observe_then_provider_error() {
         EngineObservation::ModelCall {
             usage: recorded,
             finish_reason,
+            context_ref,
+            context_strategy,
             ..
         } => {
             assert_eq!(*recorded, usage());
             assert_eq!(finish_reason, "invalid_tool_arguments");
+            assert!(context_ref.is_some());
+            assert_eq!(context_strategy.as_deref(), Some("identity@1"));
         }
         other => panic!("expected ModelCall, got {other:?}"),
     }
@@ -624,6 +896,7 @@ async fn stream_interrupt_after_tool_round_keeps_earlier_text_as_partial() {
         .map(|observation| match observation {
             EngineObservation::ModelCall { .. } => "model",
             EngineObservation::ToolCall { .. } => "tool",
+            EngineObservation::ContextExhausted { .. } => "context.exhausted",
         })
         .collect();
     assert_eq!(kinds, ["model", "tool"]);

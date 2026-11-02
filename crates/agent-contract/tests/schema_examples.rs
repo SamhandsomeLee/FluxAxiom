@@ -77,6 +77,10 @@ fn examples_match_schemas_and_rust_types() {
     );
     round_trip::<Event>(
         "contracts/schemas/event.schema.json",
+        "contracts/examples/event-context-exhausted.json",
+    );
+    round_trip::<Event>(
+        "contracts/schemas/event.schema.json",
         "contracts/examples/event-tool-call.json",
     );
     round_trip::<Event>(
@@ -163,6 +167,35 @@ fn model_call_context_fields_are_a_pair() {
     empty["payload"]["context_ref"] = Value::String(String::new());
     assert_invalid("contracts/schemas/event.schema.json", &empty);
     assert!(serde_json::from_value::<Event>(empty).is_err());
+}
+
+/// 耗尽诊断只有引用和策略名，完整往返；缺键、空串、null 与额外正文均拒绝。
+#[test]
+fn context_exhausted_diagnostic_matches_schema_and_rust() {
+    let value = read_json("contracts/examples/event-context-exhausted.json");
+    assert_valid("contracts/schemas/event.schema.json", &value);
+    let event: Event = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(event).unwrap(), value);
+    for field in ["context_ref", "context_strategy"] {
+        for replacement in [None, Some(Value::Null), Some(Value::String(String::new()))] {
+            let mut broken = value.clone();
+            let payload = broken["payload"].as_object_mut().unwrap();
+            match replacement {
+                Some(replacement) => {
+                    payload.insert(field.to_owned(), replacement);
+                }
+                None => {
+                    payload.remove(field);
+                }
+            }
+            assert_invalid("contracts/schemas/event.schema.json", &broken);
+            assert!(serde_json::from_value::<Event>(broken).is_err());
+        }
+    }
+    let mut with_body = value;
+    with_body["payload"]["reasoning_content"] = Value::String("PRIVATE_BODY".to_owned());
+    assert_invalid("contracts/schemas/event.schema.json", &with_body);
+    assert!(serde_json::from_value::<Event>(with_body).is_err());
 }
 
 /// `context_exhausted` 能通过 Run、快照、样本和失败事件的 schema。

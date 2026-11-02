@@ -1,7 +1,8 @@
 use fluxaxiom_contract::{
     Artifact, ArtifactCreatedPayload, ArtifactId, AttemptEndedPayload, AttemptId,
-    AttemptOrphanedPayload, AttemptStartedPayload, EmptyPayload, Event, EventBody, EventId,
-    ModelCallCompletedPayload, RunId, RunTerminalPayload, ToolCallCompletedPayload, SCHEMA_VERSION,
+    AttemptOrphanedPayload, AttemptStartedPayload, ContextExhaustedPayload, EmptyPayload, Event,
+    EventBody, EventId, ModelCallCompletedPayload, RunId, RunTerminalPayload,
+    ToolCallCompletedPayload, SCHEMA_VERSION,
 };
 use fluxaxiom_engine_api::{BlobRef, EngineObservation};
 use rusqlite::{params, Connection, Transaction};
@@ -215,6 +216,17 @@ pub(crate) fn observation_body(
                 response_ref: response_ref.as_str().to_owned(),
                 context_ref,
                 context_strategy,
+            }))
+        }
+        EngineObservation::ContextExhausted {
+            context_ref,
+            context_strategy,
+        } => {
+            require_text(context_strategy, "context_strategy")?;
+            require_stored(root, context_ref)?;
+            Ok(EventBody::ContextExhausted(ContextExhaustedPayload {
+                context_ref: context_ref.as_str().to_owned(),
+                context_strategy: context_strategy.clone(),
             }))
         }
         EngineObservation::ToolCall {

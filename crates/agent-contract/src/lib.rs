@@ -16,8 +16,8 @@ pub use attempt::{attempt_transition_allowed, Attempt, AttemptOutcome, AttemptSt
 pub use error::Error;
 pub use event::{
     ArtifactCreatedPayload, AttemptEndedPayload, AttemptOrphanedPayload, AttemptStartedPayload,
-    EmptyPayload, Event, EventBody, ModelCallCompletedPayload, ModelUsage, RunTerminalPayload,
-    TokenCount, ToolCallCompletedPayload, WorkspaceRevision,
+    ContextExhaustedPayload, EmptyPayload, Event, EventBody, ModelCallCompletedPayload, ModelUsage,
+    RunTerminalPayload, TokenCount, ToolCallCompletedPayload, WorkspaceRevision,
 };
 pub use id::{ArtifactId, AttemptId, EventId, FeedbackId, IdError, RunId, SessionId};
 pub use run::{run_transition_allowed, Budget, Run, RunStatus, TerminalReason};

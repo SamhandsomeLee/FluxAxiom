@@ -8,10 +8,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use fluxaxiom_contract::{AttemptStatus, EventBody, RunId, RunStatus, TerminalReason};
+use fluxaxiom_contract::{
+    AttemptOutcome, AttemptStatus, EventBody, RunId, RunStatus, TerminalReason,
+};
 use fluxaxiom_engine_api::{
-    ArtifactDraft, EngineAdapter, EngineDescriptor, EngineObservation, EngineOutcome,
-    EngineRunRequest, HostPort,
+    ArtifactDraft, BlobRef, EngineAdapter, EngineDescriptor, EngineObservation, EngineOutcome,
+    EngineRunRequest, FailureReason, HostPort,
 };
 use fluxaxiom_run_host::{HostError, RunHost};
 
@@ -84,6 +86,41 @@ impl EngineAdapter for ObserveAfterCancelEngine {
         })
         .expect("observation during Cancelling is accepted");
         EngineOutcome::Cancelled { partial: None }
+    }
+}
+
+/// 等取消意图提交后，再提交已计算出的耗尽诊断并交回失败，模拟收尾竞态。
+struct ExhaustionAfterCancelEngine;
+
+#[async_trait]
+impl EngineAdapter for ExhaustionAfterCancelEngine {
+    /// **作用**：与测试创建请求使用同一引擎身份。
+    /// **边界**：只是测试夹具，不调用模型。
+    fn descriptor(&self) -> EngineDescriptor {
+        EngineDescriptor {
+            engine_id: common::FAKE_ENGINE_ID.to_owned(),
+            version: common::FAKE_ENGINE_VERSION.to_owned(),
+        }
+    }
+
+    /// 在取消之后提交耗尽诊断，让 Host 判断最终状态。
+    ///
+    /// **作用**：验证非终态诊断不会覆盖已提交的取消意图。
+    /// **参数**：`_request` 不读取；`host` 提供当前 Run 的取消令牌、blob 与观测端口。
+    /// **边界**：等待取消后只提交诊断，不预留额度、不发模型或工具调用；失败结果带已有部分报告。
+    async fn run(&self, _request: EngineRunRequest, host: Arc<dyn HostPort>) -> EngineOutcome {
+        let record = Bytes::from_static(br#"{"spec":{"hard_limit":1},"estimate":{"tokens":2}}"#);
+        let context_ref = host.put_blob(record, "application/json").unwrap();
+        host.cancellation().cancelled().await;
+        host.observe(EngineObservation::ContextExhausted {
+            context_ref,
+            context_strategy: "identity@1".to_owned(),
+        })
+        .expect("diagnostic during Cancelling is accepted");
+        EngineOutcome::Failed {
+            reason: FailureReason::ContextExhausted,
+            partial: Some(ArtifactDraft::report("partial analysis")),
+        }
     }
 }
 
@@ -310,6 +347,91 @@ async fn observation_during_cancelling_is_recorded() {
         .position(|e| matches!(e.body, EventBody::ToolCallCompleted(_)))
         .expect("late tool.call_completed is recorded");
     assert!(cancelling < tool);
+}
+
+/// 耗尽诊断在 Cancelling 期间提交后仍可读回，但终态与 Attempt 均保持 Cancelled。
+#[tokio::test]
+async fn exhaustion_diagnostic_does_not_override_committed_cancellation() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = common::authorized_workspace(directory.path());
+    let host = RunHost::open(directory.path()).unwrap();
+    let created = host
+        .create_run(common::create_run("req_exhaustion_cancel", &workspace))
+        .unwrap();
+    let run_id = created.run.run_id.clone();
+    let drive_host = host.clone();
+    let drive_id = run_id.clone();
+    let drive = tokio::spawn(async move {
+        drive_host
+            .drive_run(&drive_id, &ExhaustionAfterCancelEngine)
+            .await
+    });
+    wait_for_status(&host, &run_id, RunStatus::Running).await;
+    host.request_cancel(&run_id).unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), drive)
+        .await
+        .expect("drive wakes up after cancel")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        outcome,
+        EngineOutcome::Cancelled {
+            partial: Some(ArtifactDraft::report("partial analysis")),
+        }
+    );
+    drop(host);
+
+    let reopened = RunHost::open(directory.path()).unwrap();
+    let run = reopened.get_run(&run_id).unwrap();
+    assert_eq!(run.status, RunStatus::Cancelled);
+    assert_eq!(run.terminal_reason, Some(TerminalReason::Cancelled));
+    let attempt = reopened.get_attempt(&created.attempt.attempt_id).unwrap();
+    assert_eq!(attempt.outcome, Some(AttemptOutcome::Cancelled));
+    assert_eq!(attempt.error_reason, None);
+    let events = reopened.events_after(&run_id, 0).unwrap();
+    let cancelling = events
+        .iter()
+        .position(|event| matches!(event.body, EventBody::RunCancelling(_)))
+        .unwrap();
+    let diagnostics: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event.body, EventBody::ContextExhausted(_)))
+        .collect();
+    assert_eq!(diagnostics.len(), 1);
+    let diagnostic = diagnostics[0];
+    assert!(events[cancelling].sequence < diagnostic.sequence);
+    assert_eq!(diagnostic.subject_id, created.attempt.attempt_id.as_str());
+    let EventBody::ContextExhausted(payload) = &diagnostic.body else {
+        unreachable!();
+    };
+    let record: serde_json::Value = serde_json::from_slice(
+        &reopened
+            .read_blob(&BlobRef::new(&payload.context_ref))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        record,
+        serde_json::json!({"spec":{"hard_limit":1},"estimate":{"tokens":2}})
+    );
+    assert!(matches!(
+        events.last().unwrap().body,
+        EventBody::RunCancelled(_)
+    ));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event.body, EventBody::RunFailed(_))));
+    let trace = reopened.trace(&run_id).unwrap();
+    assert_eq!(trace.totals.model_calls, 0);
+    assert_eq!(trace.totals.tool_calls, 0);
+    let artifacts = reopened.list_artifacts(&run_id).unwrap();
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(
+        reopened
+            .read_blob(&BlobRef::new(&artifacts[0].storage_ref))
+            .unwrap(),
+        b"partial analysis"
+    );
 }
 
 /// 同一进程里同一个 Run 不能同时有两个 drive。

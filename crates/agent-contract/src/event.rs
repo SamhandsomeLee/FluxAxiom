@@ -231,6 +231,37 @@ fn context_pair(
     }
 }
 
+/// 请求发送前因上下文耗尽而停止的诊断引用。
+///
+/// **作用**：Host 把失败的 prepare 记录关联到 Run 与当前 Attempt。
+/// **边界**：不是模型调用，也不是 Run 终态；只保存引用与策略名，不解析 context 记录。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextExhaustedPayload {
+    /// 已落盘的 context 记录引用。必需的非空字符串，不包含记录正文。
+    #[serde(deserialize_with = "nonempty_context_text")]
+    pub context_ref: String,
+    /// 记录使用的策略标识，例如 identity@1。必需的非空字符串；未知策略仍可读取。
+    #[serde(deserialize_with = "nonempty_context_text")]
+    pub context_strategy: String,
+}
+
+/// 读取一个必需的非空 context 引用或策略名。
+///
+/// **作用**：耗尽事件的两个字段不能缺席、为 null 或为空串。
+/// **参数**：`deserializer` 提供字段的字符串值；不在此验证引用格式和 blob 存在性。
+/// **边界**：错误消息不回显输入值。Host 写入时另外检查 blob 已落盘。
+fn nonempty_context_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let text = String::deserialize(deserializer)?;
+    if text.is_empty() {
+        return Err(de::Error::custom("context field must not be empty"));
+    }
+    Ok(text)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolCallCompletedPayload {
@@ -279,6 +310,8 @@ pub enum EventBody {
     AttemptOrphaned(AttemptOrphanedPayload),
     #[serde(rename = "model.call_completed")]
     ModelCallCompleted(ModelCallCompletedPayload),
+    #[serde(rename = "context.exhausted")]
+    ContextExhausted(ContextExhaustedPayload),
     #[serde(rename = "tool.call_completed")]
     ToolCallCompleted(ToolCallCompletedPayload),
     #[serde(rename = "artifact.created")]

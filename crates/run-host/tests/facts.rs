@@ -327,6 +327,13 @@ async fn context_fields_persist_as_a_pair_and_exhaustion_is_terminal() {
         })
         .collect();
     assert_eq!(models.len(), 2);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.body, EventBody::ContextExhausted(_)))
+            .count(),
+        1
+    );
     assert_eq!(models[0].context_ref, None);
     assert_eq!(models[0].context_strategy, None);
     let absent = serde_json::to_value(models[0]).unwrap();
@@ -427,6 +434,34 @@ impl EngineAdapter for ContextEngine {
                 Err(HostPortError::Invalid)
             );
         }
+        let diagnostic_ref = host
+            .put_blob(
+                bytes::Bytes::from_static(b"SENTINEL_CONTEXT_BODY"),
+                "application/json",
+            )
+            .unwrap();
+        for (context_ref, context_strategy) in [
+            (BlobRef::new(""), "identity@1"),
+            (BlobRef::new("not-a-blob-ref"), "identity@1"),
+            (
+                BlobRef::new(format!("sha256:{}", "0".repeat(64))),
+                "identity@1",
+            ),
+            (diagnostic_ref.clone(), ""),
+        ] {
+            assert_eq!(
+                host.observe(EngineObservation::ContextExhausted {
+                    context_ref,
+                    context_strategy: context_strategy.to_owned(),
+                }),
+                Err(HostPortError::Invalid)
+            );
+        }
+        host.observe(EngineObservation::ContextExhausted {
+            context_ref: diagnostic_ref,
+            context_strategy: "identity@1".to_owned(),
+        })
+        .expect("stored exhaustion diagnostic");
         EngineOutcome::Failed {
             reason: FailureReason::ContextExhausted,
             partial: Some(ArtifactDraft::report("partial report".to_owned())),

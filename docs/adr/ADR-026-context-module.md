@@ -51,9 +51,9 @@ EA-02 要求裁剪历史与工具返回，但 ADR-020 第 6 条规定“历史�
 
 6. **context 记录是独立 blob。** 结构归上下文模块所有，带自己的 `schema_version`，不进入 `agent-contract`。内容只有引用与数值：`profile_version`、`profile_hash`、策略链标识、`spec`、`estimate`（数值、来源 `usage` / `estimated`、锚点轮次）、`edits[]`（各策略自定义）、`replayable`。不含 prompt、工具正文或 `reasoning_content`。
 
-7. **事件与观测只加两个可选字段。** `EngineObservation::ModelCall` 与 `model.call_completed` 增加 `context_ref`、`context_strategy`。旧事件缺字段读出为 `None`，按恒等策略校验。
+7. **已发出调用与发送前耗尽分别关联记录。** `EngineObservation::ModelCall` 与 `model.call_completed` 增加 `context_ref`、`context_strategy` 两个可选字段。旧事件缺字段读出为 `None`，按恒等策略校验。2026-11-02 审查修订：`prepare` 在发送前拒绝请求时，Engine 先保存返回的 context 记录，再通过 `EngineObservation::ContextExhausted` 提交独立 `context.exhausted` 事件。该事件的 `context_ref`、`context_strategy` 必需且非空，Host 检查 blob 已落盘，以当前 Run/Attempt 关联事件，不解析记录内容。它表示一次失败的准备，不是模型调用或 Run 终态，不增加模型调用计数。旧二进制不认识新增事件，须升级后读取。
 
-8. **上下文耗尽是独立的终态原因。** `engine-api` 的 `FailureReason` 与 `agent-contract` 的 `TerminalReason` 各新增 `ContextExhausted`（线上为 `context_exhausted`）。不复用 `BudgetExhausted`，避免把上下文和调用预算重新绑在一起。具体是哪条策略、估算多少，写在 context 记录里。可带部分 Artifact，与预算耗尽一致。
+8. **上下文耗尽是独立的终态原因。** `engine-api` 的 `FailureReason` 与 `agent-contract` 的 `TerminalReason` 各新增 `ContextExhausted`（线上为 `context_exhausted`）。不复用 `BudgetExhausted`，避免把上下文和调用预算重新绑在一起。具体是哪条策略、估算多少，写在 context 记录里。可带部分 Artifact，与预算耗尽一致。发送前耗尽的记录经第 7 条的诊断事件保留；记录或诊断写失败按现有 Host 端口错误规则返回 `EngineError`，不静默丢失证据。Run 终态仍由 Host 根据 EngineOutcome 决定，已提交的取消意图仍优先；崩溃时已有诊断可保留，但不代替 Host 的租约与收尾规则。
 
 9. **版本号分开递增。** `prompt_layout_version` 只覆盖 system 与工具 schema；上下文策略变化递增 `context_strategy`；档案变化递增 `profile_version`。单次编辑是事实，记在 `edits[]`，不递增任何版本。
 
@@ -64,8 +64,8 @@ EA-02 要求裁剪历史与工具返回，但 ADR-020 第 6 条规定“历史�
     | 位置 | 改动 |
     | --- | --- |
     | `engine-custom` Loop | 每次模型调用前 `prepare`，序列化视图，写记录 blob；耗尽时返回 `ContextExhausted` |
-    | `engine-api` | `FailureReason::ContextExhausted`；`ModelCall` 观测两个可选字段 |
-    | `agent-contract` | `TerminalReason::ContextExhausted`；`ModelCallCompletedPayload` 两个可选字段；`event.schema.json` 与样例 |
+    | `engine-api` | `FailureReason::ContextExhausted`；`ModelCall` 观测两个可选字段；发送前失败的 `ContextExhausted` 诊断观测 |
+    | `agent-contract` | `TerminalReason::ContextExhausted`；`ModelCallCompletedPayload` 两个可选字段；`context.exhausted` 诊断事件；`event.schema.json` 与样例 |
     | `run-host` | 落库新增字段；新终态原因映射 |
     | `engine-custom::rebuild` | 规则 1、3 改为与 `replay` 结果逐字节比较 |
     | CLI `trace` / `sample export` | 显示 `context_strategy` 与估算值；样本保留两个字段 |

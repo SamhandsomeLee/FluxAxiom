@@ -63,7 +63,7 @@ impl DrivePort {
 
 #[async_trait]
 impl HostPort for DrivePort {
-    /// **作用**：校验观测并写入一条 `model.call_completed` 或 `tool.call_completed`。
+    /// **作用**：校验观测并写入一条模型、工具或 context.exhausted 诊断事件。
     /// **边界**：返回 `Ok` 时该 event 已 COMMIT。缺字段或 `byte_count` 对不上返回 `Invalid`，不写 event。
     /// 写失败返回 `Storage`，细节只进日志。
     fn observe(&self, observation: EngineObservation) -> Result<(), HostPortError> {
@@ -135,7 +135,7 @@ impl HostPort for DrivePort {
 
 /// 把一次观测写成 durable event。
 ///
-/// **作用**：在 Run 为 `Running` 或 `Cancelling`、Attempt 为 `Running` 时，用当前 Attempt 做 `subject_id` 写入一条模型或工具事件。
+/// **作用**：在 Run 为 `Running` 或 `Cancelling`、Attempt 为 `Running` 时，用当前 Attempt 做 `subject_id` 写入一条模型、工具或上下文耗尽诊断事件。
 /// **边界**：先校验再开 `BEGIN IMMEDIATE`。校验失败不写行。返回 `Ok` 时事务已提交。不发 `run.*` / `attempt.*`。
 /// `Cancelling` 也接受：被 Ctrl-C 打断的那次调用已经花了钱，Engine 收尾时提交的 `model.call_completed` / `tool.call_completed`
 /// 带着用量，丢掉会让已取消 Run 的事件日志和用量记账不完整。
