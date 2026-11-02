@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "apps/cli",
     "crates/agent-contract",
+    "crates/context",
     "crates/engine-api",
     "crates/run-host",
     "crates/engine-custom",

@@ -1,0 +1,150 @@
+# DeepSeek Flash 档案 v1。取值来自 EA-CTX 执行方案 §4（2026-10-30）。
+# 可信度为「未知」且没有 value 的字段保持未测，不补数。
+profile_version = 1
+
+[[fields]]
+name = "provider"
+value = "deepseek"
+credibility = "文档"
+source = "EA-CTX 执行方案 §4，2026-10-30"
+
+[[fields]]
+name = "alias"
+value = "deepseek-flash"
+credibility = "文档"
+source = "EA-CTX 执行方案 §4，2026-10-30"
+
+[[fields]]
+name = "doc_version"
+value = "V4.1-Flash-1017"
+credibility = "文档"
+source = "EA-CTX 执行方案 §4。doc_version 小表暂不合并"
+
+[[fields]]
+name = "context_window"
+value = "1048576"
+credibility = "文档"
+source = "EA-CTX 执行方案 §4，2026-10-30"
+
+[[fields]]
+name = "window_counts_output"
+value = "true"
+credibility = "未知"
+source = "EA-CTX 执行方案 §4 假设“是”。实测轮 T4 再替换"
+
+[[fields]]
+name = "max_output"
+value = "393216"
+credibility = "文档"
+source = "EA-CTX 执行方案 §4，2026-10-30"
+
+[[fields]]
+name = "reasoning_in_output"
+value = "true"
+credibility = "未知"
+source = "EA-CTX 执行方案 §4 假设“是”。实测轮 T4 再替换"
+
+[[fields]]
+name = "tokenizer"
+value = "offline_package_not_integrated"
+credibility = "文档"
+source = "EA-CTX 执行方案 §4：官方提供离线包，未接入。实测轮 T11 对照"
+
+[[fields]]
+name = "token_ratio_han"
+value = "0.6"
+credibility = "文档"
+source = "EA-CTX 执行方案 §4。实测轮 T8 复核前只用于汉字"
+
+[[fields]]
+name = "token_ratio_ascii_letter"
+value = "0.3"
+credibility = "文档"
+source = "EA-CTX 执行方案 §4。实测轮 T8 复核前只用于 ASCII 英文字母"
+
+[[fields]]
+name = "usage_fields"
+value = "prompt_tokens,completion_tokens,prompt_cache_hit_tokens,prompt_cache_miss_tokens"
+credibility = "实测"
+source = "P0 执行方案 §4.11 第 7 条：2026-10-26 真实 Run 的四项用量均已返回（prompt=11425 hit=8192 miss=3233 completion=2822）"
+
+[[fields]]
+name = "estimate_error"
+value = "0.30"
+credibility = "未知"
+uncalibrated = true
+source = "EA-CTX 执行方案 §4 临时 30%。T2 的 p99 出来后替换"
+
+[[fields]]
+name = "cache_ratio"
+value = "50"
+credibility = "文档"
+source = "EA-CTX 执行方案 §4，2026-10-30"
+
+[[fields]]
+name = "cache_mode"
+credibility = "未知"
+source = "EA-CTX 执行方案 §4 待核。不把「自动前缀」写成取值。实测轮 T3"
+
+[[fields]]
+name = "cache_granularity"
+credibility = "未知"
+source = "EA-CTX 执行方案 §4 无取值。实测轮 T3"
+
+[[fields]]
+name = "cache_ttl"
+credibility = "未知"
+source = "EA-CTX 执行方案 §4 无取值。实测轮 T3"
+
+[[fields]]
+name = "system_update"
+credibility = "未知"
+source = "EA-CTX 执行方案 §4：Chat Completions 未验证。实测轮 T5"
+
+[[fields]]
+name = "tool_update"
+credibility = "未知"
+source = "EA-CTX 执行方案 §4：Chat Completions 未验证。实测轮 T5"
+
+[[fields]]
+name = "effective_context"
+credibility = "未知"
+source = "EA-CTX 执行方案 §4 无取值。实测轮 T6"
+
+[[fields]]
+name = "context_awareness"
+credibility = "未知"
+source = "EA-CTX 执行方案 §4 无取值。实测轮 T9"
+
+[[fields]]
+name = "reasoning_passback"
+value = "pass_back_inside_tool_loop"
+credibility = "文档"
+source = "EA-CTX 执行方案 §4：带 tools 时工具循环内必须回传"
+
+[[fields]]
+name = "tool_pairing"
+value = "must_pair_placeholder_accepted"
+credibility = "假设"
+source = "EA-CTX 执行方案 §4。实测轮 T10 再验"
+
+[[fields]]
+name = "native_context_mgmt"
+value = "chat_completions_unconfirmed"
+credibility = "假设"
+source = "EA-CTX 执行方案 §4：Chat Completions 上未知有。实测轮 T11"
+
+[[fields]]
+name = "price_miss"
+credibility = "未知"
+source = "执行方案 §4 的 price_*。不写入单价。实测轮 T11 核对价格页"
+
+[[fields]]
+name = "price_hit"
+credibility = "未知"
+source = "执行方案 §4 的 price_*。不写入单价。实测轮 T11 核对价格页"
+
+[[fields]]
+name = "price_output"
+credibility = "未知"
+source = "执行方案 §4 的 price_*。不写入单价。实测轮 T11 核对价格页"

@@ -1,0 +1,12 @@
+[package]
+name = "fluxaxiom-context"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+fluxaxiom-contract = { path = "../agent-contract" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.8"
