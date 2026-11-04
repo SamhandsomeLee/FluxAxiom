@@ -1,6 +1,6 @@
-//! T0 未填充基线。完整请求对完整请求，各采样 5 次。
+//! T0 未填充基线，以及 T7 清空旧轮思维链后的采样。
 //!
-//! **作用**：测量 `mini-inventory` 第 1 次和第 5 次模型请求的自一致率。
+//! **作用**：测量 `mini-inventory` 第 1 次和第 5 次模型请求的自一致率。T7 只把第 5 次请求里 assistant 的 `reasoning_content` 改成空字符串。
 //! **边界**：不接 Engine，不写 Run、事件或档案。默认不拨号。stdout 不含 prompt、思维链、工具正文或密钥。
 
 use std::collections::BTreeMap;
@@ -257,6 +257,39 @@ fn decoy_fill(repeats: usize) -> String {
     DECOY_LINE.repeat(repeats)
 }
 
+/// 把已有 assistant 消息的思维链改成空字符串。
+///
+/// **作用**：T7 发送前只改这一处。
+/// **参数**：`request` 是已保存的 Chat Completions 请求。没有 `messages` 数组时返回 `None`。
+/// **边界**：键保留，值一律变成 `""`。不改 `content` 和 `tool_calls`。不打印原来的思维链。返回的个数是 assistant 消息条数。
+fn blank_assistant_reasoning(mut request: Value) -> Option<(Value, usize)> {
+    let messages = request.get_mut("messages")?.as_array_mut()?;
+    let mut count = 0usize;
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        message["reasoning_content"] = Value::String(String::new());
+        count += 1;
+    }
+    Some((request, count))
+}
+
+/// 第 5 次请求未填充基线的下一步。
+///
+/// **作用**：T7 的 5 次采样和它比较。
+/// **边界**：结束为假。工具是一次 `read_file`，路径是 `tests/inventory.rs`。不含思维链。
+fn k5_unfilled_baseline() -> Decision {
+    Decision {
+        ended: false,
+        tools: vec![(
+            "read_file".to_owned(),
+            "{path:\"tests/inventory.rs\",start_line:1}".to_owned(),
+        )],
+        paths: vec!["tests/inventory.rs".to_owned()],
+    }
+}
+
 /// 本机数据目录里的一条已保存请求。
 ///
 /// **作用**：找到要复放的 blob。
@@ -443,6 +476,44 @@ async fn unfilled_full_baseline_for_mini_inventory_k1() {
     sample_stored_request(REQUEST_K1_SHA256).await;
 }
 
+/// 清空思维链只改 assistant 的 `reasoning_content`。
+///
+/// **作用**：确认键还在、其他字段不动，且旧思维链不再出现在请求里。
+/// **边界**：不拨号。夹具里的思维链只用于断言它已被替换。
+#[test]
+fn blank_reasoning_keeps_the_key_and_other_fields() {
+    let request = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"},
+            {
+                "role": "assistant",
+                "content": "a",
+                "reasoning_content": "secret-chain",
+                "tool_calls": [{
+                    "id": "c",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "c", "content": "body"},
+            {"role": "assistant", "content": ""}
+        ]
+    });
+    let (cleared, count) = blank_assistant_reasoning(request).expect("messages");
+    assert_eq!(count, 2);
+    assert_eq!(cleared["messages"][2]["reasoning_content"], "");
+    assert_eq!(cleared["messages"][2]["content"], "a");
+    assert_eq!(cleared["messages"][2]["tool_calls"][0]["id"], "c");
+    assert_eq!(cleared["messages"][3]["content"], "body");
+    assert_eq!(cleared["messages"][4]["reasoning_content"], "");
+    assert!(!cleared.to_string().contains("secret-chain"));
+    assert_eq!(
+        normalized_arguments(r#"{"start_line":1,"path":"tests/inventory.rs"}"#),
+        k5_unfilled_baseline().tools[0].1
+    );
+}
+
 /// 第 5 次请求的未填充完整对完整基线。默认不跑。
 ///
 /// **作用**：同一条已保存请求采样 5 次，打印签名、一致率和方差。
@@ -451,6 +522,97 @@ async fn unfilled_full_baseline_for_mini_inventory_k1() {
 #[ignore = "dials api.deepseek.com when DEEPSEEK_API_KEY and the local request blob are present"]
 async fn unfilled_full_baseline_for_mini_inventory_k5() {
     sample_stored_request(REQUEST_K5_SHA256).await;
+}
+
+/// 清空第 5 次请求的旧轮思维链后再采样。默认不跑。
+///
+/// **作用**：先发一次。完成则把它算进 5 次，并和未填充基线比较。
+/// **边界**：没有密钥或没有本机 blob 时直接返回。第一次没有完成就停，不再采样。不写 Run。stdout 不含思维链。
+#[tokio::test]
+#[ignore = "dials api.deepseek.com when DEEPSEEK_API_KEY and the local request blob are present"]
+async fn cleared_reasoning_for_mini_inventory_k5() {
+    if std::env::var(API_KEY_ENV)
+        .ok()
+        .filter(|key| !key.is_empty())
+        .is_none()
+    {
+        println!("skipped reason=missing_key");
+        return;
+    }
+    let Some(request) = stored_request(REQUEST_K5_SHA256) else {
+        println!("skipped reason=missing_request");
+        return;
+    };
+    let Some((request, cleared)) = blank_assistant_reasoning(request) else {
+        println!("skipped reason=missing_messages");
+        return;
+    };
+    println!("assistant_cleared={cleared}");
+    if cleared == 0 {
+        println!("stopped reason=no_assistant");
+        return;
+    }
+    let mut client = DeepSeekClient::from_env().expect("key checked above");
+    let cancel = CancellationToken::new();
+    let baseline = k5_unfilled_baseline();
+    let mut decisions = Vec::new();
+    for index in 1..=SAMPLES {
+        match client.round(&request, &cancel).await {
+            Ok(Round::Completed(completion)) => {
+                let decision = decision_of(&completion);
+                let matched = decision == baseline;
+                println!(
+                    "sample={index} finish={} prompt_tokens={} match_baseline={}",
+                    finish_label(&completion.finish_reason),
+                    prompt_label(completion.usage.prompt_tokens),
+                    if matched { "yes" } else { "no" }
+                );
+                print_decision(index, &decision);
+                decisions.push(decision);
+            }
+            Ok(Round::Status { status, .. }) => {
+                println!("sample={index} http={status}");
+                println!("stopped reason=not_completed sample={index}");
+                return;
+            }
+            Ok(Round::Interrupted) => {
+                println!("sample={index} http=interrupted");
+                println!("stopped reason=not_completed sample={index}");
+                return;
+            }
+            Ok(Round::Cancelled) => {
+                println!("sample={index} http=cancelled");
+                println!("stopped reason=not_completed sample={index}");
+                return;
+            }
+            Ok(Round::InvalidToolArguments { .. }) => {
+                println!("sample={index} http=invalid_tool_arguments");
+                println!("stopped reason=not_completed sample={index}");
+                return;
+            }
+            Ok(Round::MalformedToolCall { .. }) => {
+                println!("sample={index} http=malformed_tool_call");
+                println!("stopped reason=not_completed sample={index}");
+                return;
+            }
+            Err(_) => {
+                println!("sample={index} http=error");
+                println!("stopped reason=not_completed sample={index}");
+                return;
+            }
+        }
+    }
+    let matched = decisions
+        .iter()
+        .filter(|decision| *decision == &baseline)
+        .count();
+    let equivalence = matched as f64 / SAMPLES as f64;
+    let rate = pairwise_agreement(&decisions).expect("five samples");
+    let variance = mode_match_variance(&decisions).expect("five samples");
+    println!(
+        "n={SAMPLES} agree_rate={rate} variance={variance} equivalence={equivalence} loss={}",
+        1.0 - equivalence
+    );
 }
 
 /// 汉字填充只加在第一条 user 末尾。
