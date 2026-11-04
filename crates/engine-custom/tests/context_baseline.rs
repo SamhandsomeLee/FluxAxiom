@@ -1,6 +1,6 @@
 //! T0 未填充基线，以及 T7 清空旧轮思维链后的采样。
 //!
-//! **作用**：测量 `mini-inventory` 第 1 次和第 5 次模型请求的自一致率。T7 只把第 5 次请求里 assistant 的 `reasoning_content` 改成空字符串。
+//! **作用**：测量 `mini-inventory` 第 1 次和第 5 次模型请求的自一致率。T7 只把第 5 次请求里 assistant 的 `reasoning_content` 改成空字符串。T9 只在第 5 次请求的第一条 user 末尾声明剩余空间远小于窗口。
 //! **边界**：不接 Engine，不写 Run、事件或档案。默认不拨号。stdout 不含 prompt、思维链、工具正文或密钥。
 
 use std::collections::BTreeMap;
@@ -288,6 +288,31 @@ fn k5_unfilled_baseline() -> Decision {
         )],
         paths: vec!["tests/inventory.rs".to_owned()],
     }
+}
+
+/// 加在第一条 user 末尾的一句剩余空间说明。
+const REMAINING_NOTICE: &str = "\n剩余空间远小于上下文窗口。";
+
+/// 正文或思维链是否提到剩余空间。
+///
+/// **作用**：T9 只把判断写成 yes 或 no。
+/// **参数**：`completion` 是一次成功响应。`content` 和 `reasoning` 都检查。
+/// **边界**：出现「剩余空间」或 “remaining context” 才算提到。不返回原文。
+fn mentions_remaining_space(completion: &ChatCompletion) -> bool {
+    observed_mentions(&completion.content) || observed_mentions(&completion.reasoning)
+}
+
+/// 一段观测文本是否提到剩余空间。
+///
+/// **作用**：[`mentions_remaining_space`] 对正文和思维链各查一次。
+/// **参数**：`text` 是响应里的一段文本。`Absent` 和 `Empty` 不算提到。
+/// **边界**：英文按小写比较。不把这段文本交回调用方。
+fn observed_mentions(text: &ObservedText) -> bool {
+    let ObservedText::Text(text) = text else {
+        return false;
+    };
+    let lower = text.to_lowercase();
+    lower.contains("剩余空间") || lower.contains("remaining context")
 }
 
 /// 本机数据目录里的一条已保存请求。
@@ -611,6 +636,138 @@ async fn cleared_reasoning_for_mini_inventory_k5() {
     let variance = mode_match_variance(&decisions).expect("five samples");
     println!(
         "n={SAMPLES} agree_rate={rate} variance={variance} equivalence={equivalence} loss={}",
+        1.0 - equivalence
+    );
+}
+
+/// 剩余空间说明只加在第一条 user 末尾，判断不泄露原文。
+///
+/// **作用**：锁住 T9 的改动位置和提到与否的规则。
+/// **边界**：不拨号。夹具文本只留在断言里。
+#[test]
+fn remaining_notice_appends_only_the_first_user() {
+    let request = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"},
+            {"role": "user", "content": "later"}
+        ]
+    });
+    let noticed = append_text_to_first_user(request, REMAINING_NOTICE).expect("user message");
+    assert_eq!(
+        noticed["messages"][1]["content"],
+        format!("u{REMAINING_NOTICE}")
+    );
+    assert_eq!(noticed["messages"][2]["content"], "later");
+    assert!(mentions_remaining_space(&ChatCompletion {
+        reasoning: ObservedText::Absent,
+        content: ObservedText::Text("剩余空间不够".to_owned()),
+        tool_calls: Vec::new(),
+        finish_reason: FinishReason::Stop,
+        usage: fluxaxiom_engine_custom::ModelUsage {
+            prompt_tokens: TokenCount::Unknown,
+            completion_tokens: TokenCount::Unknown,
+            prompt_cache_hit_tokens: TokenCount::Unknown,
+            prompt_cache_miss_tokens: TokenCount::Unknown,
+        },
+    }));
+    assert!(observed_mentions(&ObservedText::Text(
+        "The remaining context is small".to_owned()
+    )));
+    assert!(!observed_mentions(&ObservedText::Text(
+        "read the file".to_owned()
+    )));
+    assert!(!observed_mentions(&ObservedText::Absent));
+}
+
+/// 第 5 次请求声明剩余空间远小于窗口后再采样。默认不跑。
+///
+/// **作用**：不重测未填充基线。5 次采样和它比较，并记录是否提到剩余空间。
+/// **边界**：没有密钥、没有本机 blob 或找不到 user 时直接返回。第一次没有完成就停。不写 Run。stdout 不含正文和思维链。
+#[tokio::test]
+#[ignore = "dials api.deepseek.com when DEEPSEEK_API_KEY and the local request blob are present"]
+async fn remaining_space_notice_for_mini_inventory_k5() {
+    if std::env::var(API_KEY_ENV)
+        .ok()
+        .filter(|key| !key.is_empty())
+        .is_none()
+    {
+        println!("skipped reason=missing_key");
+        return;
+    }
+    let Some(request) = stored_request(REQUEST_K5_SHA256) else {
+        println!("skipped reason=missing_request");
+        return;
+    };
+    let Some(request) = append_text_to_first_user(request, REMAINING_NOTICE) else {
+        println!("skipped reason=missing_user");
+        return;
+    };
+    let mut client = DeepSeekClient::from_env().expect("key checked above");
+    let cancel = CancellationToken::new();
+    let baseline = k5_unfilled_baseline();
+    let mut decisions = Vec::new();
+    let mut mentioned = 0usize;
+    for index in 1..=SAMPLES {
+        match client.round(&request, &cancel).await {
+            Ok(Round::Completed(completion)) => {
+                let decision = decision_of(&completion);
+                let matched = decision == baseline;
+                let says = mentions_remaining_space(&completion);
+                if says {
+                    mentioned += 1;
+                }
+                println!(
+                    "sample={index} finish={} prompt_tokens={} match_baseline={} mentioned={}",
+                    finish_label(&completion.finish_reason),
+                    prompt_label(completion.usage.prompt_tokens),
+                    if matched { "yes" } else { "no" },
+                    if says { "yes" } else { "no" }
+                );
+                print_decision(index, &decision);
+                decisions.push(decision);
+            }
+            Ok(Round::Status { status, .. }) => {
+                println!("sample={index} http={status}");
+                println!("stopped reason=not_completed sample={index}");
+                return;
+            }
+            Ok(Round::Interrupted) => {
+                println!("sample={index} http=interrupted");
+                println!("stopped reason=not_completed sample={index}");
+                return;
+            }
+            Ok(Round::Cancelled) => {
+                println!("sample={index} http=cancelled");
+                println!("stopped reason=not_completed sample={index}");
+                return;
+            }
+            Ok(Round::InvalidToolArguments { .. }) => {
+                println!("sample={index} http=invalid_tool_arguments");
+                println!("stopped reason=not_completed sample={index}");
+                return;
+            }
+            Ok(Round::MalformedToolCall { .. }) => {
+                println!("sample={index} http=malformed_tool_call");
+                println!("stopped reason=not_completed sample={index}");
+                return;
+            }
+            Err(_) => {
+                println!("sample={index} http=error");
+                println!("stopped reason=not_completed sample={index}");
+                return;
+            }
+        }
+    }
+    let matched = decisions
+        .iter()
+        .filter(|decision| *decision == &baseline)
+        .count();
+    let equivalence = matched as f64 / SAMPLES as f64;
+    let rate = pairwise_agreement(&decisions).expect("five samples");
+    let variance = mode_match_variance(&decisions).expect("five samples");
+    println!(
+        "n={SAMPLES} agree_rate={rate} variance={variance} equivalence={equivalence} loss={} mentioned={mentioned}",
         1.0 - equivalence
     );
 }
