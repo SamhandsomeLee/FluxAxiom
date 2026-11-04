@@ -1,6 +1,6 @@
 //! T0 未填充基线。完整请求对完整请求，各采样 5 次。
 //!
-//! **作用**：测量 `mini-inventory` 第 1 次模型请求的自一致率。
+//! **作用**：测量 `mini-inventory` 第 1 次和第 5 次模型请求的自一致率。
 //! **边界**：不接 Engine，不写 Run、事件或档案。默认不拨号。stdout 不含 prompt、思维链、工具正文或密钥。
 
 use std::collections::BTreeMap;
@@ -12,8 +12,11 @@ use fluxaxiom_engine_custom::{
 };
 use serde_json::Value;
 
-/// 这次基线复用的请求 blob。来自 2026-10-26 的 Run，k = 1。
-const REQUEST_SHA256: &str = "f48efa04c0446c5ecae4b5d9de2397f5c3cbb93430c184d975f69e88dd11ad97";
+/// 第 1 次请求的 blob。来自 2026-10-26 的 Run。
+const REQUEST_K1_SHA256: &str = "f48efa04c0446c5ecae4b5d9de2397f5c3cbb93430c184d975f69e88dd11ad97";
+
+/// 第 5 次请求的 blob。来自同一次 Run。当时的下一步是一次 `read_file`。
+const REQUEST_K5_SHA256: &str = "005b4e4c7a92b174f62b889d01ffa9c33815af4a880e46ab329fa26e3aebb7cc";
 
 /// 同一条完整请求的采样次数。
 const SAMPLES: usize = 5;
@@ -215,20 +218,94 @@ fn print_decision(index: usize, decision: &Decision) {
     );
 }
 
-/// 本机数据目录里的第 1 次请求。
+/// 本机数据目录里的一条已保存请求。
 ///
 /// **作用**：找到要复放的 blob。
+/// **参数**：`sha256` 是请求 blob 的十六进制，64 位，不含 `sha256:` 前缀。短于 4 位时返回 `None`。
 /// **边界**：文件不在时返回 `None`。不创建目录，不读数据库。
-fn stored_request() -> Option<Value> {
+fn stored_request(sha256: &str) -> Option<Value> {
+    if sha256.len() < 4 {
+        return None;
+    }
     let root = std::env::var_os("LOCALAPPDATA")?;
     let mut path = PathBuf::from(root);
     path.push("FluxAxiom");
     path.push("blobs");
-    path.push(&REQUEST_SHA256[..2]);
-    path.push(&REQUEST_SHA256[2..4]);
-    path.push(REQUEST_SHA256);
+    path.push(&sha256[..2]);
+    path.push(&sha256[2..4]);
+    path.push(sha256);
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+/// 对一条已保存请求采样 5 次并打印自一致率。
+///
+/// **作用**：第 1 次和第 5 次请求共用采样和签名规则。
+/// **参数**：`sha256` 选择本机 blob。没有密钥或不存在时只打印跳过原因。
+/// **边界**：不写 Run。失败只打印类别，不打印响应摘要。某一次失败时不计算一致率。
+async fn sample_stored_request(sha256: &str) {
+    if std::env::var(API_KEY_ENV)
+        .ok()
+        .filter(|key| !key.is_empty())
+        .is_none()
+    {
+        println!("skipped reason=missing_key");
+        return;
+    }
+    let Some(request) = stored_request(sha256) else {
+        println!("skipped reason=missing_request");
+        return;
+    };
+    let mut client = DeepSeekClient::from_env().expect("key checked above");
+    let cancel = CancellationToken::new();
+    let mut decisions = Vec::new();
+    for index in 1..=SAMPLES {
+        match client.round(&request, &cancel).await {
+            Ok(Round::Completed(completion)) => {
+                println!(
+                    "sample={index} finish={}",
+                    finish_label(&completion.finish_reason)
+                );
+                let decision = decision_of(&completion);
+                print_decision(index, &decision);
+                decisions.push(decision);
+            }
+            Ok(Round::Status { status, .. }) => {
+                println!("sample={index} http={status}");
+                return;
+            }
+            Ok(Round::Interrupted) => {
+                println!("sample={index} http=interrupted");
+                return;
+            }
+            Ok(Round::Cancelled) => {
+                println!("sample={index} http=cancelled");
+                return;
+            }
+            Ok(Round::InvalidToolArguments { .. }) => {
+                println!("sample={index} http=invalid_tool_arguments");
+                return;
+            }
+            Ok(Round::MalformedToolCall { .. }) => {
+                println!("sample={index} http=malformed_tool_call");
+                return;
+            }
+            Err(_) => {
+                println!("sample={index} http=error");
+                return;
+            }
+        }
+    }
+    let rate = pairwise_agreement(&decisions).expect("five samples");
+    let variance = mode_match_variance(&decisions).expect("five samples");
+    let mut distinct = decisions.clone();
+    distinct.sort();
+    distinct.dedup();
+    println!(
+        "n={SAMPLES} pairs={} agree_rate={rate} variance={variance} distinct={}",
+        SAMPLES * (SAMPLES - 1) / 2,
+        distinct.len()
+    );
 }
 
 /// 结束原因的短名字。
@@ -294,66 +371,15 @@ fn one_agreeing_pair_has_the_pair_rate() {
 #[tokio::test]
 #[ignore = "dials api.deepseek.com when DEEPSEEK_API_KEY and the local request blob are present"]
 async fn unfilled_full_baseline_for_mini_inventory_k1() {
-    if std::env::var(API_KEY_ENV)
-        .ok()
-        .filter(|key| !key.is_empty())
-        .is_none()
-    {
-        println!("skipped reason=missing_key");
-        return;
-    }
-    let Some(request) = stored_request() else {
-        println!("skipped reason=missing_request");
-        return;
-    };
-    let mut client = DeepSeekClient::from_env().expect("key checked above");
-    let cancel = CancellationToken::new();
-    let mut decisions = Vec::new();
-    for index in 1..=SAMPLES {
-        match client.round(&request, &cancel).await {
-            Ok(Round::Completed(completion)) => {
-                println!(
-                    "sample={index} finish={}",
-                    finish_label(&completion.finish_reason)
-                );
-                let decision = decision_of(&completion);
-                print_decision(index, &decision);
-                decisions.push(decision);
-            }
-            Ok(Round::Status { status, .. }) => {
-                println!("sample={index} http={status}");
-                return;
-            }
-            Ok(Round::Interrupted) => {
-                println!("sample={index} http=interrupted");
-                return;
-            }
-            Ok(Round::Cancelled) => {
-                println!("sample={index} http=cancelled");
-                return;
-            }
-            Ok(Round::InvalidToolArguments { .. }) => {
-                println!("sample={index} http=invalid_tool_arguments");
-                return;
-            }
-            Ok(Round::MalformedToolCall { .. }) => {
-                println!("sample={index} http=malformed_tool_call");
-                return;
-            }
-            Err(_) => {
-                println!("sample={index} http=error");
-                return;
-            }
-        }
-    }
-    let rate = pairwise_agreement(&decisions).expect("five samples");
-    let variance = mode_match_variance(&decisions).expect("five samples");
-    let mut distinct = decisions.clone();
-    distinct.sort();
-    distinct.dedup();
-    println!(
-        "n={SAMPLES} pairs={} agree_rate={rate} variance={variance} distinct={}",
-        SAMPLES * (SAMPLES - 1) / 2,
-        distinct.len()
-    );
+    sample_stored_request(REQUEST_K1_SHA256).await;
+}
+
+/// 第 5 次请求的未填充完整对完整基线。默认不跑。
+///
+/// **作用**：同一条已保存请求采样 5 次，打印签名、一致率和方差。
+/// **边界**：没有密钥、没有本机 blob 时直接返回。不写 Run。不重测第 1 次请求。
+#[tokio::test]
+#[ignore = "dials api.deepseek.com when DEEPSEEK_API_KEY and the local request blob are present"]
+async fn unfilled_full_baseline_for_mini_inventory_k5() {
+    sample_stored_request(REQUEST_K5_SHA256).await;
 }
