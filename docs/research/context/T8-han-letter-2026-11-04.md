@@ -1,6 +1,6 @@
 # T8 记录：汉字与英文字母
 
-核对日期：2026-11-04。只覆盖 `ProbeClass::Han` 与 `ProbeClass::Letter`。数字、空白、标点、源代码切片和整段相加尚未测量，保持未知。
+核对日期：2026-11-04。只覆盖 `ProbeClass::Han` 与 `ProbeClass::Letter`。数字、空格、英文句点和中文逗号见 `T8-digit-space-punct-2026-11-04.md`。源代码切片和整段相加尚未测量，保持未知。
 
 ## 方法
 
