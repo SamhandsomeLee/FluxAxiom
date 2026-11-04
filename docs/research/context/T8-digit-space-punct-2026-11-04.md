@@ -1,6 +1,6 @@
 # T8 记录：数字、空格与标点
 
-核对日期：2026-11-04。只覆盖 `ProbeClass::Digit`、`ProbeClass::Space`、`ProbeClass::AsciiPunct` 与 `ProbeClass::HanPunct`。换行、其他空白、其他标点、源代码切片和整段相加尚未测量，保持未知。
+核对日期：2026-11-04。只覆盖 `ProbeClass::Digit`、`ProbeClass::Space`、`ProbeClass::AsciiPunct` 与 `ProbeClass::HanPunct`。关键字、数字与下划线、运算符和空格加换行见 `T8-source-units-2026-11-04.md`。字符串字面量、注释、完整函数、JSON、其他空白、其他标点和整段相加尚未测量，保持未知。
 
 ## 方法
 

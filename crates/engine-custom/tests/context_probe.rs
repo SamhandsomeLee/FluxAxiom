@@ -1,7 +1,7 @@
 //! T8 探针的离线比例计算。
 //!
 //! **作用**：把两次 `prompt_tokens` 换成比例，并判断 200 字与 2000 字两档是否稳定。也生成固定类别的探针正文。
-//! **边界**：默认测试不发网络请求，不写 Run、事件或档案。文件末尾的 `#[ignore]` 测试只在显式 `--ignored` 时拨号。数字、空格和标点与汉字、字母分开实调。
+//! **边界**：默认测试不发网络请求，不写 Run、事件或档案。文件末尾的 `#[ignore]` 测试只在显式 `--ignored` 时拨号。数字、空格、标点和源代码切片分开实调。
 
 use fluxaxiom_contract::TokenCount;
 use fluxaxiom_engine_custom::{
@@ -70,6 +70,38 @@ fn probe_text(class: ProbeClass, chars: usize) -> String {
         ProbeClass::HanPunct => "，",
     };
     unit.repeat(chars)
+}
+
+/// 源代码切片重复哪一个双字符单元。
+///
+/// **作用**：把前四片固定成关键字、数字与下划线、运算符和空白换行。
+/// **边界**：不含字符串字面量、注释、完整函数或 JSON。单元正文由 [`slice_text`] 决定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SliceClass {
+    /// 重复 ASCII 关键字 `fn`。不含数字或下划线。
+    Keyword,
+    /// 重复 `1_`。数字和下划线各占一个标量。
+    DigitUnderscore,
+    /// 重复 `+;`。加号是运算符，分号是分隔符。
+    Operator,
+    /// 重复空格 U+0020 加换行 U+000A。不含制表符或其他空白。
+    SpaceNewline,
+}
+
+/// 生成正好 `chars` 个标量的切片正文。
+///
+/// **作用**：供 200 字和 2000 字两档使用。调用方拥有返回的字符串，并可以追加到 user 末尾。
+/// **参数**：`class` 选择重复哪一个双字符单元。`chars` 是 Unicode 标量个数，必须是 2 的倍数，0 返回空串。
+/// **边界**：结果由该单元整段重复组成，末尾换行也保留。不发请求，不计算比例。
+fn slice_text(class: SliceClass, chars: usize) -> String {
+    let unit = match class {
+        SliceClass::Keyword => "fn",
+        SliceClass::DigitUnderscore => "1_",
+        SliceClass::Operator => "+;",
+        SliceClass::SpaceNewline => " \n",
+    };
+    assert!(chars.is_multiple_of(unit.chars().count()));
+    unit.repeat(chars / unit.chars().count())
 }
 
 /// 比较 200 字与 2000 字两档比例的相对差。
@@ -210,6 +242,78 @@ fn han_punct_probe_counts_one_scalar_per_comma() {
     assert!(text.chars().all(|ch| ch == '，'));
     assert!(!text.contains(','));
     assert_eq!(probe_text(ProbeClass::HanPunct, 2000).chars().count(), 2000);
+}
+
+/// 关键字切片的字数等于参数，并且只含 `fn`。
+///
+/// **作用**：锁住 `Keyword` 重复的是 `fn`。
+/// **边界**：不访问网络。不含数字或下划线。
+#[test]
+fn keyword_slice_repeats_fn() {
+    let text = slice_text(SliceClass::Keyword, 200);
+    assert_eq!(text.chars().count(), 200);
+    assert!(text
+        .chars()
+        .enumerate()
+        .all(|(index, ch)| ch == if index.is_multiple_of(2) { 'f' } else { 'n' }));
+    assert_eq!(slice_text(SliceClass::Keyword, 2000).chars().count(), 2000);
+    assert_eq!(slice_text(SliceClass::Keyword, 0).chars().count(), 0);
+}
+
+/// 数字与下划线切片的字数等于参数。
+///
+/// **作用**：锁住 `DigitUnderscore` 重复的是 `1_`。
+/// **边界**：不访问网络。不含字母。
+#[test]
+fn digit_underscore_slice_repeats_one_and_underscore() {
+    let text = slice_text(SliceClass::DigitUnderscore, 200);
+    assert_eq!(text.chars().count(), 200);
+    assert!(text
+        .chars()
+        .enumerate()
+        .all(|(index, ch)| { ch == if index.is_multiple_of(2) { '1' } else { '_' } }));
+    assert!(!text.chars().any(|ch| ch.is_ascii_alphabetic()));
+    assert_eq!(
+        slice_text(SliceClass::DigitUnderscore, 2000)
+            .chars()
+            .count(),
+        2000
+    );
+}
+
+/// 运算符切片的字数等于参数，并且只含 `+;`。
+///
+/// **作用**：锁住 `Operator` 重复的是加号和分号。
+/// **边界**：不访问网络。不含字母、数字或空白。
+#[test]
+fn operator_slice_repeats_plus_and_semicolon() {
+    let text = slice_text(SliceClass::Operator, 200);
+    assert_eq!(text.chars().count(), 200);
+    assert!(text
+        .chars()
+        .enumerate()
+        .all(|(index, ch)| ch == if index.is_multiple_of(2) { '+' } else { ';' }));
+    assert_eq!(slice_text(SliceClass::Operator, 2000).chars().count(), 2000);
+}
+
+/// 空白换行切片的字数等于参数，并且保留末尾换行。
+///
+/// **作用**：锁住 `SpaceNewline` 交替重复空格和换行。
+/// **边界**：不访问网络。不去掉末尾换行，也不把制表符算进这一类。
+#[test]
+fn space_newline_slice_keeps_trailing_newline() {
+    let text = slice_text(SliceClass::SpaceNewline, 200);
+    assert_eq!(text.chars().count(), 200);
+    assert!(text
+        .chars()
+        .enumerate()
+        .all(|(index, ch)| ch == if index.is_multiple_of(2) { ' ' } else { '\n' }));
+    assert!(text.ends_with('\n'));
+    assert!(!text.contains('\t'));
+    assert_eq!(
+        slice_text(SliceClass::SpaceNewline, 2000).chars().count(),
+        2000
+    );
 }
 
 /// 四组两档比例覆盖稳定、全 0、门槛和超门槛。
@@ -427,6 +531,49 @@ async fn live_digit_space_punct_when_deepseek_client_response() {
             ),
             ("han_punct", 200, probe_text(ProbeClass::HanPunct, 200)),
             ("han_punct", 2000, probe_text(ProbeClass::HanPunct, 2000)),
+        ],
+    )
+    .await;
+}
+
+/// 四片源代码切片各两档的实调。默认不跑。
+///
+/// **作用**：沿用同一条前缀，只追加关键字、数字与下划线、运算符、空格加换行。
+/// **边界**：不重测已有字符类。没有密钥时不拨号。不写 Run、档案或记录文件。stdout 不含探针正文和密钥。
+#[tokio::test]
+#[ignore = "dials api.deepseek.com when DEEPSEEK_API_KEY is set"]
+async fn live_source_slices_when_deepseek_client_response() {
+    let Some((mut client, prompt_before)) = live_shared_prefix().await else {
+        return;
+    };
+    live_probes(
+        &mut client,
+        prompt_before,
+        vec![
+            ("keyword", 200, slice_text(SliceClass::Keyword, 200)),
+            ("keyword", 2000, slice_text(SliceClass::Keyword, 2000)),
+            (
+                "digit_underscore",
+                200,
+                slice_text(SliceClass::DigitUnderscore, 200),
+            ),
+            (
+                "digit_underscore",
+                2000,
+                slice_text(SliceClass::DigitUnderscore, 2000),
+            ),
+            ("operator", 200, slice_text(SliceClass::Operator, 200)),
+            ("operator", 2000, slice_text(SliceClass::Operator, 2000)),
+            (
+                "space_newline",
+                200,
+                slice_text(SliceClass::SpaceNewline, 200),
+            ),
+            (
+                "space_newline",
+                2000,
+                slice_text(SliceClass::SpaceNewline, 2000),
+            ),
         ],
     )
     .await;
