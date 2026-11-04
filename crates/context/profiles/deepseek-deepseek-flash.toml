@@ -29,8 +29,8 @@ source = "EA-CTX 执行方案 §4，2026-10-30"
 [[fields]]
 name = "window_counts_output"
 value = "true"
-credibility = "未知"
-source = "EA-CTX 执行方案 §4 假设“是”。实测轮 T4 再替换"
+credibility = "文档"
+source = "T4-docs-2026-11-04：获取模型列表写明上下文窗口合计输入与输出 token。取值仍是 true"
 
 [[fields]]
 name = "max_output"
@@ -42,7 +42,7 @@ source = "EA-CTX 执行方案 §4，2026-10-30"
 name = "reasoning_in_output"
 value = "true"
 credibility = "未知"
-source = "EA-CTX 执行方案 §4 假设“是”。实测轮 T4 再替换"
+source = "T4-docs-2026-11-04：没有直接句子说明思维链计入 max_tokens。取值仍是假设的 true"
 
 [[fields]]
 name = "tokenizer"
@@ -102,37 +102,37 @@ source = "EA-CTX 执行方案 §4，2026-10-30"
 [[fields]]
 name = "cache_mode"
 credibility = "未知"
-source = "EA-CTX 执行方案 §4 待核。不把「自动前缀」写成取值。实测轮 T3"
+source = "T3-cache-2026-11-04：1 分钟和 5 分钟重发出现命中，请求没有断点字段。15 与 60 未测，不写取值"
 
 [[fields]]
 name = "cache_granularity"
 credibility = "未知"
-source = "EA-CTX 执行方案 §4 无取值。实测轮 T3"
+source = "T3-cache-2026-11-04：截断步长 1024，看不出更小跳变。不写取值"
 
 [[fields]]
 name = "cache_ttl"
 credibility = "未知"
-source = "EA-CTX 执行方案 §4 无取值。实测轮 T3"
+source = "T3-cache-2026-11-04：5 分钟仍命中。15 与 60 未测，不写取值"
 
 [[fields]]
 name = "system_update"
 credibility = "未知"
-source = "EA-CTX 执行方案 §4：Chat Completions 未验证。实测轮 T5"
+source = "T5-update-2026-11-04：末尾追加的 system 被遵循，原前缀仍命中。不写取值"
 
 [[fields]]
 name = "tool_update"
 credibility = "未知"
-source = "EA-CTX 执行方案 §4：Chat Completions 未验证。实测轮 T5"
+source = "T5-update-2026-11-04：追加的工具被调用。那次命中是 0，看不出是否打断已有命中。不写取值"
 
 [[fields]]
 name = "effective_context"
 credibility = "未知"
-source = "EA-CTX 执行方案 §4 无取值。实测轮 T6"
+source = "T6-effective-context-2026-11-04：mini-inventory-k5 到 512K 没有下降点。不写取值"
 
 [[fields]]
 name = "context_awareness"
 credibility = "未知"
-source = "EA-CTX 执行方案 §4 无取值。实测轮 T9"
+source = "T9-awareness-2026-11-04：声明剩余空间远小于窗口后下一步不变，模型也没提到。不写取值"
 
 [[fields]]
 name = "reasoning_passback"
@@ -143,26 +143,26 @@ source = "EA-CTX 执行方案 §4：带 tools 时工具循环内必须回传"
 [[fields]]
 name = "tool_pairing"
 value = "must_pair_placeholder_accepted"
-credibility = "假设"
-source = "EA-CTX 执行方案 §4。实测轮 T10 再验"
+credibility = "实测"
+source = "T10-tool-pairing-2026-11-04：成对占位被接受，缺 tool 消息和错配 id 均为 400"
 
 [[fields]]
 name = "native_context_mgmt"
 value = "chat_completions_unconfirmed"
 credibility = "假设"
-source = "EA-CTX 执行方案 §4：Chat Completions 上未知有。实测轮 T11"
+source = "T11-docs-2026-11-04：Chat Completions 参数表没有压缩参数。响应正文未保存，不改取值"
 
 [[fields]]
 name = "price_miss"
 credibility = "未知"
-source = "执行方案 §4 的 price_*。不写入单价。实测轮 T11 核对价格页"
+source = "T11-docs-2026-11-04：价格有峰谷两档，不收成一个数"
 
 [[fields]]
 name = "price_hit"
 credibility = "未知"
-source = "执行方案 §4 的 price_*。不写入单价。实测轮 T11 核对价格页"
+source = "T11-docs-2026-11-04：价格有峰谷两档，不收成一个数"
 
 [[fields]]
 name = "price_output"
 credibility = "未知"
-source = "执行方案 §4 的 price_*。不写入单价。实测轮 T11 核对价格页"
+source = "T11-docs-2026-11-04：价格有峰谷两档，不收成一个数"

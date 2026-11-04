@@ -90,7 +90,7 @@ pub struct ModelProfile {
     pub context_window: u64,
     /// 单次输出上限，单位是 token。硬上限不用它，输出预留用请求的 `max_tokens`。
     pub max_output: u64,
-    /// 窗口是否包含本次输出。`true` 时硬上限先扣掉 `max_tokens`。当前档案取假设值 `true`，可信度仍是未知。
+    /// 窗口是否包含本次输出。`true` 时硬上限先扣掉 `max_tokens`。当前档案取值 `true`，来源是 T4 的文档核对。
     pub window_counts_output: bool,
     /// `estimate_error` 的分子。与 [`Self::estimate_error_den`] 一起表示临时误差，当前是 30/100。
     pub estimate_error_num: u64,
@@ -419,7 +419,7 @@ struct RawField {
 mod tests {
     use super::*;
 
-    /// 嵌入档案的版本、临时误差、未知字段和 hash 与文件字节一致。
+    /// 嵌入档案的版本、临时误差、未知字段、已收口字段和 hash 与文件字节一致。
     #[test]
     fn embedded_deepseek_flash_keeps_unknowns_unfilled() {
         let profile = deepseek_flash().expect("embedded profile");
@@ -448,15 +448,70 @@ mod tests {
         assert_eq!(profile.context_window, 1_048_576);
         assert!(profile.window_counts_output);
         assert_eq!(
+            profile.field("window_counts_output").unwrap().credibility,
+            Credibility::Documented
+        );
+        let pairing = profile.field("tool_pairing").unwrap();
+        assert_eq!(
+            pairing.value.as_deref(),
+            Some("must_pair_placeholder_accepted")
+        );
+        assert_eq!(pairing.credibility, Credibility::Measured);
+        assert_eq!(
             (profile.estimate_error_num, profile.estimate_error_den),
             (30, 100)
         );
         assert!(profile.field("estimate_error").unwrap().uncalibrated);
-        for name in ["cache_ttl", "effective_context", "price_miss", "cache_mode"] {
+        let sourced = [
+            ("cache_mode", "T3-cache-2026-11-04"),
+            ("cache_granularity", "T3-cache-2026-11-04"),
+            ("cache_ttl", "T3-cache-2026-11-04"),
+            ("reasoning_in_output", "T4-docs-2026-11-04"),
+            ("system_update", "T5-update-2026-11-04"),
+            ("tool_update", "T5-update-2026-11-04"),
+            ("effective_context", "T6-effective-context-2026-11-04"),
+            ("context_awareness", "T9-awareness-2026-11-04"),
+            ("price_miss", "T11-docs-2026-11-04"),
+            ("price_hit", "T11-docs-2026-11-04"),
+            ("price_output", "T11-docs-2026-11-04"),
+            ("native_context_mgmt", "T11-docs-2026-11-04"),
+        ];
+        for (name, record) in sourced {
             let field = profile.field(name).unwrap();
-            assert_eq!(field.credibility, Credibility::Unknown);
+            assert!(
+                field.source.contains(record),
+                "{name} source {}",
+                field.source
+            );
+        }
+        for name in [
+            "cache_mode",
+            "cache_granularity",
+            "cache_ttl",
+            "system_update",
+            "tool_update",
+            "effective_context",
+            "context_awareness",
+            "price_miss",
+            "price_hit",
+            "price_output",
+        ] {
+            let field = profile.field(name).unwrap();
+            assert_eq!(field.credibility, Credibility::Unknown, "{name}");
             assert!(field.value.is_none(), "{name}");
         }
+        assert_eq!(
+            profile
+                .field("reasoning_in_output")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            profile.field("reasoning_in_output").unwrap().credibility,
+            Credibility::Unknown
+        );
         assert_eq!(
             profile.profile_hash,
             sha256_hex(EMBEDDED_DEEPSEEK_FLASH.as_bytes())
