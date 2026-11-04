@@ -221,19 +221,40 @@ fn print_decision(index: usize, decision: &Decision) {
     );
 }
 
-/// 在第一条 user 末尾重复汉字「中」。
+/// 在第一条 user 末尾追加文本。
 ///
-/// **作用**：把第 5 次请求填充到约 16K，后面的工具结果保持原样。
-/// **参数**：`request` 是已保存的 Chat Completions 请求。`chars` 是追加的 Unicode 标量数，0 不改变正文。
+/// **作用**：填充时不改后面的工具结果。
+/// **参数**：`request` 是已保存的 Chat Completions 请求。`extra` 是追加到第一条 user 末尾的正文，空串不改变它。
 /// **边界**：没有 user 消息或正文不是字符串时返回 `None`。不打印正文。
-fn append_han_to_first_user(mut request: Value, chars: usize) -> Option<Value> {
+fn append_text_to_first_user(mut request: Value, extra: &str) -> Option<Value> {
     let messages = request.get_mut("messages")?.as_array_mut()?;
     let user = messages
         .iter_mut()
         .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))?;
     let content = user.get("content")?.as_str()?.to_owned();
-    user["content"] = Value::String(format!("{content}{}", "中".repeat(chars)));
+    user["content"] = Value::String(format!("{content}{extra}"));
     Some(request)
+}
+
+/// 在第一条 user 末尾重复汉字「中」。
+///
+/// **作用**：把第 5 次请求填充到约 16K，后面的工具结果保持原样。
+/// **参数**：`request` 是已保存的 Chat Completions 请求。`chars` 是追加的 Unicode 标量数，0 不改变正文。
+/// **边界**：没有 user 消息或正文不是字符串时返回 `None`。不打印正文。
+fn append_han_to_first_user(request: Value, chars: usize) -> Option<Value> {
+    append_text_to_first_user(request, &"中".repeat(chars))
+}
+
+/// 相似干扰的一行。只含邻近路径，不含 `tests/inventory.rs`。
+const DECOY_LINE: &str = "src/inventory.rs src/storage.rs src/lib.rs src/main.rs README.md\n";
+
+/// 把相似干扰重复 `repeats` 次。
+///
+/// **作用**：凑出约 16K 的干扰正文。
+/// **参数**：`repeats` 是 [`DECOY_LINE`] 的重复次数，0 返回空串。
+/// **边界**：不包含正确下一步的路径 `tests/inventory.rs`。
+fn decoy_fill(repeats: usize) -> String {
+    DECOY_LINE.repeat(repeats)
 }
 
 /// 本机数据目录里的一条已保存请求。
@@ -468,6 +489,110 @@ async fn han_fill_16k_baseline_for_mini_inventory_k5() {
         return;
     };
     let Some(filled) = append_han_to_first_user(request, FILL_HAN_CHARS) else {
+        println!("skipped reason=missing_user");
+        return;
+    };
+    sample_request(&filled).await;
+}
+
+/// 相似干扰不含正确下一步的路径。
+#[test]
+fn decoy_fill_names_neighbors_and_not_the_target() {
+    let text = decoy_fill(2);
+    assert!(text.contains("src/inventory.rs"));
+    assert!(text.contains("src/storage.rs"));
+    assert!(text.contains("README.md"));
+    assert!(!text.contains("tests/inventory.rs"));
+    assert_eq!(text.matches("src/lib.rs").count(), 2);
+}
+
+/// 读一次请求的服务端 `prompt_tokens`。
+///
+/// **作用**：用一小段干扰估计重复次数，不计入五次基线。
+/// **参数**：`client` 是已有密钥的 DeepSeek 客户端。`request` 是这一次的填充请求。
+/// **边界**：失败时打印类别并返回 `None`。不打印正文或响应摘要。
+async fn probe_prompt_tokens(client: &mut DeepSeekClient, request: &Value) -> Option<u64> {
+    let cancel = CancellationToken::new();
+    match client.round(request, &cancel).await {
+        Ok(Round::Completed(completion)) => match completion.usage.prompt_tokens {
+            TokenCount::Known(value) => Some(value),
+            TokenCount::Unknown => {
+                println!("calibrate prompt_tokens=unknown");
+                None
+            }
+        },
+        Ok(Round::Status { status, .. }) => {
+            println!("calibrate http={status}");
+            None
+        }
+        Ok(Round::Interrupted) => {
+            println!("calibrate http=interrupted");
+            None
+        }
+        Ok(Round::Cancelled) => {
+            println!("calibrate http=cancelled");
+            None
+        }
+        Ok(Round::InvalidToolArguments { .. }) => {
+            println!("calibrate http=invalid_tool_arguments");
+            None
+        }
+        Ok(Round::MalformedToolCall { .. }) => {
+            println!("calibrate http=malformed_tool_call");
+            None
+        }
+        Err(_) => {
+            println!("calibrate http=error");
+            None
+        }
+    }
+}
+
+/// 第 5 次请求加相似路径干扰后的完整对完整基线。默认不跑。
+///
+/// **作用**：把服务端 `prompt_tokens` 调到约 16000，再采样 5 次。
+/// **边界**：没有密钥、没有本机 blob 或找不到 user 时直接返回。不写 Run，不打印干扰全文。校准那一次不计入一致率。
+#[tokio::test]
+#[ignore = "dials api.deepseek.com when DEEPSEEK_API_KEY and the local request blob are present"]
+async fn similar_fill_16k_baseline_for_mini_inventory_k5() {
+    if std::env::var(API_KEY_ENV)
+        .ok()
+        .filter(|key| !key.is_empty())
+        .is_none()
+    {
+        println!("skipped reason=missing_key");
+        return;
+    }
+    let Some(request) = stored_request(REQUEST_K5_SHA256) else {
+        println!("skipped reason=missing_request");
+        return;
+    };
+    const UNFILLED_PROMPT: u64 = 2964;
+    const TARGET_PROMPT: u64 = 16_000;
+    const PROBE_REPEATS: u64 = 40;
+    let Some(probe) =
+        append_text_to_first_user(request.clone(), &decoy_fill(PROBE_REPEATS as usize))
+    else {
+        println!("skipped reason=missing_user");
+        return;
+    };
+    let mut client = DeepSeekClient::from_env().expect("key checked above");
+    let Some(probe_tokens) = probe_prompt_tokens(&mut client, &probe).await else {
+        return;
+    };
+    let Some(added) = probe_tokens
+        .checked_sub(UNFILLED_PROMPT)
+        .filter(|added| *added > 0)
+    else {
+        println!(
+            "calibrate prompt_tokens={probe_tokens} repeats={PROBE_REPEATS} status=not_larger"
+        );
+        return;
+    };
+    let need = TARGET_PROMPT.saturating_sub(UNFILLED_PROMPT);
+    let repeats = ((need.saturating_mul(PROBE_REPEATS) + added / 2) / added).max(1);
+    println!("calibrate prompt_tokens={probe_tokens} probe_repeats={PROBE_REPEATS} chosen_repeats={repeats}");
+    let Some(filled) = append_text_to_first_user(request, &decoy_fill(repeats as usize)) else {
         println!("skipped reason=missing_user");
         return;
     };
