@@ -1,7 +1,7 @@
 //! T8 探针的离线比例计算。
 //!
 //! **作用**：把两次 `prompt_tokens` 换成比例，并判断 200 字与 2000 字两档是否稳定。也生成固定类别的探针正文。
-//! **边界**：默认测试不发网络请求，不写 Run、事件或档案。文件末尾的 `#[ignore]` 测试只在显式 `--ignored` 时拨号。数字、空格、标点和源代码切片分开实调。
+//! **边界**：默认测试不发网络请求，不写 Run、事件或档案。文件末尾的 `#[ignore]` 测试只在显式 `--ignored` 时拨号。字符类、源代码单元、字符串、注释和整段分开实调。
 
 use fluxaxiom_contract::TokenCount;
 use fluxaxiom_engine_custom::{
@@ -99,6 +99,41 @@ fn slice_text(class: SliceClass, chars: usize) -> String {
         SliceClass::DigitUnderscore => "1_",
         SliceClass::Operator => "+;",
         SliceClass::SpaceNewline => " \n",
+    };
+    assert!(chars.is_multiple_of(unit.chars().count()));
+    unit.repeat(chars / unit.chars().count())
+}
+
+/// 字符串和注释重复哪一个语法单元。
+///
+/// **作用**：把这两类切片固定成五个单元，调用方不能再传入别的正文。
+/// **边界**：不含完整函数或 JSON。单元正文由 [`syntax_text`] 决定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyntaxClass {
+    /// 重复 ASCII 字符串 `"aa"`。引号计入字数。
+    AsciiString,
+    /// 重复含汉字的字符串 `"中中"`。引号计入字数。
+    HanString,
+    /// 重复英文行注释 `//a` 加换行。换行计入字数。
+    LineComment,
+    /// 重复英文块注释 `/*a*/`。不含换行。
+    BlockComment,
+    /// 重复中文行注释 `//中` 加换行。换行计入字数。
+    HanComment,
+}
+
+/// 生成正好 `chars` 个标量的字符串或注释正文。
+///
+/// **作用**：供 200 字和 2000 字两档使用。调用方拥有返回的字符串，并可以追加到 user 末尾。
+/// **参数**：`class` 选择重复哪一个语法单元。`chars` 是 Unicode 标量个数，必须是该单元长度的倍数，0 返回空串。
+/// **边界**：结果由该单元整段重复组成，末尾换行也保留。不发请求，不计算比例。
+fn syntax_text(class: SyntaxClass, chars: usize) -> String {
+    let unit = match class {
+        SyntaxClass::AsciiString => "\"aa\"",
+        SyntaxClass::HanString => "\"中中\"",
+        SyntaxClass::LineComment => "//a\n",
+        SyntaxClass::BlockComment => "/*a*/",
+        SyntaxClass::HanComment => "//中\n",
     };
     assert!(chars.is_multiple_of(unit.chars().count()));
     unit.repeat(chars / unit.chars().count())
@@ -314,6 +349,289 @@ fn space_newline_slice_keeps_trailing_newline() {
         slice_text(SliceClass::SpaceNewline, 2000).chars().count(),
         2000
     );
+}
+
+/// ASCII 字符串切片的字数等于参数，并且由 `"aa"` 重复组成。
+///
+/// **作用**：锁住 `AsciiString` 的单元含引号。
+/// **边界**：不访问网络。不含汉字或换行。
+#[test]
+fn ascii_string_slice_repeats_quoted_aa() {
+    let text = syntax_text(SyntaxClass::AsciiString, 200);
+    assert_eq!(text.chars().count(), 200);
+    assert_eq!(text, "\"aa\"".repeat(50));
+    assert!(!text.contains('中'));
+    assert!(!text.contains('\n'));
+    assert_eq!(
+        syntax_text(SyntaxClass::AsciiString, 2000).chars().count(),
+        2000
+    );
+}
+
+/// 含汉字的字符串切片的字数等于参数。
+///
+/// **作用**：锁住 `HanString` 重复的是 `"中中"`。
+/// **边界**：不访问网络。不含换行。
+#[test]
+fn han_string_slice_repeats_quoted_han() {
+    let text = syntax_text(SyntaxClass::HanString, 200);
+    assert_eq!(text.chars().count(), 200);
+    assert_eq!(text, "\"中中\"".repeat(50));
+    assert!(!text.contains('\n'));
+    assert_eq!(
+        syntax_text(SyntaxClass::HanString, 2000).chars().count(),
+        2000
+    );
+    assert_eq!(syntax_text(SyntaxClass::HanString, 0).chars().count(), 0);
+}
+
+/// 英文行注释切片的字数等于参数，并且保留末尾换行。
+///
+/// **作用**：锁住 `LineComment` 重复的是 `//a` 加换行。
+/// **边界**：不访问网络。不去掉末尾换行，也不含块注释。
+#[test]
+fn line_comment_slice_keeps_trailing_newline() {
+    let text = syntax_text(SyntaxClass::LineComment, 200);
+    assert_eq!(text.chars().count(), 200);
+    assert_eq!(text, "//a\n".repeat(50));
+    assert!(text.ends_with('\n'));
+    assert!(!text.contains("/*"));
+    assert_eq!(
+        syntax_text(SyntaxClass::LineComment, 2000).chars().count(),
+        2000
+    );
+}
+
+/// 英文块注释切片的字数等于参数。
+///
+/// **作用**：锁住 `BlockComment` 重复的是 `/*a*/`。
+/// **边界**：不访问网络。不含换行。
+#[test]
+fn block_comment_slice_repeats_slash_star() {
+    let text = syntax_text(SyntaxClass::BlockComment, 200);
+    assert_eq!(text.chars().count(), 200);
+    assert_eq!(text, "/*a*/".repeat(40));
+    assert!(!text.contains('\n'));
+    assert_eq!(
+        syntax_text(SyntaxClass::BlockComment, 2000).chars().count(),
+        2000
+    );
+}
+
+/// 中文注释切片的字数等于参数，并且保留末尾换行。
+///
+/// **作用**：锁住 `HanComment` 重复的是 `//中` 加换行。
+/// **边界**：不访问网络。不去掉末尾换行。
+#[test]
+fn han_comment_slice_keeps_trailing_newline() {
+    let text = syntax_text(SyntaxClass::HanComment, 200);
+    assert_eq!(text.chars().count(), 200);
+    assert_eq!(text, "//中\n".repeat(50));
+    assert!(text.ends_with('\n'));
+    assert!(text.contains('中'));
+    assert_eq!(
+        syntax_text(SyntaxClass::HanComment, 2000).chars().count(),
+        2000
+    );
+}
+
+/// 整段探针里的一片。
+///
+/// **作用**：按出现顺序拼成 Rust 函数或 JSON。同一 `label` 的正文再拼成类别桶。
+/// **边界**：`text` 只留在测试进程里，不写入记录或 stdout。
+struct Piece {
+    /// 类别标签。同一标签的片段属于一个切片桶。
+    label: &'static str,
+    /// 这一片的正文。空串不会出现。
+    text: String,
+}
+
+/// 用标签和静态正文做一片。
+///
+/// **作用**：组装 [`rust_pieces`] 和 [`json_pieces`]。
+/// **参数**：`label` 是类别标签，不能是空串。`text` 是这一片的正文，不能是空串。
+/// **边界**：调用方拥有返回值里的正文。不检查标签是否属于某一段。
+fn piece(label: &'static str, text: &'static str) -> Piece {
+    Piece {
+        label,
+        text: text.to_owned(),
+    }
+}
+
+/// 追加一行 `let x = 1;`。
+///
+/// **作用**：把 Rust 样本补到 200 个标量。
+/// **参数**：`pieces` 接收新片段，顺序加在已有片段之后。
+/// **边界**：这一行固定是 15 个标量。不检查样本总长。
+fn push_let_x(pieces: &mut Vec<Piece>) {
+    pieces.push(piece("whitespace", "    "));
+    pieces.push(piece("keyword", "let"));
+    pieces.push(piece("whitespace", " "));
+    pieces.push(piece("keyword", "x"));
+    pieces.push(piece("whitespace", " "));
+    pieces.push(piece("operator", "="));
+    pieces.push(piece("whitespace", " "));
+    pieces.push(piece("digit_underscore", "1"));
+    pieces.push(piece("operator", ";"));
+    pieces.push(piece("whitespace", "\n"));
+}
+
+/// 200 个标量的 Rust 函数，按切片拆开。
+///
+/// **作用**：整段相加使用的函数样本。
+/// **边界**：片段按顺序拼接后正好 200 个标量。不含制表符。
+fn rust_pieces() -> Vec<Piece> {
+    let mut pieces = vec![
+        piece("keyword", "fn"),
+        piece("whitespace", " "),
+        piece("keyword", "add"),
+        piece("digit_underscore", "_1"),
+        piece("operator", "()"),
+        piece("whitespace", " "),
+        piece("operator", "{"),
+        piece("whitespace", "\n"),
+        piece("whitespace", "    "),
+        piece("keyword", "let"),
+        piece("whitespace", " "),
+        piece("keyword", "s"),
+        piece("whitespace", " "),
+        piece("operator", "="),
+        piece("whitespace", " "),
+        piece("ascii_string", "\"aa\""),
+        piece("operator", ";"),
+        piece("whitespace", "\n"),
+        piece("whitespace", "    "),
+        piece("keyword", "let"),
+        piece("whitespace", " "),
+        piece("keyword", "h"),
+        piece("whitespace", " "),
+        piece("operator", "="),
+        piece("whitespace", " "),
+        piece("han_string", "\"中\""),
+        piece("operator", ";"),
+        piece("whitespace", "\n"),
+        piece("whitespace", "    "),
+        piece("line_comment", "//a\n"),
+        piece("whitespace", "    "),
+        piece("block_comment", "/*a*/"),
+        piece("whitespace", "\n"),
+        piece("whitespace", "    "),
+        piece("han_comment", "//中\n"),
+    ];
+    for _ in 0..8 {
+        push_let_x(&mut pieces);
+    }
+    pieces.push(piece("whitespace", "    "));
+    pieces.push(piece("operator", "}"));
+    pieces.push(piece("whitespace", "\n"));
+    pieces
+}
+
+/// 200 个标量的 JSON 工具输出，按切片拆开。
+///
+/// **作用**：整段相加使用的 JSON 样本。
+/// **边界**：片段按顺序拼接后正好 200 个标量。末尾 8 个空格用来补齐长度。
+fn json_pieces() -> Vec<Piece> {
+    let mut pieces = vec![
+        piece("operator", "{"),
+        piece("ascii_string", "\"path\""),
+        piece("operator", ":"),
+        piece("ascii_string", "\"aa\""),
+        piece("operator", ","),
+        piece("ascii_string", "\"name\""),
+        piece("operator", ":"),
+        piece("han_string", "\"中\""),
+        piece("operator", ","),
+        piece("ascii_string", "\"n\""),
+        piece("operator", ":"),
+        piece("digit", "1"),
+    ];
+    for _ in 0..18 {
+        pieces.push(piece("operator", ","));
+        pieces.push(piece("ascii_string", "\"k\""));
+        pieces.push(piece("operator", ":"));
+        pieces.push(piece("ascii_string", "\"aa\""));
+    }
+    pieces.push(piece("whitespace", "        "));
+    pieces.push(piece("operator", "}"));
+    pieces
+}
+
+/// 按顺序拼接全部片段。
+///
+/// **作用**：得到整段探针。
+/// **参数**：`pieces` 是按出现顺序排列的片段。空切片得到空串。
+/// **边界**：不插入分隔符，也不去掉末尾换行。
+fn whole_text(pieces: &[Piece]) -> String {
+    pieces.iter().map(|item| item.text.as_str()).collect()
+}
+
+/// 把同一标签的片段按出现顺序拼成一个桶。
+///
+/// **作用**：整段相加时，每一类单独测这一条拼接结果。
+/// **参数**：`pieces` 是整段的全部片段。`label` 是要收集的类别标签。
+/// **边界**：标签没有出现时返回空串。拼接会去掉原本夹在中间的其他类别。
+fn bucket_text(pieces: &[Piece], label: &str) -> String {
+    pieces
+        .iter()
+        .filter(|item| item.label == label)
+        .map(|item| item.text.as_str())
+        .collect()
+}
+
+/// 按首次出现收集标签。
+///
+/// **作用**：决定类别桶的测量顺序。
+/// **参数**：`pieces` 是整段的全部片段。
+/// **边界**：重复标签只保留第一次。不返回空标签。
+fn labels_in_order(pieces: &[Piece]) -> Vec<&str> {
+    let mut labels = Vec::new();
+    for item in pieces {
+        if !labels.contains(&item.label) {
+            labels.push(item.label);
+        }
+    }
+    labels
+}
+
+/// Rust 样本是 200 个标量，类别桶合起来等于整段。
+///
+/// **作用**：锁住函数正文的长度和拆分。
+/// **边界**：不访问网络。2000 字是这 200 字重复 10 次。
+#[test]
+fn rust_whole_is_200_scalars_and_buckets_cover_it() {
+    let pieces = rust_pieces();
+    let whole = whole_text(&pieces);
+    assert_eq!(whole.chars().count(), 200);
+    assert!(whole.starts_with("fn add_1() {"));
+    assert!(whole.ends_with("}\n"));
+    assert!(!whole.contains('\t'));
+    let bucket_chars: usize = labels_in_order(&pieces)
+        .into_iter()
+        .map(|label| bucket_text(&pieces, label).chars().count())
+        .sum();
+    assert_eq!(bucket_chars, 200);
+    assert_eq!(whole.repeat(10).chars().count(), 2000);
+}
+
+/// JSON 样本是 200 个标量，类别桶合起来等于整段。
+///
+/// **作用**：锁住工具输出的长度和拆分。
+/// **边界**：不访问网络。2000 字是这 200 字重复 10 次。
+#[test]
+fn json_whole_is_200_scalars_and_buckets_cover_it() {
+    let pieces = json_pieces();
+    let whole = whole_text(&pieces);
+    assert_eq!(whole.chars().count(), 200);
+    assert!(whole.starts_with("{\"path\":\"aa\""));
+    assert!(whole.ends_with('}'));
+    assert!(whole.contains('中'));
+    let bucket_chars: usize = labels_in_order(&pieces)
+        .into_iter()
+        .map(|label| bucket_text(&pieces, label).chars().count())
+        .sum();
+    assert_eq!(bucket_chars, 200);
+    assert_eq!(whole.repeat(10).chars().count(), 2000);
 }
 
 /// 四组两档比例覆盖稳定、全 0、门槛和超门槛。
@@ -577,4 +895,147 @@ async fn live_source_slices_when_deepseek_client_response() {
         ],
     )
     .await;
+}
+
+/// 字符串和注释各两档的实调。默认不跑。
+///
+/// **作用**：沿用同一条前缀，只追加两个字符串字面量和三类注释。
+/// **边界**：不重测已有切片。没有密钥时不拨号。不写 Run、档案或记录文件。stdout 不含探针正文和密钥。
+#[tokio::test]
+#[ignore = "dials api.deepseek.com when DEEPSEEK_API_KEY is set"]
+async fn live_literals_comments_when_deepseek_client_response() {
+    let Some((mut client, prompt_before)) = live_shared_prefix().await else {
+        return;
+    };
+    live_probes(
+        &mut client,
+        prompt_before,
+        vec![
+            (
+                "ascii_string",
+                200,
+                syntax_text(SyntaxClass::AsciiString, 200),
+            ),
+            (
+                "ascii_string",
+                2000,
+                syntax_text(SyntaxClass::AsciiString, 2000),
+            ),
+            ("han_string", 200, syntax_text(SyntaxClass::HanString, 200)),
+            (
+                "han_string",
+                2000,
+                syntax_text(SyntaxClass::HanString, 2000),
+            ),
+            (
+                "line_comment",
+                200,
+                syntax_text(SyntaxClass::LineComment, 200),
+            ),
+            (
+                "line_comment",
+                2000,
+                syntax_text(SyntaxClass::LineComment, 2000),
+            ),
+            (
+                "block_comment",
+                200,
+                syntax_text(SyntaxClass::BlockComment, 200),
+            ),
+            (
+                "block_comment",
+                2000,
+                syntax_text(SyntaxClass::BlockComment, 2000),
+            ),
+            (
+                "han_comment",
+                200,
+                syntax_text(SyntaxClass::HanComment, 200),
+            ),
+            (
+                "han_comment",
+                2000,
+                syntax_text(SyntaxClass::HanComment, 2000),
+            ),
+        ],
+    )
+    .await;
+}
+
+/// 测量整段和各类别桶，并打印 token 差是否相加。
+///
+/// **作用**：Rust 函数和 JSON 各测 200 字与 2000 字。2000 字是 200 字重复 10 次。
+/// **参数**：`client` 是已测完前缀的 DeepSeek 客户端，本函数会继续用它拨号。`prompt_before` 是前缀的 `prompt_tokens`。`sample` 是 `rust` 或 `json`。`pieces` 是这一段的有序片段。
+/// **边界**：不打印正文。某一类失败时不打印相加结果。类别桶是同类片段直接拼接，中间原来的其他类别不在桶里。
+async fn live_whole_sample(
+    client: &mut DeepSeekClient,
+    prompt_before: u64,
+    sample: &str,
+    pieces: &[Piece],
+) {
+    let base = whole_text(pieces);
+    let labels = labels_in_order(pieces);
+    for copies in [1usize, 10] {
+        let whole = base.repeat(copies);
+        let chars = whole.chars().count();
+        let user = format!("{LIVE_PREFIX_USER}{whole}");
+        let whole_after = live_prompt(client, &user).await;
+        let whole_tokens = match &whole_after {
+            Ok(tokens) => Some(*tokens),
+            Err(_) => None,
+        };
+        print_probe(
+            &format!("{sample}_whole"),
+            chars,
+            prompt_before,
+            whole_after,
+        );
+
+        let mut part_sum = 0u64;
+        let mut complete = true;
+        for label in &labels {
+            let bucket = bucket_text(pieces, label).repeat(copies);
+            let bucket_chars = bucket.chars().count();
+            let user = format!("{LIVE_PREFIX_USER}{bucket}");
+            let after = live_prompt(client, &user).await;
+            if let Ok(tokens) = &after {
+                match tokens.checked_sub(prompt_before) {
+                    Some(delta) => part_sum = part_sum.saturating_add(delta),
+                    None => complete = false,
+                }
+            } else {
+                complete = false;
+            }
+            print_probe(
+                &format!("{sample}_{label}"),
+                bucket_chars,
+                prompt_before,
+                after,
+            );
+        }
+
+        if complete {
+            if let Some(tokens) = whole_tokens {
+                if let Some(whole_delta) = tokens.checked_sub(prompt_before) {
+                    println!(
+                        "additivity sample={sample} chars={chars} part_sum={part_sum} whole_delta={whole_delta} http=completed"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// 完整 Rust 函数和 JSON 工具输出的实调。默认不跑。
+///
+/// **作用**：测量两段正文的 200 字与 2000 字，并比较类别桶 token 差之和与整段 token 差。
+/// **边界**：不重测已有切片。没有密钥时不拨号。不写 Run、档案或记录文件。stdout 不含正文和密钥。
+#[tokio::test]
+#[ignore = "dials api.deepseek.com when DEEPSEEK_API_KEY is set"]
+async fn live_whole_additivity_when_deepseek_client_response() {
+    let Some((mut client, prompt_before)) = live_shared_prefix().await else {
+        return;
+    };
+    live_whole_sample(&mut client, prompt_before, "rust", &rust_pieces()).await;
+    live_whole_sample(&mut client, prompt_before, "json", &json_pieces()).await;
 }
