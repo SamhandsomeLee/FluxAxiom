@@ -1,6 +1,9 @@
 /target
 .env
 
+# 本机代理生成的技能副本，不入库
+.agents/
+
 # samples 内独立项目的构建产物
 samples/**/target/
 samples/**/Cargo.lock
