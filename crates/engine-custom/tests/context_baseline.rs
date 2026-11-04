@@ -504,6 +504,8 @@ fn decoy_fill_names_neighbors_and_not_the_target() {
     assert!(text.contains("README.md"));
     assert!(!text.contains("tests/inventory.rs"));
     assert_eq!(text.matches("src/lib.rs").count(), 2);
+    assert_eq!(decoy_repeats_for_target(64_000, 2964), 3391);
+    assert_eq!(decoy_repeats_for_target(16_000, 2964), 724);
 }
 
 /// 读一次请求的服务端 `prompt_tokens`。
@@ -591,10 +593,60 @@ async fn similar_fill_16k_baseline_for_mini_inventory_k5() {
     };
     let need = TARGET_PROMPT.saturating_sub(UNFILLED_PROMPT);
     let repeats = ((need.saturating_mul(PROBE_REPEATS) + added / 2) / added).max(1);
-    println!("calibrate prompt_tokens={probe_tokens} probe_repeats={PROBE_REPEATS} chosen_repeats={repeats}");
+    println!(
+        "calibrate prompt_tokens={probe_tokens} probe_repeats={PROBE_REPEATS} chosen_repeats={repeats}"
+    );
     let Some(filled) = append_text_to_first_user(request, &decoy_fill(repeats as usize)) else {
         println!("skipped reason=missing_user");
         return;
     };
     sample_request(&filled).await;
+}
+
+/// 按 16K 相似干扰的实测斜率换算重复次数。
+///
+/// **作用**：40 次重复把 2964 token 加到 3684，即每次重复 18 token。
+/// **参数**：`target` 是希望达到的服务端 `prompt_tokens`。`unfilled` 是未填充请求的 `prompt_tokens`，大于 `target` 时返回 1。
+/// **边界**：不发请求。正式采样仍记录实际 `prompt_tokens`。
+fn decoy_repeats_for_target(target: u64, unfilled: u64) -> usize {
+    const TOKENS_PER_REPEAT: u64 = 18;
+    let need = target.saturating_sub(unfilled);
+    ((need + TOKENS_PER_REPEAT / 2) / TOKENS_PER_REPEAT).max(1) as usize
+}
+
+/// 第 5 次请求在 64K、256K、512K 上的两种填充基线。默认不跑。
+///
+/// **作用**：把 T0 尚未测量的填充长度一次采完。16K 已有记录，这里不重测。
+/// **边界**：没有密钥或没有本机 blob 时直接返回。某一档失败时打印类别并继续下一档。不写 Run，不打印填充正文。
+#[tokio::test]
+#[ignore = "dials api.deepseek.com when DEEPSEEK_API_KEY and the local request blob are present"]
+async fn longer_fill_baselines_for_mini_inventory_k5() {
+    if std::env::var(API_KEY_ENV)
+        .ok()
+        .filter(|key| !key.is_empty())
+        .is_none()
+    {
+        println!("skipped reason=missing_key");
+        return;
+    }
+    let Some(request) = stored_request(REQUEST_K5_SHA256) else {
+        println!("skipped reason=missing_request");
+        return;
+    };
+    const UNFILLED_PROMPT: u64 = 2964;
+    const TARGETS: [(&str, u64); 3] = [("64k", 64_000), ("256k", 256_000), ("512k", 512_000)];
+    for (name, target) in TARGETS {
+        let chars = target.saturating_sub(UNFILLED_PROMPT) as usize;
+        println!("case=han-{name} han_chars={chars}");
+        match append_han_to_first_user(request.clone(), chars) {
+            Some(filled) => sample_request(&filled).await,
+            None => println!("case=han-{name} skipped reason=missing_user"),
+        }
+        let repeats = decoy_repeats_for_target(target, UNFILLED_PROMPT);
+        println!("case=similar-{name} repeats={repeats}");
+        match append_text_to_first_user(request.clone(), &decoy_fill(repeats)) {
+            Some(filled) => sample_request(&filled).await,
+            None => println!("case=similar-{name} skipped reason=missing_user"),
+        }
+    }
 }
