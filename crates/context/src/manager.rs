@@ -67,7 +67,7 @@ impl ContextManager {
     ) -> Result<Prepared, ContextExhausted> {
         let estimate = estimate_transcript(&self.profile, transcript);
         let spec = ContextSpec {
-            hard_limit: self.profile.hard_limit(max_tokens),
+            hard_limit: self.profile.hard_limit(max_tokens), //当前轮次可以使用的token上限
         };
         let record = ContextRecord::identity(
             self.profile.profile_version,
@@ -80,7 +80,7 @@ impl ContextManager {
         }
         Ok(Prepared {
             view: View::identity(transcript),
-            record,
+            record, //record : record，record移入Prepared后，prepare函数中不能再使用了，所有权转移了。
         })
     }
 
@@ -119,6 +119,7 @@ impl ContextManager {
 }
 
 /// 选择锚点估算或全量估算，并以已知 prompt 用量托底。
+/// 估算下一次模型请求需要多少输入token,并防止估算结果低于模型服务端已经报告过的真实用量
 ///
 /// **作用**：`prepare` 写入记录前调用。
 /// **参数**：`profile` 提供字符比例。`transcript` 提供正文和各轮用量。
