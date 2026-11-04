@@ -6,6 +6,7 @@
 //! `ChatRequest::new` 默认带未校准的 `max_tokens: 32768`。
 
 mod chat;
+mod decision;
 mod doc_version;
 mod engine;
 mod fake;
@@ -14,6 +15,8 @@ mod rebuild;
 mod retry;
 mod sse;
 mod tools;
+
+pub use decision::{decision_of, mode_match_variance, pairwise_agreement, Decision};
 
 pub use chat::{
     observe_reasoning, replay_reasoning, usage_from_json, ChatCompletion, ChatError, ChatRequest,

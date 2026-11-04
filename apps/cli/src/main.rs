@@ -1,10 +1,11 @@
 //! FluxAxiom CLI：组合根。
 //!
 //! **作用**：组装 `RunHost` 与 `EngineA`，提供 `run` / `status` / `events` / `artifacts` / `trace` /
-//! `sample export` / `sample feedback`。
+//! `sample export` / `sample feedback` / `ctx replay`。
 //! **边界**：`run` 内监听 Ctrl-C 并调用 `request_cancel`；第二次 Ctrl-C 强退（§4.8 / A3b）。
 //! 租约扫描在 `RunHost::open`。默认 Fake Engine；`--engine deepseek` 读 `DEEPSEEK_API_KEY`（环境变量，或当前目录向上的 `.env`）。
 
+mod ctx_replay;
 mod data_dir;
 
 use std::path::PathBuf;
@@ -117,6 +118,35 @@ enum Command {
         #[command(subcommand)]
         command: SampleCommand,
     },
+    /// 上下文评测。不写 Run。
+    Ctx {
+        #[command(subcommand)]
+        command: CtxCommand,
+    },
+}
+
+/// `flux ctx` 子命令。
+#[derive(Debug, Subcommand)]
+enum CtxCommand {
+    /// 对已保存的第 k 次请求再采样，打印下一步一致率。
+    Replay {
+        run_id: String,
+        /// 模型调用序号，从 1 起。
+        #[arg(long)]
+        call: u32,
+        /// 采样次数。少于 2 次时不打印比率。
+        #[arg(long, default_value_t = 5)]
+        samples: usize,
+        /// 只接受 `identity@1`。其它策略不发请求。
+        #[arg(long, default_value = "identity@1")]
+        strategy: String,
+        /// 使用 Fake 或真实 DeepSeek。
+        #[arg(long, value_enum, default_value_t = EngineKind::Fake)]
+        engine: EngineKind,
+        /// Host 数据目录。省略时读 `FLUXAXIOM_DATA_DIR`，再退回平台默认。
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 /// `flux sample` 子命令。
@@ -154,7 +184,7 @@ enum CliFeedbackVerdict {
 
 /// CLI 可选的 Engine 实现。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum EngineKind {
+pub(crate) enum EngineKind {
     /// 脚本化 Fake，不拨号。默认，便于本地与 CI。
     Fake,
     /// `DeepSeekClient::from_env`，需要 `DEEPSEEK_API_KEY`。
@@ -246,6 +276,16 @@ async fn run() -> Result<(), String> {
                 note,
                 data_dir,
             } => cmd_sample_feedback(run_id, verdict, note, data_dir),
+        },
+        Command::Ctx { command } => match command {
+            CtxCommand::Replay {
+                run_id,
+                call,
+                samples,
+                strategy,
+                engine,
+                data_dir,
+            } => ctx_replay::replay(run_id, call, samples, strategy, engine, data_dir).await,
         },
     }
 }
@@ -1092,21 +1132,21 @@ fn now_timestamp() -> Result<Timestamp, String> {
 ///
 /// **作用**：各子命令共用的入口；内部会 `reap_expired_leases`。
 /// **参数**：`data_dir` 为 `--data-dir`；`None` 走环境变量与平台默认。
-fn open_host(data_dir: Option<PathBuf>) -> Result<RunHost, String> {
+pub(crate) fn open_host(data_dir: Option<PathBuf>) -> Result<RunHost, String> {
     RunHost::open(data_dir::resolve(data_dir)).map_err(host_err)
 }
 
 /// 把 CLI 字符串收成契约 `RunId`。
 ///
 /// **边界**：非法格式返回用户可见错误，不暴露解析细节。
-fn parse_run_id(value: &str) -> Result<RunId, String> {
+pub(crate) fn parse_run_id(value: &str) -> Result<RunId, String> {
     RunId::parse(value).map_err(|_| format!("invalid run id: {value}"))
 }
 
 /// 把 `HostError` 收成 CLI 错误字符串。
 ///
 /// **边界**：依赖 `Display`；不附加堆栈。
-fn host_err(error: HostError) -> String {
+pub(crate) fn host_err(error: HostError) -> String {
     error.to_string()
 }
 
