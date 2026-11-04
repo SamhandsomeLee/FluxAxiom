@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use fluxaxiom_engine_custom::{
     CancellationToken, ChatCompletion, ChatTransport, DeepSeekClient, FinishReason, ObservedText,
-    Round, API_KEY_ENV,
+    Round, TokenCount, API_KEY_ENV,
 };
 use serde_json::Value;
 
@@ -20,6 +20,9 @@ const REQUEST_K5_SHA256: &str = "005b4e4c7a92b174f62b889d01ffa9c33815af4a880e46a
 
 /// 同一条完整请求的采样次数。
 const SAMPLES: usize = 5;
+
+/// 16K 档加在第一条 user 末尾的汉字数。未填充的第 5 次请求约 2964 token，汉字比例按 1 计。
+const FILL_HAN_CHARS: usize = 13_000;
 
 /// 一次采样的下一步签名。
 ///
@@ -218,6 +221,21 @@ fn print_decision(index: usize, decision: &Decision) {
     );
 }
 
+/// 在第一条 user 末尾重复汉字「中」。
+///
+/// **作用**：把第 5 次请求填充到约 16K，后面的工具结果保持原样。
+/// **参数**：`request` 是已保存的 Chat Completions 请求。`chars` 是追加的 Unicode 标量数，0 不改变正文。
+/// **边界**：没有 user 消息或正文不是字符串时返回 `None`。不打印正文。
+fn append_han_to_first_user(mut request: Value, chars: usize) -> Option<Value> {
+    let messages = request.get_mut("messages")?.as_array_mut()?;
+    let user = messages
+        .iter_mut()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))?;
+    let content = user.get("content")?.as_str()?.to_owned();
+    user["content"] = Value::String(format!("{content}{}", "中".repeat(chars)));
+    Some(request)
+}
+
 /// 本机数据目录里的一条已保存请求。
 ///
 /// **作用**：找到要复放的 blob。
@@ -238,12 +256,12 @@ fn stored_request(sha256: &str) -> Option<Value> {
     serde_json::from_str(&text).ok()
 }
 
-/// 对一条已保存请求采样 5 次并打印自一致率。
+/// 对一条请求采样 5 次并打印自一致率。
 ///
-/// **作用**：第 1 次和第 5 次请求共用采样和签名规则。
-/// **参数**：`sha256` 选择本机 blob。没有密钥或不存在时只打印跳过原因。
+/// **作用**：未填充请求和 16K 填充请求共用采样和签名规则。
+/// **参数**：`request` 是已组装好的 Chat Completions 请求。没有密钥时只打印跳过原因。
 /// **边界**：不写 Run。失败只打印类别，不打印响应摘要。某一次失败时不计算一致率。
-async fn sample_stored_request(sha256: &str) {
+async fn sample_request(request: &Value) {
     if std::env::var(API_KEY_ENV)
         .ok()
         .filter(|key| !key.is_empty())
@@ -252,19 +270,16 @@ async fn sample_stored_request(sha256: &str) {
         println!("skipped reason=missing_key");
         return;
     }
-    let Some(request) = stored_request(sha256) else {
-        println!("skipped reason=missing_request");
-        return;
-    };
     let mut client = DeepSeekClient::from_env().expect("key checked above");
     let cancel = CancellationToken::new();
     let mut decisions = Vec::new();
     for index in 1..=SAMPLES {
-        match client.round(&request, &cancel).await {
+        match client.round(request, &cancel).await {
             Ok(Round::Completed(completion)) => {
                 println!(
-                    "sample={index} finish={}",
-                    finish_label(&completion.finish_reason)
+                    "sample={index} finish={} prompt_tokens={}",
+                    finish_label(&completion.finish_reason),
+                    prompt_label(completion.usage.prompt_tokens)
                 );
                 let decision = decision_of(&completion);
                 print_decision(index, &decision);
@@ -308,6 +323,27 @@ async fn sample_stored_request(sha256: &str) {
     );
 }
 
+/// 对一条已保存请求采样 5 次并打印自一致率。
+///
+/// **作用**：第 1 次和第 5 次请求共用采样和签名规则。
+/// **参数**：`sha256` 选择本机 blob。没有密钥或不存在时只打印跳过原因。
+/// **边界**：不写 Run。失败只打印类别，不打印响应摘要。某一次失败时不计算一致率。
+async fn sample_stored_request(sha256: &str) {
+    if std::env::var(API_KEY_ENV)
+        .ok()
+        .filter(|key| !key.is_empty())
+        .is_none()
+    {
+        println!("skipped reason=missing_key");
+        return;
+    }
+    let Some(request) = stored_request(sha256) else {
+        println!("skipped reason=missing_request");
+        return;
+    };
+    sample_request(&request).await;
+}
+
 /// 结束原因的短名字。
 ///
 /// **作用**：stdout 不带未知原因的原文。
@@ -319,6 +355,18 @@ fn finish_label(reason: &FinishReason) -> &'static str {
         FinishReason::Length => "length",
         FinishReason::ToolCalls => "tool_calls",
         FinishReason::Other(_) => "other",
+    }
+}
+
+/// 用量里的 prompt token 短标签。
+///
+/// **作用**：采样输出只留服务端计数。
+/// **参数**：`tokens` 是这次响应的 `prompt_tokens`。`Unknown` 表示响应没有给出已知数。
+/// **边界**：不打印请求正文。
+fn prompt_label(tokens: TokenCount) -> String {
+    match tokens {
+        TokenCount::Known(value) => value.to_string(),
+        TokenCount::Unknown => "unknown".to_owned(),
     }
 }
 
@@ -382,4 +430,46 @@ async fn unfilled_full_baseline_for_mini_inventory_k1() {
 #[ignore = "dials api.deepseek.com when DEEPSEEK_API_KEY and the local request blob are present"]
 async fn unfilled_full_baseline_for_mini_inventory_k5() {
     sample_stored_request(REQUEST_K5_SHA256).await;
+}
+
+/// 汉字填充只加在第一条 user 末尾。
+#[test]
+fn han_fill_appends_only_the_first_user() {
+    let request = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"},
+            {"role": "user", "content": "later"}
+        ]
+    });
+    let filled = append_han_to_first_user(request, 3).expect("user message");
+    assert_eq!(filled["messages"][1]["content"], "u中中中");
+    assert_eq!(filled["messages"][2]["content"], "later");
+    assert_eq!(filled["messages"].as_array().expect("messages").len(), 3);
+}
+
+/// 第 5 次请求加 1.3 万个「中」后的完整对完整基线。默认不跑。
+///
+/// **作用**：测量约 16K 的无关填充是否仍做出同一步。
+/// **边界**：没有密钥、没有本机 blob 或找不到 user 时直接返回。不写 Run，不打印填充正文。
+#[tokio::test]
+#[ignore = "dials api.deepseek.com when DEEPSEEK_API_KEY and the local request blob are present"]
+async fn han_fill_16k_baseline_for_mini_inventory_k5() {
+    if std::env::var(API_KEY_ENV)
+        .ok()
+        .filter(|key| !key.is_empty())
+        .is_none()
+    {
+        println!("skipped reason=missing_key");
+        return;
+    }
+    let Some(request) = stored_request(REQUEST_K5_SHA256) else {
+        println!("skipped reason=missing_request");
+        return;
+    };
+    let Some(filled) = append_han_to_first_user(request, FILL_HAN_CHARS) else {
+        println!("skipped reason=missing_user");
+        return;
+    };
+    sample_request(&filled).await;
 }
