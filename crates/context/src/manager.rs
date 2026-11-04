@@ -170,6 +170,8 @@ fn estimate_with_complete_usage(profile: &ModelProfile, transcript: &Transcript)
         profile.han_den,
         profile.letter_num,
         profile.letter_den,
+        profile.digit_num,
+        profile.digit_den,
     );
     let anchored = Estimate {
         tokens: prompt.saturating_add(completion).saturating_add(delta),
@@ -212,6 +214,8 @@ fn full_estimate(profile: &ModelProfile, transcript: &Transcript) -> Estimate {
             profile.han_den,
             profile.letter_num,
             profile.letter_den,
+            profile.digit_num,
+            profile.digit_den,
         ),
         source: EstimateSource::Estimated,
         anchor_round: None,
@@ -277,13 +281,13 @@ mod tests {
         }
     }
 
-    /// 没有上一轮时，汉字和英文字母合在一起向上取整，标点不计。
+    /// 没有上一轮时，汉字、英文字母和数字合在一起向上取整，标点不计。
     #[test]
-    fn full_estimate_counts_only_han_and_ascii_letters() {
+    fn full_estimate_counts_han_letters_and_digits() {
         let prepared = manager()
             .prepare(&bare("Hi", "你好，123"), 32_768)
             .expect("under limit");
-        assert_eq!(prepared.record.estimate.tokens, 2);
+        assert_eq!(prepared.record.estimate.tokens, 4);
         assert_eq!(prepared.record.estimate.source, EstimateSource::Estimated);
         assert_eq!(prepared.record.estimate.anchor_round, None);
         assert_eq!(prepared.record.spec.hard_limit, 711_065);
@@ -405,7 +409,7 @@ mod tests {
         round.usage.prompt_tokens = TokenCount::Known(100);
         transcript.rounds.push(round);
         let prepared = manager().prepare(&transcript, 32_768).expect("under limit");
-        assert_eq!(prepared.record.estimate.tokens, 600);
+        assert_eq!(prepared.record.estimate.tokens, 1000);
         assert_eq!(prepared.record.estimate.source, EstimateSource::Estimated);
         assert_eq!(prepared.record.estimate.anchor_round, None);
     }
@@ -492,7 +496,7 @@ mod tests {
         round.trailing_user = "你好".to_owned();
         transcript.rounds.push(round);
         let prepared = manager().prepare(&transcript, 32_768).expect("under limit");
-        // 两个汉字 1.2，向上取整为 2。
+        // 两个汉字按 1 计是 2。
         assert_eq!(prepared.record.estimate.tokens, 112);
     }
 
@@ -541,11 +545,11 @@ mod tests {
         );
     }
 
-    /// 输出预留占满或超过窗口时，空输入和不可计数字符也不能绕过耗尽检查。
+    /// 输出预留占满或超过窗口时，空输入和仍不计数的标点也不能绕过耗尽检查。
     #[test]
     fn zero_hard_limit_rejects_zero_estimates() {
         for max_tokens in [1_048_576, 1_048_577] {
-            for text in ["", "123，。\n"] {
+            for text in ["", "，。\n"] {
                 let err = manager()
                     .prepare(&bare("", text), max_tokens)
                     .expect_err("exhausted");
@@ -595,7 +599,7 @@ mod tests {
             value,
             json!({
                 "schema_version": 1,
-                "profile_version": 1,
+                "profile_version": 2,
                 "profile_hash": profile.profile_hash,
                 "context_strategy": "identity@1",
                 "spec": { "hard_limit": 711065 },

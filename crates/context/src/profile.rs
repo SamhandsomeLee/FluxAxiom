@@ -18,6 +18,9 @@ const REQUIRED_NAMES: &[&str] = &[
     "tokenizer",
     "token_ratio_han",
     "token_ratio_ascii_letter",
+    "token_ratio_ascii_digit",
+    "token_ratio_repeated_a",
+    "token_ratio_repeated_fn",
     "usage_fields",
     "estimate_error",
     "cache_ratio",
@@ -70,10 +73,10 @@ pub struct ProfileField {
 /// 估算和硬上限实际读取的档案。
 ///
 /// **作用**：`deepseek_flash` 从嵌入的 toml 构造。`profile_hash` 是该文件字节的 sha256 小写十六进制。
-/// **边界**：不保存单价数字。`estimate_error` 在 T2 之前是未校准的临时比例。
+/// **边界**：不保存单价数字。`estimate_error` 仍是未校准的 0.30；T2 第二步的 p99 没有低于它。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelProfile {
-    /// 档案版本，从 1 起。与嵌入 toml 的 `profile_version` 相同。不是 1 的文件会拒绝。
+    /// 档案版本，从 1 起。与嵌入 toml 的 `profile_version` 相同。当前加载器只接受 2。
     pub profile_version: u32,
     /// 档案 toml 原文 UTF-8 字节的 sha256，64 位小写十六进制，无前缀。
     pub profile_hash: String,
@@ -93,14 +96,18 @@ pub struct ModelProfile {
     pub estimate_error_num: u64,
     /// `estimate_error` 的分母，必须大于分子。0 不会从合法档案里读出。
     pub estimate_error_den: u64,
-    /// 汉字比例的分子。与 [`Self::han_den`] 一起表示每字 token，当前档案是 0.6。
+    /// 汉字比例的分子。与 [`Self::han_den`] 一起表示每字 token。档案 v2 是 1。
     pub han_num: u64,
     /// 汉字比例的分母。
     pub han_den: u64,
-    /// ASCII 英文字母比例的分子。与 [`Self::letter_den`] 一起，当前档案是 0.3。
+    /// ASCII 英文字母比例的分子。与 [`Self::letter_den`] 一起。档案 v2 仍是文档比例 0.3，不改用重复 `a` 或 `fn` 的实测。
     pub letter_num: u64,
     /// ASCII 英文字母比例的分母。
     pub letter_den: u64,
+    /// ASCII 数字比例的分子。与 [`Self::digit_den`] 一起。档案 v2 取 T8 两档里较高的 0.335。
+    pub digit_num: u64,
+    /// ASCII 数字比例的分母。
+    pub digit_den: u64,
     /// 档案里的全部字段，含没有取值的未知项。估算只读上面拆出来的数，不扫描这个列表。
     pub fields: Vec<ProfileField>,
 }
@@ -173,7 +180,7 @@ impl ModelProfile {
 /// **边界**：必需字段缺席、文档字段没有值、比例不是约定字符串时返回错误。
 pub(crate) fn load(text: &str) -> Result<ModelProfile, ProfileError> {
     let file: ProfileFile = toml::from_str(text).map_err(|_| ProfileError::Toml)?;
-    if file.profile_version != 1 {
+    if file.profile_version != 2 {
         return Err(ProfileError::Version(file.profile_version));
     }
     let mut fields = Vec::with_capacity(file.fields.len());
@@ -230,6 +237,8 @@ pub(crate) fn load(text: &str) -> Result<ModelProfile, ProfileError> {
         han_den: parse_ratio(&fields, "token_ratio_han")?.1,
         letter_num: parse_ratio(&fields, "token_ratio_ascii_letter")?.0,
         letter_den: parse_ratio(&fields, "token_ratio_ascii_letter")?.1,
+        digit_num: parse_ratio(&fields, "token_ratio_ascii_digit")?.0,
+        digit_den: parse_ratio(&fields, "token_ratio_ascii_digit")?.1,
         fields,
     };
     Ok(profile)
@@ -379,7 +388,7 @@ impl std::fmt::Display for ProfileError {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProfileFile {
-    /// 档案版本。加载器只接受 1。
+    /// 档案版本。加载器只接受 2。
     profile_version: u32,
     /// 全部字段，顺序不参与 hash 以外的比较。hash 用的是原文，不是这个列表。
     fields: Vec<RawField>,
@@ -414,7 +423,26 @@ mod tests {
     #[test]
     fn embedded_deepseek_flash_keeps_unknowns_unfilled() {
         let profile = deepseek_flash().expect("embedded profile");
-        assert_eq!(profile.profile_version, 1);
+        assert_eq!(profile.profile_version, 2);
+        assert_eq!((profile.han_num, profile.han_den), (1, 1));
+        assert_eq!((profile.letter_num, profile.letter_den), (3, 10));
+        assert_eq!((profile.digit_num, profile.digit_den), (335, 1000));
+        assert_eq!(
+            profile
+                .field("token_ratio_repeated_a")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("0.125")
+        );
+        assert_eq!(
+            profile
+                .field("token_ratio_repeated_fn")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("0.5")
+        );
         assert_eq!(profile.alias, "deepseek-flash");
         assert_eq!(profile.doc_version, "V4.1-Flash-1017");
         assert_eq!(profile.context_window, 1_048_576);
@@ -434,6 +462,14 @@ mod tests {
             sha256_hex(EMBEDDED_DEEPSEEK_FLASH.as_bytes())
         );
         assert_eq!(profile.hard_limit(32_768), 711_065);
+    }
+
+    /// 档案版本不是 2 时拒绝，不按旧比例加载。
+    #[test]
+    fn profile_version_other_than_current_is_rejected() {
+        let text =
+            EMBEDDED_DEEPSEEK_FLASH.replacen("profile_version = 2", "profile_version = 1", 1);
+        assert!(matches!(load(&text), Err(ProfileError::Version(1))));
     }
 
     /// 比例按十进制解析，档案换数不用改代码。

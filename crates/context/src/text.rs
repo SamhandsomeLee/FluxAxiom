@@ -1,7 +1,7 @@
 //! 把正文里可计数的字符换成 token 估算。
 //!
-//! **作用**：供估算器使用。实测轮完成前只数汉字和 ASCII 英文字母。
-//! **边界**：数字、空白、标点和其他文字不计数。不按语法排除整段源代码。
+//! **作用**：供估算器使用。计入汉字、ASCII 英文字母和 ASCII 数字。
+//! **边界**：空白、标点和全角数字不计数。不按语法拆源代码。重复字母的其它实测比例不在这里选用。
 
 /// 一段文字里参与估算的字符数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -10,14 +10,16 @@ pub(crate) struct Count {
     pub han: u64,
     /// ASCII `A–Z` / `a–z` 的个数。0 表示没有。全角拉丁字母不计入。
     pub ascii_letters: u64,
+    /// ASCII `0–9` 的个数。0 表示没有。全角数字不计入。
+    pub ascii_digits: u64,
 }
 
-/// 累加 `text` 里的汉字和 ASCII 英文字母。
+/// 累加 `text` 里的汉字、ASCII 英文字母和 ASCII 数字。
 ///
 /// **作用**：全量估算和新增内容估算都先走这里。
 /// **参数**：`text` 可以是 prompt、思维链或工具正文。空串不改变计数。
-/// **边界**：不把结果当服务端 token。汉字含扩展区；全角拉丁字母、日文假名、韩文不计入，
-/// 这些文字出现时估算会偏低，靠 `estimate_error` 的临时余量兜底。
+/// **边界**：不把结果当服务端 token。汉字含扩展区。全角拉丁字母、全角数字、日文假名、韩文、空白和标点不计入。
+/// 这些文字出现时估算会偏低，靠 `estimate_error` 兜底。
 pub(crate) fn count_text(text: &str) -> Count {
     let mut count = Count::default();
     for ch in text.chars() {
@@ -25,6 +27,8 @@ pub(crate) fn count_text(text: &str) -> Count {
             count.han += 1;
         } else if ch.is_ascii_alphabetic() {
             count.ascii_letters += 1;
+        } else if ch.is_ascii_digit() {
+            count.ascii_digits += 1;
         }
     }
     count
@@ -34,12 +38,13 @@ impl Count {
     /// 与另一段计数相加。
     ///
     /// **作用**：把多段正文合成一次取整前的计数。
-    /// **参数**：`other` 是另一段的汉字数和字母数。
+    /// **参数**：`other` 是另一段的汉字数、字母数和数字个数。
     /// **边界**：溢出时饱和，不回绕成小值。
     pub(crate) fn saturating_add(self, other: Self) -> Self {
         Self {
             han: self.han.saturating_add(other.han),
             ascii_letters: self.ascii_letters.saturating_add(other.ascii_letters),
+            ascii_digits: self.ascii_digits.saturating_add(other.ascii_digits),
         }
     }
 }
@@ -47,18 +52,24 @@ impl Count {
 /// 按档案比例把计数向上取整成 token。
 ///
 /// **作用**：得到写入 `estimate.tokens` 的本地部分。
-/// **参数**：`count` 是已经分开的汉字数和字母数，两项都为 0 时结果为 0。`han_num` / `han_den` 是汉字比例，分母必须非 0。`letter_num` / `letter_den` 是英文字母比例，分母必须非 0。
-/// **边界**：两边都是 0 时返回 0。不四舍五入。结果超出 `u64` 时饱和。
+/// **参数**：`count` 是已经分开的汉字数、字母数和数字个数，三项都为 0 时结果为 0。`han_num` / `han_den` 是汉字比例，分母必须非 0。`letter_num` / `letter_den` 是英文字母比例，分母必须非 0。`digit_num` / `digit_den` 是 ASCII 数字比例，分母必须非 0。
+/// **边界**：三项都是 0 时返回 0。不四舍五入。任一比例分母为 0 时不能调用。结果超出 `u64` 时饱和。
 pub(crate) fn ceil_tokens(
     count: Count,
     han_num: u64,
     han_den: u64,
     letter_num: u64,
     letter_den: u64,
+    digit_num: u64,
+    digit_den: u64,
 ) -> u64 {
-    let numerator = (count.han as u128) * (han_num as u128) * (letter_den as u128)
-        + (count.ascii_letters as u128) * (letter_num as u128) * (han_den as u128);
-    let denominator = (han_den as u128) * (letter_den as u128);
+    let han_den = han_den as u128;
+    let letter_den = letter_den as u128;
+    let digit_den = digit_den as u128;
+    let numerator = (count.han as u128) * (han_num as u128) * letter_den * digit_den
+        + (count.ascii_letters as u128) * (letter_num as u128) * han_den * digit_den
+        + (count.ascii_digits as u128) * (digit_num as u128) * han_den * letter_den;
+    let denominator = han_den * letter_den * digit_den;
     ceil_div(numerator, denominator)
 }
 
@@ -80,7 +91,7 @@ pub(crate) fn floor_hard_limit(window: u64, reserve: u64, error_num: u64, error_
 
 /// 正整数除法向上取整。
 ///
-/// **作用**：把「汉字数 × 比例 + 字母数 × 比例」收成整数 token。
+/// **作用**：把汉字、字母和数字按各自比例相加后收成整数 token。
 /// **参数**：`denominator` 必须非 0。`numerator` 为 0 时返回 0。
 /// **边界**：结果超出 `u64` 时饱和为 `u64::MAX`，不回绕。
 fn ceil_div(numerator: u128, denominator: u128) -> u64 {
@@ -124,21 +135,24 @@ mod tests {
         let two_and_two = Count {
             han: 2,
             ascii_letters: 2,
+            ascii_digits: 0,
         };
-        assert_eq!(ceil_tokens(two_and_two, 3, 5, 3, 10), 2);
+        assert_eq!(ceil_tokens(two_and_two, 3, 5, 3, 10, 0, 1), 2);
         let four_letters = Count {
             han: 0,
             ascii_letters: 4,
+            ascii_digits: 0,
         };
-        assert_eq!(ceil_tokens(four_letters, 3, 5, 3, 10), 2);
-        assert_eq!(ceil_tokens(Count::default(), 3, 5, 3, 10), 0);
+        assert_eq!(ceil_tokens(four_letters, 3, 5, 3, 10, 0, 1), 2);
+        assert_eq!(ceil_tokens(Count::default(), 3, 5, 3, 10, 0, 1), 0);
     }
 
-    /// 标点、数字、空白和全角字母不计数。扩展区汉字计数。
+    /// 空白、标点和全角字母不计数。ASCII 数字和扩展区汉字计数。
     #[test]
-    fn skips_unmeasured_characters() {
+    fn counts_han_letters_and_ascii_digits() {
         let count = count_text("a 1，。\nＡ\u{20000}");
         assert_eq!(count.ascii_letters, 1);
+        assert_eq!(count.ascii_digits, 1);
         assert_eq!(count.han, 1);
     }
 

@@ -55,15 +55,15 @@ pub struct AssistantTurn {
 
 /// assistant 消息上的一次工具调用。
 ///
-/// **作用**：全量估算时计入 `id`、`name`、`arguments` 里的汉字和英文字母。
+/// **作用**：全量估算时计入 `id`、`name`、`arguments` 里的汉字、英文字母和 ASCII 数字。
 /// **边界**：锚点估算不再数它们。
 #[derive(Clone, PartialEq, Eq)]
 pub struct ToolCall {
-    /// 调用 ID，应与对应 [`ToolResult::call_id`] 相同。空串在这里不拒绝。全量估算会计入其中的英文字母。`Debug` 会打印。
+    /// 调用 ID，应与对应 [`ToolResult::call_id`] 相同。空串在这里不拒绝。全量估算会计入其中的英文字母和 ASCII 数字。`Debug` 会打印。
     pub id: String,
-    /// 工具名。空串在这里不拒绝。全量估算计入汉字和英文字母。`Debug` 会打印。
+    /// 工具名。空串在这里不拒绝。全量估算计入汉字、英文字母和 ASCII 数字。`Debug` 会打印。
     pub name: String,
-    /// 参数 JSON 文本。空串允许。`Debug` 只打印字符数。全量估算计入汉字和英文字母；锚点估算不数。
+    /// 参数 JSON 文本。空串允许。`Debug` 只打印字符数。全量估算计入汉字、英文字母和 ASCII 数字；锚点估算不数。
     pub arguments: String,
 }
 
@@ -84,7 +84,7 @@ pub struct ToolResult {
     pub result_ref: String,
     /// 调用方声明的正文字节数。0 允许。不与 `body` 的字节长度对账。
     pub byte_count: u64,
-    /// 调用方交来的工具正文。空串允许。估算只数其中的汉字和英文字母。`Debug` 不打印，不进入 context 记录。
+    /// 调用方交来的工具正文。空串允许。估算只数其中的汉字、英文字母和 ASCII 数字。`Debug` 不打印，不进入 context 记录。
     pub body: String,
 }
 

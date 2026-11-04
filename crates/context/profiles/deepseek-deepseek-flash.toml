@@ -1,6 +1,6 @@
-# DeepSeek Flash 档案 v1。取值来自 EA-CTX 执行方案 §4（2026-10-30）。
+# DeepSeek Flash 档案 v2。汉字与数字比例来自 T2 第二步（2026-11-04）。
 # 可信度为「未知」且没有 value 的字段保持未测，不补数。
-profile_version = 1
+profile_version = 2
 
 [[fields]]
 name = "provider"
@@ -52,15 +52,33 @@ source = "EA-CTX 执行方案 §4：官方提供离线包，未接入。实测�
 
 [[fields]]
 name = "token_ratio_han"
-value = "0.6"
-credibility = "文档"
-source = "EA-CTX 执行方案 §4。实测轮 T8 复核前只用于汉字"
+value = "1"
+credibility = "实测"
+source = "T8-han-letter-2026-11-04：重复「中」两档都是 1。T2 第二步替换文档比例 0.6"
 
 [[fields]]
 name = "token_ratio_ascii_letter"
 value = "0.3"
 credibility = "文档"
-source = "EA-CTX 执行方案 §4。实测轮 T8 复核前只用于 ASCII 英文字母"
+source = "T2 第二步保留文档比例 0.3。重复 a 的 0.125 与重复 fn 的 0.5 分别记在下面两个字段，计数器不读它们"
+
+[[fields]]
+name = "token_ratio_ascii_digit"
+value = "0.335"
+credibility = "实测"
+source = "T8-digit-space-punct-2026-11-04：200 字 0.335，2000 字 0.3335，两档稳定。T2 第二步取较高的一档，不取平均"
+
+[[fields]]
+name = "token_ratio_repeated_a"
+value = "0.125"
+credibility = "实测"
+source = "T8-han-letter-2026-11-04：重复 a 两档都是 0.125。不是全部 ASCII 字母的比例，计数器不读"
+
+[[fields]]
+name = "token_ratio_repeated_fn"
+value = "0.5"
+credibility = "实测"
+source = "T8-source-units-2026-11-04：重复 fn 两档都是 0.5。不是全部 ASCII 字母的比例，计数器不读"
 
 [[fields]]
 name = "usage_fields"
@@ -73,7 +91,7 @@ name = "estimate_error"
 value = "0.30"
 credibility = "未知"
 uncalibrated = true
-source = "EA-CTX 执行方案 §4 临时 30%。T2 的 p99 出来后替换"
+source = "T2 第二步重算 35 行，nearest-rank p99 为 2029/2035，不低于 0.30，临时余量不替换。见 T2-profile-v2-2026-11-04"
 
 [[fields]]
 name = "cache_ratio"

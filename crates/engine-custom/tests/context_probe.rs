@@ -1,8 +1,9 @@
-//! T8 探针的离线比例计算。
+//! T8 探针的离线比例计算，以及 T2 对当前估算器的复算。
 //!
-//! **作用**：把两次 `prompt_tokens` 换成比例，并判断 200 字与 2000 字两档是否稳定。也生成固定类别的探针正文。
+//! **作用**：把两次 `prompt_tokens` 换成比例，并判断 200 字与 2000 字两档是否稳定。也生成固定类别的探针正文。T2 用现有 `prepare` 对照已记录的服务端 token。
 //! **边界**：默认测试不发网络请求，不写 Run、事件或档案。文件末尾的 `#[ignore]` 测试只在显式 `--ignored` 时拨号。字符类、源代码单元、字符串、注释和整段分开实调。
 
+use fluxaxiom_context::{deepseek_flash, ContextManager, EstimateSource, Transcript};
 use fluxaxiom_contract::TokenCount;
 use fluxaxiom_engine_custom::{
     execute, CancellationToken, ChatError, ChatRequest, DeepSeekClient, Message, ReasoningEffort,
@@ -651,6 +652,510 @@ const LIVE_PREFIX_SYSTEM: &str = "reply in one word";
 
 /// 实调前缀的 user。探针正文只追加在这条字符串后面。
 const LIVE_PREFIX_USER: &str = "prefix";
+
+/// T8 前缀实调记录的服务端 `prompt_tokens`。估算偏差只在测试里对照这个数。
+const PREFIX_PROMPT_AFTER: u64 = 35;
+
+/// 用空轮次估算「前缀 user + 探针」，并对照 T8 记录的服务端 token。
+///
+/// **作用**：T2 每一行都走现有 `prepare`，不另写计数。
+/// **参数**：`label` 是这一行的类别名，只写进断言失败信息。`probe` 是追加在 [`LIVE_PREFIX_USER`] 后面的正文。前缀行传空串，末尾不另加字符。`expected_tokens` 是当前档案下这次请求的全量估算。`prompt_after` 是 T8 记录里的服务端 `prompt_tokens`，只参与偏差。`expected_deviation` 是估算减去 `prompt_after`，负数表示低估。
+/// **边界**：`rounds` 为空，来源必须是 `estimated`，锚点必须为空。不拨号，不改档案。
+fn assert_probe_estimate(
+    label: &str,
+    probe: &str,
+    expected_tokens: u64,
+    prompt_after: u64,
+    expected_deviation: i64,
+) {
+    let transcript = Transcript {
+        system: LIVE_PREFIX_SYSTEM.to_owned(),
+        user: format!("{LIVE_PREFIX_USER}{probe}"),
+        rounds: Vec::new(),
+    };
+    let manager = ContextManager::new(deepseek_flash().expect("embedded profile"));
+    let prepared = manager
+        .prepare(&transcript, 1)
+        .expect("probe is under the hard limit");
+    let estimate = &prepared.record.estimate;
+    let deviation = i64::try_from(estimate.tokens).expect("estimate fits in i64")
+        - i64::try_from(prompt_after).expect("recorded prompt fits in i64");
+
+    assert_eq!(estimate.source, EstimateSource::Estimated, "{label}");
+    assert_eq!(estimate.anchor_round, None, "{label}");
+    assert_eq!(estimate.tokens, expected_tokens, "{label}");
+    assert_eq!(deviation, expected_deviation, "{label}");
+}
+
+/// 空轮次下，前缀的全量估算对照 T8 记录的服务端 token。
+///
+/// **作用**：锁住没有探针时的估算、来源、锚点和偏差。
+/// **边界**：不拨号，不改档案。35 来自 T8 记录，不写进估算器。
+#[test]
+fn prefix_estimate_uses_full_count_without_anchor() {
+    assert_probe_estimate("prefix", "", 6, PREFIX_PROMPT_AFTER, -29);
+}
+
+/// 200 个字母 `a` 的全量估算对照 T8 记录的服务端 token。
+///
+/// **作用**：锁住字母探针追加到前缀之后的估算和偏差。
+/// **边界**：不拨号，不改档案。只测 200 字。60 来自 T8 记录。
+#[test]
+fn letter_200_estimate_against_recorded_prompt() {
+    assert_probe_estimate(
+        "letter/200",
+        &probe_text(ProbeClass::Letter, 200),
+        66,
+        60,
+        6,
+    );
+}
+
+/// 2000 个字母 `a` 的全量估算对照 T8 记录的服务端 token。
+///
+/// **作用**：锁住同一字母探针在更长一档上的估算和偏差。
+/// **边界**：不拨号，不改档案。只测 2000 字。285 来自 T8 记录。
+#[test]
+fn letter_2000_estimate_against_recorded_prompt() {
+    assert_probe_estimate(
+        "letter/2000",
+        &probe_text(ProbeClass::Letter, 2000),
+        606,
+        285,
+        321,
+    );
+}
+
+/// 200 个汉字「中」的全量估算对照 T8 记录的服务端 token。
+///
+/// **作用**：锁住汉字探针追加到前缀之后的估算和偏差。
+/// **边界**：不拨号，不改档案。只测 200 字。235 来自 T8 记录。
+#[test]
+fn han_200_estimate_against_recorded_prompt() {
+    assert_probe_estimate("han/200", &probe_text(ProbeClass::Han, 200), 206, 235, -29);
+}
+
+/// 2000 个汉字「中」的全量估算对照 T8 记录的服务端 token。
+///
+/// **作用**：锁住同一汉字探针在更长一档上的估算和偏差。
+/// **边界**：不拨号，不改档案。只测 2000 字。2035 来自 T8 记录。
+#[test]
+fn han_2000_estimate_against_recorded_prompt() {
+    assert_probe_estimate(
+        "han/2000",
+        &probe_text(ProbeClass::Han, 2000),
+        2006,
+        2035,
+        -29,
+    );
+}
+
+/// 200 个数字 `1` 的全量估算对照 T8 记录的服务端 token。
+///
+/// **作用**：锁住 ASCII 数字按 0.335 计入后的估算和偏差。
+/// **边界**：不拨号，不改档案。只测 200 字。102 来自 T8 记录。
+#[test]
+fn digit_200_estimate_against_recorded_prompt() {
+    assert_probe_estimate(
+        "digit/200",
+        &probe_text(ProbeClass::Digit, 200),
+        73,
+        102,
+        -29,
+    );
+}
+
+/// 2000 个数字 `1` 的全量估算对照 T8 记录的服务端 token。
+///
+/// **作用**：锁住数字比例在更长一档上的估算和偏差。
+/// **边界**：不拨号，不改档案。只测 2000 字。702 来自 T8 记录。
+#[test]
+fn digit_2000_estimate_against_recorded_prompt() {
+    assert_probe_estimate(
+        "digit/2000",
+        &probe_text(ProbeClass::Digit, 2000),
+        676,
+        702,
+        -26,
+    );
+}
+
+/// 200 个空格的全量估算对照 T8 记录的服务端 token。
+///
+/// **作用**：锁住当前估算器不计入空格时的偏差。空格在 T8 中两档不稳定，仍记录偏差。
+/// **边界**：不拨号，不改档案。只测 200 字。38 来自 T8 记录。空格不增加估算。
+#[test]
+fn space_200_estimate_against_recorded_prompt() {
+    assert_probe_estimate("space/200", &probe_text(ProbeClass::Space, 200), 6, 38, -32);
+}
+
+/// 2000 个空格的全量估算对照 T8 记录的服务端 token。
+///
+/// **作用**：锁住空格在更长一档上仍不增加估算时的偏差。两档比例不稳定，不取比例。
+/// **边界**：不拨号，不改档案。只测 2000 字。52 来自 T8 记录。
+#[test]
+fn space_2000_estimate_against_recorded_prompt() {
+    assert_probe_estimate(
+        "space/2000",
+        &probe_text(ProbeClass::Space, 2000),
+        6,
+        52,
+        -46,
+    );
+}
+
+/// 200 个英文句点的全量估算对照 T8 记录的服务端 token。
+///
+/// **作用**：锁住当前估算器不计入英文句点时的偏差。句点在 T8 中两档不稳定，仍记录偏差。
+/// **边界**：不拨号，不改档案。只测 200 字。38 来自 T8 记录。句点不增加估算。
+#[test]
+fn ascii_punct_200_estimate_against_recorded_prompt() {
+    assert_probe_estimate(
+        "ascii_punct/200",
+        &probe_text(ProbeClass::AsciiPunct, 200),
+        6,
+        38,
+        -32,
+    );
+}
+
+/// 2000 个英文句点的全量估算对照 T8 记录的服务端 token。
+///
+/// **作用**：锁住英文句点在更长一档上仍不增加估算时的偏差。两档比例不稳定，不取比例。
+/// **边界**：不拨号，不改档案。只测 2000 字。52 来自 T8 记录。
+#[test]
+fn ascii_punct_2000_estimate_against_recorded_prompt() {
+    assert_probe_estimate(
+        "ascii_punct/2000",
+        &probe_text(ProbeClass::AsciiPunct, 2000),
+        6,
+        52,
+        -46,
+    );
+}
+
+/// 200 个中文逗号的全量估算对照 T8 记录的服务端 token。
+///
+/// **作用**：锁住当前估算器不把中文逗号当成汉字时的偏差。
+/// **边界**：不拨号，不改档案。只测 200 字。135 来自 T8 记录。逗号不增加估算。
+#[test]
+fn han_punct_200_estimate_against_recorded_prompt() {
+    assert_probe_estimate(
+        "han_punct/200",
+        &probe_text(ProbeClass::HanPunct, 200),
+        6,
+        135,
+        -129,
+    );
+}
+
+/// 其余已有 `prompt_after` 的 T8 探针，一次对照当前估算。
+///
+/// **作用**：锁住中文逗号长档、源代码单元、字符串、注释和整段的估算与偏差。
+/// **边界**：不拨号，不改档案。类别桶没有逐档服务端 token，不进入本表。
+#[test]
+fn remaining_recorded_probes_match_server_prompt() {
+    let rust_200 = whole_text(&rust_pieces());
+    let json_200 = whole_text(&json_pieces());
+    let cases = [
+        (
+            "han_punct/2000",
+            probe_text(ProbeClass::HanPunct, 2000),
+            6_u64,
+            1035_u64,
+            -1029_i64,
+        ),
+        (
+            "keyword/200",
+            slice_text(SliceClass::Keyword, 200),
+            66,
+            135,
+            -69,
+        ),
+        (
+            "keyword/2000",
+            slice_text(SliceClass::Keyword, 2000),
+            606,
+            1035,
+            -429,
+        ),
+        (
+            "digit_underscore/200",
+            slice_text(SliceClass::DigitUnderscore, 200),
+            40,
+            235,
+            -195,
+        ),
+        (
+            "digit_underscore/2000",
+            slice_text(SliceClass::DigitUnderscore, 2000),
+            341,
+            2035,
+            -1694,
+        ),
+        (
+            "operator/200",
+            slice_text(SliceClass::Operator, 200),
+            6,
+            235,
+            -229,
+        ),
+        (
+            "operator/2000",
+            slice_text(SliceClass::Operator, 2000),
+            6,
+            2035,
+            -2029,
+        ),
+        (
+            "space_newline/200",
+            slice_text(SliceClass::SpaceNewline, 200),
+            6,
+            60,
+            -54,
+        ),
+        (
+            "space_newline/2000",
+            slice_text(SliceClass::SpaceNewline, 2000),
+            6,
+            285,
+            -279,
+        ),
+        (
+            "ascii_string/200",
+            syntax_text(SyntaxClass::AsciiString, 200),
+            36,
+            136,
+            -100,
+        ),
+        (
+            "ascii_string/2000",
+            syntax_text(SyntaxClass::AsciiString, 2000),
+            306,
+            1036,
+            -730,
+        ),
+        (
+            "han_string/200",
+            syntax_text(SyntaxClass::HanString, 200),
+            106,
+            186,
+            -80,
+        ),
+        (
+            "han_string/2000",
+            syntax_text(SyntaxClass::HanString, 2000),
+            1006,
+            1536,
+            -530,
+        ),
+        (
+            "line_comment/200",
+            syntax_text(SyntaxClass::LineComment, 200),
+            21,
+            185,
+            -164,
+        ),
+        (
+            "line_comment/2000",
+            syntax_text(SyntaxClass::LineComment, 2000),
+            156,
+            1535,
+            -1379,
+        ),
+        (
+            "block_comment/200",
+            syntax_text(SyntaxClass::BlockComment, 200),
+            18,
+            194,
+            -176,
+        ),
+        (
+            "block_comment/2000",
+            syntax_text(SyntaxClass::BlockComment, 2000),
+            126,
+            1634,
+            -1508,
+        ),
+        (
+            "han_comment/200",
+            syntax_text(SyntaxClass::HanComment, 200),
+            56,
+            185,
+            -129,
+        ),
+        (
+            "han_comment/2000",
+            syntax_text(SyntaxClass::HanComment, 2000),
+            506,
+            1535,
+            -1029,
+        ),
+        ("rust_whole/200", rust_200.clone(), 26, 125, -99),
+        ("rust_whole/2000", rust_200.repeat(10), 204, 935, -731),
+        ("json_whole/200", json_200.clone(), 27, 122, -95),
+        ("json_whole/2000", json_200.repeat(10), 215, 905, -690),
+    ];
+
+    for (label, probe, expected_tokens, prompt_after, expected_deviation) in cases {
+        let chars: usize = label
+            .rsplit_once('/')
+            .and_then(|(_, chars)| chars.parse().ok())
+            .expect("label ends with a size");
+        assert_eq!(probe.chars().count(), chars, "{label}");
+        assert_probe_estimate(
+            label,
+            &probe,
+            expected_tokens,
+            prompt_after,
+            expected_deviation,
+        );
+    }
+}
+
+/// 35 行低估幅度的 nearest-rank p99 仍高于临时余量。
+///
+/// **作用**：锁住档案 v2 不把这次 p99 写成新的 `estimate_error`。
+/// **边界**：不拨号。`rounds` 为空。比例按 `(prompt_after - 估算) / prompt_after` 排序，35 行的第 35 名就是最大值。
+#[test]
+fn underestimation_p99_stays_above_the_temporary_margin() {
+    let profile = deepseek_flash().expect("embedded profile");
+    assert_eq!(
+        (profile.estimate_error_num, profile.estimate_error_den),
+        (30, 100)
+    );
+    let rust_200 = whole_text(&rust_pieces());
+    let json_200 = whole_text(&json_pieces());
+    let rows = [
+        ("prefix", String::new(), PREFIX_PROMPT_AFTER),
+        ("letter/200", probe_text(ProbeClass::Letter, 200), 60),
+        ("letter/2000", probe_text(ProbeClass::Letter, 2000), 285),
+        ("han/200", probe_text(ProbeClass::Han, 200), 235),
+        ("han/2000", probe_text(ProbeClass::Han, 2000), 2035),
+        ("digit/200", probe_text(ProbeClass::Digit, 200), 102),
+        ("digit/2000", probe_text(ProbeClass::Digit, 2000), 702),
+        ("space/200", probe_text(ProbeClass::Space, 200), 38),
+        ("space/2000", probe_text(ProbeClass::Space, 2000), 52),
+        (
+            "ascii_punct/200",
+            probe_text(ProbeClass::AsciiPunct, 200),
+            38,
+        ),
+        (
+            "ascii_punct/2000",
+            probe_text(ProbeClass::AsciiPunct, 2000),
+            52,
+        ),
+        ("han_punct/200", probe_text(ProbeClass::HanPunct, 200), 135),
+        (
+            "han_punct/2000",
+            probe_text(ProbeClass::HanPunct, 2000),
+            1035,
+        ),
+        ("keyword/200", slice_text(SliceClass::Keyword, 200), 135),
+        ("keyword/2000", slice_text(SliceClass::Keyword, 2000), 1035),
+        (
+            "digit_underscore/200",
+            slice_text(SliceClass::DigitUnderscore, 200),
+            235,
+        ),
+        (
+            "digit_underscore/2000",
+            slice_text(SliceClass::DigitUnderscore, 2000),
+            2035,
+        ),
+        ("operator/200", slice_text(SliceClass::Operator, 200), 235),
+        (
+            "operator/2000",
+            slice_text(SliceClass::Operator, 2000),
+            2035,
+        ),
+        (
+            "space_newline/200",
+            slice_text(SliceClass::SpaceNewline, 200),
+            60,
+        ),
+        (
+            "space_newline/2000",
+            slice_text(SliceClass::SpaceNewline, 2000),
+            285,
+        ),
+        (
+            "ascii_string/200",
+            syntax_text(SyntaxClass::AsciiString, 200),
+            136,
+        ),
+        (
+            "ascii_string/2000",
+            syntax_text(SyntaxClass::AsciiString, 2000),
+            1036,
+        ),
+        (
+            "han_string/200",
+            syntax_text(SyntaxClass::HanString, 200),
+            186,
+        ),
+        (
+            "han_string/2000",
+            syntax_text(SyntaxClass::HanString, 2000),
+            1536,
+        ),
+        (
+            "line_comment/200",
+            syntax_text(SyntaxClass::LineComment, 200),
+            185,
+        ),
+        (
+            "line_comment/2000",
+            syntax_text(SyntaxClass::LineComment, 2000),
+            1535,
+        ),
+        (
+            "block_comment/200",
+            syntax_text(SyntaxClass::BlockComment, 200),
+            194,
+        ),
+        (
+            "block_comment/2000",
+            syntax_text(SyntaxClass::BlockComment, 2000),
+            1634,
+        ),
+        (
+            "han_comment/200",
+            syntax_text(SyntaxClass::HanComment, 200),
+            185,
+        ),
+        (
+            "han_comment/2000",
+            syntax_text(SyntaxClass::HanComment, 2000),
+            1535,
+        ),
+        ("rust_whole/200", rust_200.clone(), 125),
+        ("rust_whole/2000", rust_200.repeat(10), 935),
+        ("json_whole/200", json_200.clone(), 122),
+        ("json_whole/2000", json_200.repeat(10), 905),
+    ];
+    let mut ratios = Vec::new();
+    for (label, probe, prompt_after) in rows {
+        let transcript = Transcript {
+            system: LIVE_PREFIX_SYSTEM.to_owned(),
+            user: format!("{LIVE_PREFIX_USER}{probe}"),
+            rounds: Vec::new(),
+        };
+        let prepared = ContextManager::new(profile.clone())
+            .prepare(&transcript, 1)
+            .unwrap_or_else(|_| panic!("{label} is under the hard limit"));
+        let estimate = i64::try_from(prepared.record.estimate.tokens).expect("estimate fits");
+        let after = i64::try_from(prompt_after).expect("prompt fits");
+        ratios.push((after - estimate, prompt_after));
+    }
+    assert_eq!(ratios.len(), 35);
+    ratios.sort_by(|left, right| (left.0 * right.1 as i64).cmp(&(right.0 * left.1 as i64)));
+    let (under, after) = ratios[34];
+    assert_eq!((under, after), (2029, 2035));
+    let after = i64::try_from(after).expect("prompt fits");
+    assert!(under * 100 >= after * 30);
+}
 
 /// 一次实调没有拿到可用的 `prompt_tokens`。
 ///
