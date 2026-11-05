@@ -1,7 +1,8 @@
 //! L2 陈旧遮蔽：遮蔽保护窗口外的工具原文，并按 `l2@1` 重放。
 //!
-//! **作用**：[`StaleMask`] 实现策略。[`ContextManager::replay`] 在策略名是 `l2@1` 时调用它。
-//! **边界**：不读档案，不打开 blob，不看软触发和 64K 目标。`prepare` 不调用它。
+//! **作用**：[`StaleMask`] 实现策略。[`ContextManager::prepare`] 在超过软触发且仍高于目标时调用它。
+//! [`ContextManager::replay`] 按 `l2@1`、`l0l2@1` 或 `l0l1l2@1` 重放。
+//! **边界**：不读档案，不打开 blob。软触发和腾出量在 `prepare` 里。
 
 use crate::record::{ContextRecord, ContextSpec, ReplayError};
 use crate::strategy::ContextStrategy;
@@ -15,7 +16,7 @@ pub const L2_STRATEGY: &str = "l2@1";
 /// 陈旧遮蔽策略。
 ///
 /// **作用**：实现 [`ContextStrategy`]。`apply` 遮掉保护窗口外的工具原文，`replay` 按记录写回。
-/// **边界**：没有字段。不读档案，不打开 blob。`prepare` 不调用它。
+/// **边界**：没有字段。不读档案，不打开 blob。是否留下由 `prepare` 决定。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaleMask;
 
@@ -30,9 +31,9 @@ impl ContextStrategy for StaleMask {
 
     /// 把保护窗口外的工具原文换成存根，并追加 edit。
     ///
-    /// **作用**：策略测试直接调用。`prepare` 不调用。
-    /// **参数**：`view` 只改窗口外、正文仍是原文的 `body`。`spec` 不读，硬上限为 0 也允许。
-    /// `record` 只在 `edits` 末尾追加，不改策略名。
+    /// **作用**：`prepare` 在决定留下 L2 之前调用。策略测试也可以直接调用。
+    /// **参数**：`view` 只改窗口外、正文仍是原文、且不是本轮 L0 指针目标的 `body`。`spec` 不读，硬上限为 0 也允许。
+    /// `record` 只在 `edits` 末尾追加，不改策略名。已有的 `unchanged` edit 用来认出指针目标。
     /// **边界**：没有命中时不追加。不删除 blob。
     fn apply(&self, view: &mut View, _spec: &ContextSpec, record: &mut ContextRecord) {
         mask_stale(view, &mut record.edits);
@@ -53,20 +54,134 @@ impl ContextStrategy for StaleMask {
     }
 }
 
+/// `prepare` 在留下 L2、但没有留下 L1 时写入的策略标识。
+pub const L0L2_STRATEGY: &str = "l0l2@1";
+
+/// 先重放 L0 的 edit，再重放 L2 的 edit。
+///
+/// **作用**：`ContextManager::replay` 在策略名是 `l0l2@1` 时调用。
+/// **边界**：`prepare` 不调用 [`Self::apply`]。不打开 blob。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct L0ThenL2;
+
+impl ContextStrategy for L0ThenL2 {
+    /// 返回 `l0l2@1`。
+    ///
+    /// **作用**：记录和重放用它认出「L0 之后又留下了 L2」。
+    /// **边界**：不带估算或档案 hash。
+    fn id(&self) -> &str {
+        L0L2_STRATEGY
+    }
+
+    /// 不在这里跑目标判断。
+    ///
+    /// **作用**：trait 要求有 `apply`。目标和腾出量在 `prepare` 里。
+    /// **参数**：`view`、`spec`、`record` 都不读。空视图允许。
+    /// **边界**：不改视图，不追加 edit。
+    fn apply(&self, _view: &mut View, _spec: &ContextSpec, _record: &mut ContextRecord) {}
+
+    /// 按 `op` 分成两段重放。
+    ///
+    /// **作用**：同一条记录里可以同时有 `unchanged` 和 `stale`。
+    /// **参数**：`view` 从事实抄出。`record` 提供策略名和 `edits`。
+    /// **边界**：策略名不是 `l0l2@1`，或出现第三种 `op`，都不改视图。
+    fn replay(&self, view: &mut View, record: &ContextRecord) -> Result<(), ReplayError> {
+        if record.context_strategy != self.id() {
+            return Err(ReplayError::UnknownStrategy {
+                id: record.context_strategy.clone(),
+            });
+        }
+        let mut unchanged = Vec::new();
+        let mut stale = Vec::new();
+        for edit in &record.edits {
+            let Some(op) = edit.get("op").and_then(|value| value.as_str()) else {
+                return Err(ReplayError::InvalidEdit);
+            };
+            match op {
+                "unchanged" => unchanged.push(edit.clone()),
+                "stale" => stale.push(edit.clone()),
+                _ => return Err(ReplayError::InvalidEdit),
+            }
+        }
+        crate::forward_dedup::replay_unchanged_edits(view, &unchanged)?;
+        replay_stale_edits(view, &stale)
+    }
+}
+
+/// `prepare` 在 L1 和 L2 都留下时写入的策略标识。
+pub const L0L1L2_STRATEGY: &str = "l0l1l2@1";
+
+/// 先重放 L0，再重放 L1，最后重放 L2。
+///
+/// **作用**：`ContextManager::replay` 在策略名是 `l0l1l2@1` 时调用。
+/// **边界**：`prepare` 不调用 [`Self::apply`]。不打开 blob。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct L0ThenL1ThenL2;
+
+impl ContextStrategy for L0ThenL1ThenL2 {
+    /// 返回 `l0l1l2@1`。
+    ///
+    /// **作用**：记录和重放用它认出「L0、L1、L2 都留下了」。
+    /// **边界**：不带估算或档案 hash。
+    fn id(&self) -> &str {
+        L0L1L2_STRATEGY
+    }
+
+    /// 不在这里跑软触发或目标判断。
+    ///
+    /// **作用**：trait 要求有 `apply`。去留在 `prepare` 里。
+    /// **参数**：`view`、`spec`、`record` 都不读。空视图允许。
+    /// **边界**：不改视图，不追加 edit。
+    fn apply(&self, _view: &mut View, _spec: &ContextSpec, _record: &mut ContextRecord) {}
+
+    /// 按 `op` 分成三段重放。
+    ///
+    /// **作用**：同一条记录里可以同时有 `unchanged`、`superseded` 和 `stale`。
+    /// **参数**：`view` 从事实抄出。`record` 提供策略名和 `edits`。
+    /// **边界**：策略名不是 `l0l1l2@1`，或出现第四种 `op`，都不改视图。
+    fn replay(&self, view: &mut View, record: &ContextRecord) -> Result<(), ReplayError> {
+        if record.context_strategy != self.id() {
+            return Err(ReplayError::UnknownStrategy {
+                id: record.context_strategy.clone(),
+            });
+        }
+        let mut unchanged = Vec::new();
+        let mut superseded = Vec::new();
+        let mut stale = Vec::new();
+        for edit in &record.edits {
+            let Some(op) = edit.get("op").and_then(|value| value.as_str()) else {
+                return Err(ReplayError::InvalidEdit);
+            };
+            match op {
+                "unchanged" => unchanged.push(edit.clone()),
+                "superseded" => superseded.push(edit.clone()),
+                "stale" => stale.push(edit.clone()),
+                _ => return Err(ReplayError::InvalidEdit),
+            }
+        }
+        crate::forward_dedup::replay_unchanged_edits(view, &unchanged)?;
+        crate::supersede::replay_superseded_edits(view, &superseded)?;
+        replay_stale_edits(view, &stale)
+    }
+}
+
 /// 把保护窗口之外、正文仍是原文的工具结果换成陈旧存根。
 ///
 /// **作用**：L2 的遮蔽函数。测试直接调用。
 /// **参数**：`view` 只改命中的工具 `body`，空视图允许。`edits` 只在末尾追加命中的 edit，已有内容保留。
 /// **边界**：最近 [`PROTECT_ROUNDS`] 个模型轮不动。正文已以 `[unchanged:`、`[superseded:` 或 `[stale:` 开头时跳过。
+/// 已有 `unchanged` edit 的 `same_as_round` / `same_as_call` 指向的原文也跳过。缺这两个字段的 edit 不当成指针。
 /// 不改 `system`、`user`、assistant 和 `trailing_user`。不读规格，不改策略名，不打开 blob。
 /// 从最旧一轮的最早一次调用开始，窗口外的原文一批全部替换，不按目标中途停下。
-/// 被 L0 指针指到的原文这一步仍会遮。
 fn mask_stale(view: &mut View, edits: &mut Vec<Value>) {
+    let pointed = l0_pointer_targets(edits);
     let protect_from = view.rounds.len().saturating_sub(PROTECT_ROUNDS);
     for round in 0..protect_from {
         let tool_count = view.rounds[round].tools.len();
         for call in 0..tool_count {
-            if is_existing_stub(&view.rounds[round].tools[call].body) {
+            if pointed.contains(&(round, call))
+                || is_existing_stub(&view.rounds[round].tools[call].body)
+            {
                 continue;
             }
             let tool = view.rounds[round].tools[call].clone();
@@ -79,6 +194,31 @@ fn mask_stale(view: &mut View, edits: &mut Vec<Value>) {
             }));
         }
     }
+}
+
+/// 收集已有 L0 指针指向的工具位置。
+///
+/// **作用**：`mask_stale` 避免把「与第 N 轮相同」指到的原文再换成陈旧存根。
+/// **参数**：`edits` 是调用前已经写下的 edit。空切片表示没有指针。
+/// **边界**：只认 `op` 为 `unchanged` 且 `same_as_round`、`same_as_call` 都是从 1 起的整数。其它 edit 忽略。
+fn l0_pointer_targets(edits: &[Value]) -> Vec<(usize, usize)> {
+    let mut targets = Vec::new();
+    for edit in edits {
+        let Some(object) = edit.as_object() else {
+            continue;
+        };
+        if object.get("op").and_then(Value::as_str) != Some("unchanged") {
+            continue;
+        }
+        let Ok(round) = one_based(object, "same_as_round") else {
+            continue;
+        };
+        let Ok(call) = one_based(object, "same_as_call") else {
+            continue;
+        };
+        targets.push((round, call));
+    }
+    targets
 }
 
 /// 判断这段正文是不是已有的存根。
@@ -549,5 +689,66 @@ mod tests {
             })
         );
         assert_eq!(facts.rounds[0].tools[0].body, original);
+    }
+
+    /// 已有 L0 指针时，不遮它指向的原文，仍遮窗口外的另一条。
+    ///
+    /// **作用**：锁住 `same_as_round` / `same_as_call`。
+    /// **边界**：四轮里前两轮在保护窗口外。第 1 轮是指针目标。
+    #[test]
+    fn mask_stale_skips_the_l0_pointer_target() {
+        let original = "original-body";
+        let other = "other-body";
+        let mut view = View {
+            system: "sys".to_owned(),
+            user: "usr".to_owned(),
+            rounds: vec![
+                round(vec![tool(
+                    "list_files",
+                    r#"{"path":"."}"#,
+                    original,
+                    12,
+                    "sha256:same",
+                )]),
+                round(vec![tool(
+                    "list_files",
+                    r#"{"path":"src"}"#,
+                    other,
+                    8,
+                    "sha256:other",
+                )]),
+                round(vec![tool(
+                    "list_files",
+                    r#"{"path":"near"}"#,
+                    "near",
+                    4,
+                    "sha256:near",
+                )]),
+                round(vec![tool(
+                    "list_files",
+                    r#"{"path":"."}"#,
+                    original,
+                    12,
+                    "sha256:same",
+                )]),
+            ],
+        };
+        let mut edits = vec![json!({
+            "op": "unchanged",
+            "round": 4,
+            "call": 1,
+            "same_as_round": 1,
+            "same_as_call": 1,
+            "result_ref": "sha256:same",
+        })];
+        mask_stale(&mut view, &mut edits);
+        assert_eq!(view.rounds[0].tools[0].body, original);
+        assert_eq!(
+            view.rounds[1].tools[0].body,
+            "[stale: list_files {\"path\":\"src\"}, 8 B, sha256:other; call this tool again if needed]"
+        );
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[1]["op"], "stale");
+        assert_eq!(edits[1]["round"], 2);
     }
 }

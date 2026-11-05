@@ -92,7 +92,8 @@ async fn exhaustion_diagnostic_survives_reopen_without_a_phantom_model_call() {
         let record: serde_json::Value = serde_json::from_slice(&record_bytes).unwrap();
         assert_eq!(payload.context_strategy, "l0@1");
         assert_eq!(record["context_strategy"], payload.context_strategy);
-        assert_eq!(record["schema_version"], 2);
+        assert_eq!(record["schema_version"], 3);
+        assert_eq!(record["spec"]["target"], 64000);
         assert_eq!(record["spec"]["hard_limit"], 711065);
         assert_eq!(record["spec"]["soft_trigger"], 128000);
         assert_eq!(record["spec"]["protect_rounds"], 2);

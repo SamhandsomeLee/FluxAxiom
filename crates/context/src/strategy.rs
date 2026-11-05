@@ -12,7 +12,7 @@ pub const IDENTITY_STRATEGY: &str = "identity@1";
 /// 一次可重放的上下文编辑。
 ///
 /// **作用**：`apply` 改视图并记下编辑；`replay` 按记录重做同一件事。
-/// **边界**：`ForwardDedup`、`SupersedeRead` 与 `StaleMask` 已经实现它。`prepare` 每次调用 L0，只在超过软触发后才试 L1，不调用 L2。
+/// **边界**：`ForwardDedup`、`SupersedeRead` 与 `StaleMask` 已经实现它。`prepare` 每次调用 L0，只在超过软触发后才试 L1，仍高于目标时才试 L2。
 pub trait ContextStrategy: Send + Sync {
     /// 返回这条策略的稳定标识。
     ///

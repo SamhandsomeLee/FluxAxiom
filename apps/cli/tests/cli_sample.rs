@@ -288,7 +288,7 @@ fn unsupported_and_legacy_context_records_keep_their_classification() {
         } else {
             replace_context_record(data.path(), |record| match kind {
                 "unknown_strategy" => record["context_strategy"] = json!("mask@999"),
-                "unsupported_schema" => record["schema_version"] = json!(3),
+                "unsupported_schema" => record["schema_version"] = json!(4),
                 "not_replayable" => record["replayable"] = json!(false),
                 _ => unreachable!(),
             });

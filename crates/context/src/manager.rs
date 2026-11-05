@@ -6,7 +6,9 @@
 use fluxaxiom_contract::TokenCount;
 
 use crate::forward_dedup::{ForwardDedup, L0_STRATEGY};
-use crate::stale::{StaleMask, L2_STRATEGY};
+use crate::stale::{
+    L0ThenL1ThenL2, L0ThenL2, StaleMask, L0L1L2_STRATEGY, L0L2_STRATEGY, L2_STRATEGY,
+};
 use crate::supersede::{L0ThenL1, L0L1_STRATEGY, SupersedeRead, L1_STRATEGY, PROTECT_ROUNDS};
 use crate::profile::ModelProfile;
 use crate::record::{ContextRecord, ContextSpec, Estimate, EstimateSource, ReplayError};
@@ -14,8 +16,11 @@ use crate::strategy::{ContextStrategy, Identity, IDENTITY_STRATEGY};
 use crate::text::ceil_tokens;
 use crate::transcript::{Round, Transcript, View};
 
-/// 未校准的软触发。估算不超过这个数时不试 L1。
+/// 未校准的软触发。估算不超过这个数时不试 L1 和 L2。
 const SOFT_TRIGGER_TOKENS: u64 = 128_000;
+
+/// 未校准的 L2 目标。软触发之后，估算不超过这个数时不试 L2。
+const TARGET_TOKENS: u64 = SOFT_TRIGGER_TOKENS / 2;
 
 /// 没超过硬上限时，L1 至少要腾出的 token。
 const MIN_FREE_TOKENS: u64 = 32_000;
@@ -44,7 +49,7 @@ pub struct ContextExhausted {
 
 /// 持有一份档案的恒等管理器。
 ///
-/// **作用**：没留下 L1 时策略名是 `l0@1`。留下 L1 时策略名是 `l0l1@1`。
+/// **作用**：没留下 L1 和 L2 时策略名是 `l0@1`。只留下 L1 时是 `l0l1@1`。留下 L2 时是 `l0l2@1` 或 `l0l1l2@1`。
 /// **边界**：不读取档案里没有取值的字段，也不读取单价。耗尽时不发送请求。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextManager {
@@ -62,24 +67,26 @@ impl ContextManager {
         Self { profile }
     }
 
-    /// 先做 L0，超过软触发后再决定是否留下 L1，最后检查硬上限。
+    /// 先做 L0，超过软触发后再决定是否留下 L1，仍高于目标时再决定是否留下 L2，最后检查硬上限。
     ///
-    /// **作用**：每次模型调用前调用。通过硬上限时，重复的新工具正文已换成存根；留下 L1 时，被后读盖住的旧正文也换成存根。
+    /// **作用**：每次模型调用前调用。通过硬上限时，重复的新工具正文已换成存根；留下 L1 时，被后读盖住的旧正文也换成存根；留下 L2 时，保护窗口外的旧工具原文也换成存根。
     /// **参数**：`transcript` 由调用方填入正文。`max_tokens` 是这次请求的输出上限，用来计算硬上限。
     /// **边界**：估算使用替换后的工具正文。更早轮次的已知 prompt 仍是下界。缓存字段不参加加法。
-    /// 记录为 schema 2：软触发 128K、最少腾出 `max(32K, 估算 / 4)`、保护窗口 2 轮。`replay` 不读后三项。
-    /// 估算不超过 128K 时不试 L1，策略名保持 `l0@1`。超过 128K 时，没超过硬上限则至少要腾出最少腾出量才留下 L1；已经超过硬上限时即使腾出不够也留下。
+    /// 记录为 schema 3：软触发 128K、最少腾出 `max(32K, 估算 / 4)`、保护窗口 2 轮、目标 64K。`replay` 不读后四项。
+    /// 估算不超过 128K 时不试 L1 和 L2，策略名保持 `l0@1`。超过 128K 时，没超过硬上限则至少要腾出最少腾出量才留下 L1；已经超过硬上限时即使腾出不够也留下。
+    /// L1 去留之后估算仍高于 64K 时，用同样的腾出规则决定是否留下 L2。
     /// 硬上限为 0，或最终估算仍超过硬上限时，返回 [`ContextExhausted`]，不发送请求。
     pub fn prepare(
         &self,
         transcript: &Transcript,
         max_tokens: u32,
     ) -> Result<Prepared, ContextExhausted> {
-        let spec = ContextSpec::schema2(
+        let spec = ContextSpec::schema3(
             self.profile.hard_limit(max_tokens),
             SOFT_TRIGGER_TOKENS,
             MIN_FREE_TOKENS,
             PROTECT_ROUNDS as u32,
+            TARGET_TOKENS,
         );
         let mut view = View::identity(transcript);
         let mut record = ContextRecord::identity(
@@ -113,6 +120,29 @@ impl ContextManager {
                 view = before_view;
                 record.edits = before_edits;
             }
+            if record.estimate.tokens > TARGET_TOKENS {
+                let before_view = view.clone();
+                let before_edits = record.edits.clone();
+                let before_tokens = record.estimate.tokens;
+                let kept_l1 = record.context_strategy == L0L1_STRATEGY;
+                StaleMask.apply(&mut view, &spec, &mut record);
+                let after = estimate_view(&self.profile, transcript, &view);
+                let freed = before_tokens.saturating_sub(after.tokens);
+                let minimum = MIN_FREE_TOKENS.max(before_tokens / 4);
+                let over_hard = spec.hard_limit == 0 || before_tokens > spec.hard_limit;
+                let added = record.edits.len() > before_edits.len();
+                if added && (over_hard || freed >= minimum) {
+                    record.context_strategy = if kept_l1 {
+                        L0L1L2_STRATEGY.to_owned()
+                    } else {
+                        L0L2_STRATEGY.to_owned()
+                    };
+                    record.estimate = after;
+                } else {
+                    view = before_view;
+                    record.edits = before_edits;
+                }
+            }
         }
         if record.spec.hard_limit == 0 || record.estimate.tokens > record.spec.hard_limit {
             return Err(ContextExhausted { record });
@@ -124,11 +154,12 @@ impl ContextManager {
     ///
     /// **作用**：校验器拿它的结果做逐字节比较。本函数不理解编辑种类。
     /// **参数**：`transcript` 是调用方从 blob 装好的事实。`record` 是当时的 context 记录。
-    /// **边界**：接受 schema 1 与 2 的 `identity@1`、`l0@1`、`l1@1`、`l0l1@1` 与 `l2@1`。不可重放、未知策略或恒等记录里有编辑时返回错误。
+    /// **边界**：接受 schema 1、2 与 3 的 `identity@1`、`l0@1`、`l1@1`、`l0l1@1`、`l2@1`、`l0l2@1` 与 `l0l1l2@1`。不可重放、未知策略或恒等记录里有编辑时返回错误。
     /// 检查估算来源与锚点的关联及轮次范围；不重新计算估算，也不对照硬上限。
-    /// 不读 `spec` 里的软触发、最少腾出和保护窗口。
+    /// 不读 `spec` 里的软触发、最少腾出、保护窗口和目标。
     pub fn replay(transcript: &Transcript, record: &ContextRecord) -> Result<View, ReplayError> {
         if record.schema_version != crate::record::SCHEMA_V1
+            && record.schema_version != crate::record::SCHEMA_V2
             && record.schema_version != crate::record::SCHEMA_VERSION
         {
             return Err(ReplayError::UnsupportedSchema {
@@ -158,6 +189,10 @@ impl ContextManager {
             L0ThenL1.replay(&mut view, record)?;
         } else if record.context_strategy == L2_STRATEGY {
             StaleMask.replay(&mut view, record)?;
+        } else if record.context_strategy == L0L2_STRATEGY {
+            L0ThenL2.replay(&mut view, record)?;
+        } else if record.context_strategy == L0L1L2_STRATEGY {
+            L0ThenL1ThenL2.replay(&mut view, record)?;
         } else {
             return Err(ReplayError::UnknownStrategy {
                 id: record.context_strategy.clone(),
@@ -354,7 +389,8 @@ mod tests {
         assert_eq!(prepared.record.estimate.tokens, 4);
         assert_eq!(prepared.record.estimate.source, EstimateSource::Estimated);
         assert_eq!(prepared.record.estimate.anchor_round, None);
-        assert_eq!(prepared.record.schema_version, 2);
+        assert_eq!(prepared.record.schema_version, 3);
+        assert_eq!(prepared.record.spec.target, Some(64_000));
         assert_eq!(prepared.record.spec.hard_limit, 711_065);
         assert_eq!(prepared.record.spec.soft_trigger, Some(128_000));
         assert_eq!(prepared.record.spec.min_free, Some(32_000));
@@ -460,6 +496,36 @@ mod tests {
         }
     }
 
+    /// 造一轮 `list_files`，避免被 L1 当成可作废的读取。
+    ///
+    /// **作用**：L2 去留测试用它放一段可计数的正文。
+    /// **参数**：`body` 是工具原文。`result_ref` 写入这条结果；和另一条相同且参数也相同才会被 L0 指到。
+    /// **边界**：参数固定为 `{"path":"."}`。用量四项都是未知。
+    fn list_round(body: &str, result_ref: &str) -> Round {
+        Round {
+            assistant: AssistantTurn {
+                content: "keep".to_owned(),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+            },
+            tools: vec![ToolResult {
+                call_id: "call".to_owned(),
+                name: "list_files".to_owned(),
+                arguments: r#"{"path":"."}"#.to_owned(),
+                result_ref: result_ref.to_owned(),
+                byte_count: body.len() as u64,
+                body: body.to_owned(),
+            }],
+            usage: ModelUsage {
+                prompt_tokens: TokenCount::Unknown,
+                completion_tokens: TokenCount::Unknown,
+                prompt_cache_hit_tokens: TokenCount::Unknown,
+                prompt_cache_miss_tokens: TokenCount::Unknown,
+            },
+            trailing_user: String::new(),
+        }
+    }
+
     /// 三轮：第 1 轮是部分读取，第 3 轮整文件盖住它。第 2 轮没有工具。
     ///
     /// **作用**：让第 1 轮落在保护窗口之外。
@@ -535,6 +601,61 @@ mod tests {
             .iter()
             .any(|edit| edit["op"] == "superseded"));
         assert!(exhausted.record.estimate.tokens > exhausted.record.spec.hard_limit);
+    }
+
+    /// 旧工具正文够大时留下 L2，最近两轮保持原文。
+    ///
+    /// **作用**：确认目标之后的去留，以及 `l0l2@1` 可以重放。
+    /// **边界**：工具名是 `list_files`，所以没有 L1 编辑。
+    #[test]
+    fn prepare_keeps_l2_when_it_frees_enough() {
+        let old = "中".repeat(100_000);
+        let transcript = Transcript {
+            system: "s".to_owned(),
+            user: "中".repeat(40_000),
+            rounds: vec![
+                list_round(&old, "sha256:old"),
+                list_round("mid", "sha256:mid"),
+                list_round("new", "sha256:new"),
+            ],
+        };
+        let prepared = manager().prepare(&transcript, 32_768).expect("under limit");
+        assert_eq!(prepared.record.context_strategy, L0L2_STRATEGY);
+        assert!(prepared.view.rounds[0].tools[0].body.starts_with("[stale:"));
+        assert_eq!(prepared.view.rounds[1].tools[0].body, "mid");
+        assert_eq!(prepared.view.rounds[2].tools[0].body, "new");
+        let view = ContextManager::replay(&transcript, &prepared.record).expect("replay");
+        assert_eq!(view, prepared.view);
+    }
+
+    /// L0 指针指向的原文保持正文，另一条窗口外的旧结果可以变成存根。
+    ///
+    /// **作用**：确认接入 `prepare` 之后会跳过指针目标。
+    /// **边界**：第 4 轮与第 1 轮是同一次结果。第 2 轮是另一条大正文。
+    #[test]
+    fn prepare_does_not_stale_the_l0_pointer_target() {
+        let original = "中".repeat(100_000);
+        let other = "中".repeat(80_000);
+        let transcript = Transcript {
+            system: "s".to_owned(),
+            user: "u".to_owned(),
+            rounds: vec![
+                list_round(&original, "sha256:same"),
+                list_round(&other, "sha256:other"),
+                list_round("near", "sha256:near"),
+                list_round(&original, "sha256:same"),
+            ],
+        };
+        let prepared = manager().prepare(&transcript, 32_768).expect("under limit");
+        assert_eq!(prepared.record.context_strategy, L0L2_STRATEGY);
+        assert_eq!(prepared.view.rounds[0].tools[0].body, original);
+        assert!(prepared.view.rounds[1].tools[0].body.starts_with("[stale:"));
+        assert_eq!(
+            prepared.view.rounds[3].tools[0].body,
+            "[unchanged: same result as round #1 call 1]"
+        );
+        let view = ContextManager::replay(&transcript, &prepared.record).expect("replay");
+        assert_eq!(view, prepared.view);
     }
 
     /// 锚点只加最后一轮的工具正文。assistant 正文和未知的缓存字段不再数一遍。
@@ -804,7 +925,8 @@ mod tests {
                         "hard_limit": 0,
                         "soft_trigger": 128000,
                         "min_free": 32000,
-                        "protect_rounds": 2
+                        "protect_rounds": 2,
+                        "target": 64000
                     })
                 );
                 assert_eq!(
@@ -848,7 +970,7 @@ mod tests {
         assert_eq!(
             value,
             json!({
-                "schema_version": 2,
+                "schema_version": 3,
                 "profile_version": 2,
                 "profile_hash": profile.profile_hash,
                 "context_strategy": "l0@1",
@@ -856,7 +978,8 @@ mod tests {
                     "hard_limit": 711065,
                     "soft_trigger": 128000,
                     "min_free": 32000,
-                    "protect_rounds": 2
+                    "protect_rounds": 2,
+                    "target": 64000
                 },
                 "estimate": {
                     "tokens": 7,
@@ -907,12 +1030,12 @@ mod tests {
             Err(ReplayError::NotReplayable)
         ));
         record.replayable = true;
-        record.schema_version = 3;
+        record.schema_version = 4;
         assert!(matches!(
             ContextManager::replay(&transcript, &record),
-            Err(ReplayError::UnsupportedSchema { schema_version: 3 })
+            Err(ReplayError::UnsupportedSchema { schema_version: 4 })
         ));
-        record.schema_version = 2;
+        record.schema_version = 3;
         record.edits.push(json!({"op": "mask"}));
         assert!(matches!(
             ContextManager::replay(&transcript, &record),
