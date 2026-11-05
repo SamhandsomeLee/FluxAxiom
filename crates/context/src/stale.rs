@@ -1,8 +1,9 @@
-//! L2 陈旧遮蔽的第一刀：把保护窗口之外的工具原文换成存根。
+//! L2 陈旧遮蔽：遮蔽保护窗口外的工具原文，并按 edit 重放。
 //!
-//! **作用**：测试直接调用 [`mask_stale`]。`prepare` 这一步不调用它。
+//! **作用**：测试直接调用 [`mask_stale`] 和 [`replay_stale_edits`]。`prepare` 这一步不调用它们。
 //! **边界**：不读档案，不打开 blob，不看软触发和 64K 目标。
 
+use crate::record::ReplayError;
 use crate::supersede::PROTECT_ROUNDS;
 use crate::transcript::{ToolResult, View};
 use serde_json::{json, Value};
@@ -56,6 +57,72 @@ fn stale_stub(tool: &ToolResult) -> String {
         "[stale: {} {}, {} B, {}; call this tool again if needed]",
         tool.name, tool.arguments, tool.byte_count, tool.result_ref
     )
+}
+
+/// 按 L2 edit 把事实视图里的正文写回存根。
+///
+/// **作用**：重放测试直接调用。以后的策略 `replay` 再转调它。
+/// **参数**：`view` 从事实抄出，成功时只改 edit 点到的 `body`。`edits` 只处理 `op: stale`，空切片允许。
+/// **边界**：先检查全部 edit，任一不合法返回 [`ReplayError::InvalidEdit`] 且不改 `view`。
+/// 存根由该条工具的名字、参数、大小和 `result_ref` 重拼，不读取 edit 里的其它文字。
+/// 轮次落在最近 [`PROTECT_ROUNDS`] 轮内时也不合法。不打开 blob。
+fn replay_stale_edits(view: &mut View, edits: &[Value]) -> Result<(), ReplayError> {
+    let mut changes = Vec::new();
+    let protect_from = view.rounds.len().saturating_sub(PROTECT_ROUNDS);
+    for edit in edits {
+        let Some(object) = edit.as_object() else {
+            return Err(ReplayError::InvalidEdit);
+        };
+        let Some(op) = object.get("op").and_then(Value::as_str) else {
+            return Err(ReplayError::InvalidEdit);
+        };
+        if op != "stale" {
+            return Err(ReplayError::InvalidEdit);
+        }
+        let round = one_based(object, "round")?;
+        let call = one_based(object, "call")?;
+        let Some(result_ref) = object.get("result_ref").and_then(Value::as_str) else {
+            return Err(ReplayError::InvalidEdit);
+        };
+        let Some(tool) = tool_at(view, round, call) else {
+            return Err(ReplayError::InvalidEdit);
+        };
+        if tool.result_ref != result_ref || round >= protect_from {
+            return Err(ReplayError::InvalidEdit);
+        }
+        changes.push((round, call, stale_stub(tool)));
+    }
+    for (round, call, body) in changes {
+        view.rounds[round].tools[call].body = body;
+    }
+    Ok(())
+}
+
+/// 读取 edit 里从 1 起的序号，并转换成切片下标。
+///
+/// **作用**：`replay_stale_edits` 读轮次与调用序号。
+/// **参数**：`object` 是一条 edit。`key` 是要读的字段名。值必须是不小于 1 的整数。
+/// **边界**：缺字段、负数、小数或 0 都返回 [`ReplayError::InvalidEdit`]。
+fn one_based(object: &serde_json::Map<String, Value>, key: &str) -> Result<usize, ReplayError> {
+    let Some(number) = object.get(key).and_then(Value::as_u64) else {
+        return Err(ReplayError::InvalidEdit);
+    };
+    let Some(index) = usize::try_from(number)
+        .ok()
+        .and_then(|value| value.checked_sub(1))
+    else {
+        return Err(ReplayError::InvalidEdit);
+    };
+    Ok(index)
+}
+
+/// 按从 0 起的下标取出一条工具结果。
+///
+/// **作用**：`replay_stale_edits` 确认序号落在视图里。
+/// **参数**：`view` 只读。`round` 是轮次下标，`call` 是该轮工具下标，都从 0 起。
+/// **边界**：越界时返回 `None`。
+fn tool_at(view: &View, round: usize, call: usize) -> Option<&ToolResult> {
+    view.rounds.get(round).and_then(|item| item.tools.get(call))
 }
 
 #[cfg(test)]
@@ -203,5 +270,159 @@ mod tests {
         assert!(edits.is_empty());
         assert_eq!(view.rounds[0].tools[0].body, older);
         assert_eq!(view.rounds[1].tools[0].body, newer);
+    }
+
+    /// 三轮各一条工具，只有第 1 轮在保护窗口外。
+    ///
+    /// **作用**：重放测试共用的事实视图。
+    /// **边界**：assistant 正文是 `keep`。第 2、3 轮正文分别是 `middle-body` 和 `newest-body`。
+    fn three_round_view() -> View {
+        View {
+            system: "sys".to_owned(),
+            user: "usr".to_owned(),
+            rounds: vec![
+                round(vec![tool(
+                    "list_files",
+                    r#"{"path":"."}"#,
+                    "dir-listing",
+                    12,
+                    "sha256:abc",
+                )]),
+                round(vec![tool(
+                    "read_file",
+                    r#"{"path":"a.rs"}"#,
+                    "middle-body",
+                    20,
+                    "sha256:mid",
+                )]),
+                round(vec![tool(
+                    "read_file",
+                    r#"{"path":"b.rs"}"#,
+                    "newest-body",
+                    30,
+                    "sha256:new",
+                )]),
+            ],
+        }
+    }
+
+    /// 从事实重放后，视图与 `mask_stale` 的结果相同。
+    ///
+    /// **作用**：确认存根来自工具名、参数、大小和 `result_ref`。
+    /// **边界**：edit 里另写的 `body` 不进入视图。
+    #[test]
+    fn replay_stale_restores_the_masked_view() {
+        let facts = three_round_view();
+        let mut masked = facts.clone();
+        let mut edits = Vec::new();
+        mask_stale(&mut masked, &mut edits);
+        edits[0]["body"] = json!("tampered stub");
+        let mut replayed = facts;
+        replay_stale_edits(&mut replayed, &edits).expect("edits match the facts");
+        assert_eq!(replayed, masked);
+    }
+
+    /// 任一条 edit 对不上事实时，整批拒绝，正文保持原文。
+    ///
+    /// **作用**：锁住序号、引用、`op` 和缺字段。
+    /// **边界**：第一条即使合法，后面有一条不合法时也不写入。
+    #[test]
+    fn replay_stale_keeps_facts_when_an_edit_is_invalid() {
+        let facts = three_round_view();
+        let original = facts.rounds[0].tools[0].body.clone();
+        let mut masked = facts.clone();
+        let mut edits = Vec::new();
+        mask_stale(&mut masked, &mut edits);
+
+        let mut bad_round = facts.clone();
+        let mut bad = edits.clone();
+        bad[0]["round"] = json!(9);
+        assert_eq!(
+            replay_stale_edits(&mut bad_round, &bad),
+            Err(ReplayError::InvalidEdit)
+        );
+        assert_eq!(bad_round.rounds[0].tools[0].body, original);
+
+        let mut bad_ref_view = facts.clone();
+        let mut bad_ref = edits.clone();
+        bad_ref[0]["result_ref"] = json!("sha256:nope");
+        assert_eq!(
+            replay_stale_edits(&mut bad_ref_view, &bad_ref),
+            Err(ReplayError::InvalidEdit)
+        );
+        assert_eq!(bad_ref_view.rounds[0].tools[0].body, original);
+
+        let mut bad_op_view = facts.clone();
+        let mut bad_op = edits.clone();
+        bad_op[0]["op"] = json!("unchanged");
+        assert_eq!(
+            replay_stale_edits(&mut bad_op_view, &bad_op),
+            Err(ReplayError::InvalidEdit)
+        );
+        assert_eq!(bad_op_view.rounds[0].tools[0].body, original);
+
+        let mut missing_view = facts.clone();
+        let mut missing = edits.clone();
+        missing[0]
+            .as_object_mut()
+            .expect("object")
+            .remove("result_ref");
+        assert_eq!(
+            replay_stale_edits(&mut missing_view, &missing),
+            Err(ReplayError::InvalidEdit)
+        );
+        assert_eq!(missing_view.rounds[0].tools[0].body, original);
+
+        let mut batch = facts.clone();
+        batch.rounds[0].tools.push(tool(
+            "search_code",
+            r#"{"query":"x"}"#,
+            "hits",
+            4,
+            "sha256:hits",
+        ));
+        let first = batch.rounds[0].tools[0].body.clone();
+        let second = batch.rounds[0].tools[1].body.clone();
+        let edits = vec![
+            json!({
+                "op": "stale",
+                "round": 1,
+                "call": 1,
+                "result_ref": "sha256:abc",
+            }),
+            json!({
+                "op": "stale",
+                "round": 1,
+                "call": 2,
+                "result_ref": "sha256:nope",
+            }),
+        ];
+        assert_eq!(
+            replay_stale_edits(&mut batch, &edits),
+            Err(ReplayError::InvalidEdit)
+        );
+        assert_eq!(batch.rounds[0].tools[0].body, first);
+        assert_eq!(batch.rounds[0].tools[1].body, second);
+    }
+
+    /// 手工写下保护窗口内的编辑时，重放拒绝并且不改正文。
+    ///
+    /// **作用**：确认重放自己检查窗口，不信任 edit 的位置。
+    /// **边界**：第 3 轮落在最近两轮内。`result_ref` 与事实一致，仍拒绝。
+    #[test]
+    fn replay_stale_rejects_a_protected_round() {
+        let mut facts = three_round_view();
+        let original = facts.rounds[2].tools[0].body.clone();
+        let edits = vec![json!({
+            "op": "stale",
+            "round": 3,
+            "call": 1,
+            "result_ref": "sha256:new",
+        })];
+        assert_eq!(
+            replay_stale_edits(&mut facts, &edits),
+            Err(ReplayError::InvalidEdit)
+        );
+        assert_eq!(facts.rounds[2].tools[0].body, original);
     }
 }
