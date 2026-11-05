@@ -6,6 +6,7 @@
 use fluxaxiom_contract::TokenCount;
 
 use crate::forward_dedup::{ForwardDedup, L0_STRATEGY};
+use crate::supersede::{SupersedeRead, L1_STRATEGY};
 use crate::profile::ModelProfile;
 use crate::record::{ContextRecord, ContextSpec, Estimate, EstimateSource, ReplayError};
 use crate::strategy::{ContextStrategy, Identity, IDENTITY_STRATEGY};
@@ -123,6 +124,8 @@ impl ContextManager {
             Identity.replay(&mut view, record)?;
         } else if record.context_strategy == L0_STRATEGY {
             ForwardDedup.replay(&mut view, record)?;
+        } else if record.context_strategy == L1_STRATEGY {
+            SupersedeRead.replay(&mut view, record)?;
         } else {
             return Err(ReplayError::UnknownStrategy {
                 id: record.context_strategy.clone(),

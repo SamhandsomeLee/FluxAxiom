@@ -18,6 +18,7 @@ pub use profile::{deepseek_flash, ModelProfile, ProfileError, ProfileField};
 pub use record::{ContextRecord, ContextSpec, Estimate, EstimateSource, ReplayError};
 pub use strategy::{ContextStrategy, Identity, IDENTITY_STRATEGY};
 pub use transcript::{AssistantTurn, Round, ToolCall, ToolResult, Transcript, View};
+pub use supersede::{SupersedeRead, L1_STRATEGY};
 
 #[cfg(test)]
 mod tests {

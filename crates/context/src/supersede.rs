@@ -7,7 +7,8 @@
 use crate::transcript::{ToolResult, View};
 use serde_json::{json, Value};
 
-use crate::record::ReplayError;
+use crate::record::{ContextRecord, ContextSpec, ReplayError};
+use crate::strategy::ContextStrategy;
 
 
 /// 一次 `read_file` 实际读到的范围。
@@ -95,6 +96,49 @@ fn read_span(tool: &ToolResult) -> Option<ReadSpan> {
         end,
     })
 }
+
+/// 写入记录的 L1 策略标识。
+pub const L1_STRATEGY: &str = "l1@1";
+
+
+/// 作废遮蔽策略。
+///
+/// **作用**：实现 [`ContextStrategy`]。`apply` 遮掉被后读盖住的旧正文，`replay` 按记录写回。
+/// **边界**：没有字段。不读档案，不打开 blob。`prepare` 不调用它。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupersedeRead;
+
+impl ContextStrategy for SupersedeRead {
+    /// 返回 `l1@1`。
+    ///
+    /// **作用**：记录和重放用它认出作废遮蔽。
+    /// **边界**：不带估算或档案 hash。
+    fn id(&self) -> &str {
+        L1_STRATEGY
+    }
+    /// 把被后读盖住的旧工具正文换成存根，并追加 edit。
+    ///
+    /// **作用**：策略测试直接调用。
+    /// **参数**：`view` 只改保护窗口之外命中的 `body`。`spec` 不读。`record` 只在 `edits` 末尾追加，不改策略名。
+    /// **边界**：没有命中时不追加。不删除 blob。
+    fn apply(&self, view: &mut View, _spec: &ContextSpec, record: &mut ContextRecord) {
+        mask_superseded(view, &mut record.edits);
+    }
+    /// 按记录把事实视图里的正文写回存根。
+    ///
+    /// **作用**：`ContextManager::replay` 在策略名是 `l1@1` 时调用。
+    /// **参数**：`view` 从事实抄出。`record` 提供策略名和 `edits`。
+    /// **边界**：策略名不是 `l1@1` 时返回 [`ReplayError::UnknownStrategy`]，不改视图。
+    fn replay(&self, view: &mut View, record: &ContextRecord) -> Result<(), ReplayError> {
+        if record.context_strategy != self.id() {
+            return Err(ReplayError::UnknownStrategy {
+                id: record.context_strategy.clone(),
+            });
+        }
+        replay_superseded_edits(view, &record.edits)
+    }
+}
+
 
 /// 保护窗口：最近多少个模型轮里的工具结果不被 L1 遮掉。
 const PROTECT_ROUNDS: usize = 2;
@@ -261,7 +305,8 @@ mod tests {
     use super::*;
     use fluxaxiom_contract::{ModelUsage, TokenCount};
 
-    use crate::record::ReplayError;
+    use crate::forward_dedup::L0_STRATEGY;
+    use crate::record::{Estimate, EstimateSource, ReplayError};
     use crate::transcript::{AssistantTurn, Round};
 
     /// 拼一条 `read_file` 的渲染正文。
@@ -681,5 +726,57 @@ mod tests {
             Err(ReplayError::InvalidEdit)
         );
         assert_eq!(missing_view.rounds[0].tools[0].body, original);
+    }
+
+    /// 造一条策略名已经是 `l1@1` 的记录。
+    ///
+    /// **作用**：策略测试不用经过 `prepare`。
+    /// **边界**：`edits` 为空，`hard_limit` 为 0。`apply` 不读这两项。
+    fn l1_record() -> ContextRecord {
+        ContextRecord {
+            schema_version: 1,
+            profile_version: 1,
+            profile_hash: "profile".to_owned(),
+            context_strategy: L1_STRATEGY.to_owned(),
+            spec: ContextSpec { hard_limit: 0 },
+            estimate: Estimate {
+                tokens: 0,
+                source: EstimateSource::Estimated,
+                anchor_round: None,
+            },
+            edits: Vec::new(),
+            replayable: true,
+        }
+    }
+
+    #[test]
+    fn strategy_round_trips_the_superseded_view() {
+        let mut masked = supersede_scenario_view();
+        let mut record = l1_record();
+        let spec = record.spec.clone();
+        SupersedeRead.apply(&mut masked, &spec, &mut record);
+        assert_eq!(record.context_strategy, L1_STRATEGY);
+        assert_eq!(record.edits.len(), 1);
+
+        let mut replayed = supersede_scenario_view();
+        SupersedeRead
+            .replay(&mut replayed, &record)
+            .expect("l1 record matches the facts");
+        assert_eq!(replayed, masked);
+    }
+
+    #[test]
+    fn strategy_replay_rejects_another_strategy_name() {
+        let mut record = l1_record();
+        record.context_strategy = L0_STRATEGY.to_owned();
+        let mut facts = supersede_scenario_view();
+        let original = facts.rounds[0].tools[0].body.clone();
+        assert_eq!(
+            SupersedeRead.replay(&mut facts, &record),
+            Err(ReplayError::UnknownStrategy {
+                id: L0_STRATEGY.to_owned(),
+            })
+        );
+        assert_eq!(facts.rounds[0].tools[0].body, original);
     }
 }
