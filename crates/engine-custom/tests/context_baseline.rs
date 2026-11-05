@@ -1,6 +1,6 @@
-//! T0 未填充基线，以及 T7 清空旧轮思维链后的采样。
+//! T0 未填充基线，以及 T7、T9 和 L2 遮蔽后的采样。
 //!
-//! **作用**：测量 `mini-inventory` 第 1 次和第 5 次模型请求的自一致率。T7 只把第 5 次请求里 assistant 的 `reasoning_content` 改成空字符串。T9 只在第 5 次请求的第一条 user 末尾声明剩余空间远小于窗口。
+//! **作用**：测量 `mini-inventory` 第 1 次和第 5 次模型请求的自一致率。T7 只把第 5 次请求里 assistant 的 `reasoning_content` 改成空字符串。T9 只在第 5 次请求的第一条 user 末尾声明剩余空间远小于窗口。L2 测量把保护窗口外的工具正文换成存根。
 //! **边界**：不接 Engine，不写 Run、事件或档案。默认不拨号。stdout 不含 prompt、思维链、工具正文或密钥。
 
 use std::path::PathBuf;
@@ -20,6 +20,9 @@ const REQUEST_K5_SHA256: &str = "005b4e4c7a92b174f62b889d01ffa9c33815af4a880e46a
 
 /// 同一条完整请求的采样次数。
 const SAMPLES: usize = 5;
+
+/// 最近多少个模型轮的工具结果保持原文。与上下文模块的保护窗口相同。
+const PROTECT_ROUNDS: usize = 2;
 
 /// 16K 档加在第一条 user 末尾的汉字数。未填充的第 5 次请求约 2964 token，汉字比例按 1 计。
 const FILL_HAN_CHARS: usize = 13_000;
@@ -271,6 +274,104 @@ fn prompt_label(tokens: TokenCount) -> String {
     }
 }
 
+/// 一次遮蔽改了多少条工具结果。
+struct MaskStats {
+    /// 请求里的 assistant 消息条数，也就是已完成的模型轮数。
+    rounds: usize,
+    /// 换成存根的工具消息条数。0 表示没有窗口外的可遮蔽结果。
+    stubbed: usize,
+    /// 被换掉的原正文 UTF-8 字节数。不含存根本身。
+    bytes_before: usize,
+}
+
+/// 从一条 assistant 的工具调用里取出名字和参数。
+///
+/// **作用**：存根要写工具名和参数，不写工具正文。
+/// **参数**：`assistant` 是带 `tool_calls` 的消息。`call_id` 是 tool 消息的 `tool_call_id`，空串对不上。
+/// **边界**：只认 OpenAI 嵌套的 `function`。对不上时返回 `None`。
+fn tool_name_and_arguments(assistant: &Value, call_id: &str) -> Option<(String, String)> {
+    if call_id.is_empty() {
+        return None;
+    }
+    let calls = assistant.get("tool_calls")?.as_array()?;
+    for call in calls {
+        if call.get("id").and_then(Value::as_str) != Some(call_id) {
+            continue;
+        }
+        let function = call.get("function")?;
+        let name = function.get("name").and_then(Value::as_str)?.to_owned();
+        let arguments = function
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        return Some((name, arguments));
+    }
+    None
+}
+
+/// 把保护窗口之外的工具正文换成 L2 存根。
+///
+/// **作用**：构造第 5 次请求的遮蔽版。最近 [`PROTECT_ROUNDS`] 个 assistant 轮的工具结果不动。
+/// **参数**：`request` 是已保存的 Chat Completions 请求。没有 `messages` 时返回 `None`。
+/// **边界**：不改 system、user、assistant。已经是存根的正文跳过。对不上调用的工具消息保持原文，不计入 `stubbed`。
+fn mask_old_tool_results(mut request: Value) -> Option<(Value, MaskStats)> {
+    let messages = request.get_mut("messages")?.as_array_mut()?;
+    let rounds = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+        .count();
+    let mut current_round = 0usize;
+    let mut last_assistant = None;
+    let mut pending = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+        if role == "assistant" {
+            current_round += 1;
+            last_assistant = Some(index);
+            continue;
+        }
+        if role != "tool" || current_round == 0 || current_round > rounds.saturating_sub(PROTECT_ROUNDS)
+        {
+            continue;
+        }
+        let content = message.get("content").and_then(Value::as_str).unwrap_or("");
+        if content.starts_with("[stale:")
+            || content.starts_with("[unchanged:")
+            || content.starts_with("[superseded:")
+        {
+            continue;
+        }
+        let call_id = message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let Some(assistant) = last_assistant.and_then(|slot| messages.get(slot)) else {
+            continue;
+        };
+        let Some((name, arguments)) = tool_name_and_arguments(assistant, call_id) else {
+            continue;
+        };
+        let bytes = content.len();
+        pending.push((
+            index,
+            format!(
+                "[stale: {name} {arguments}, {bytes} B, sha256:{call_id}; call this tool again if needed]"
+            ),
+            bytes,
+        ));
+    }
+    let stats = MaskStats {
+        rounds,
+        stubbed: pending.len(),
+        bytes_before: pending.iter().map(|(_, _, bytes)| bytes).sum(),
+    };
+    for (index, stub, _) in pending {
+        messages[index]["content"] = Value::String(stub);
+    }
+    Some((request, stats))
+}
+
 /// 五次相同签名的两两一致率是 1，方差是 0。
 #[test]
 fn identical_samples_agree_with_zero_variance() {
@@ -350,6 +451,183 @@ fn blank_reasoning_keeps_the_key_and_other_fields() {
         k5_unfilled_baseline().tools[0].1,
         r#"{path:"tests/inventory.rs",start_line:1}"#
     );
+}
+
+/// 保护窗口外的工具正文换成存根，最近两轮和 assistant 保持原文。
+///
+/// **作用**：确认遮蔽只动窗口外的 tool 消息。
+/// **边界**：不拨号。哨兵正文只用于断言它已被替换。
+#[test]
+fn mask_replaces_only_tool_results_outside_the_protect_window() {
+    let request = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"},
+            assistant_with("c1"),
+            {"role": "tool", "tool_call_id": "c1", "content": "SECRET_EARLY"},
+            assistant_with("c2"),
+            {"role": "tool", "tool_call_id": "c2", "content": "SECRET_MIDDLE"},
+            assistant_with("c3"),
+            {"role": "tool", "tool_call_id": "c3", "content": "KEEP_NEAR"},
+            assistant_with("c4"),
+            {"role": "tool", "tool_call_id": "c4", "content": "KEEP_LAST"}
+        ]
+    });
+    let (masked, stats) = mask_old_tool_results(request).expect("messages");
+    assert_eq!(stats.rounds, 4);
+    assert_eq!(stats.stubbed, 2);
+    assert_eq!(stats.bytes_before, "SECRET_EARLY".len() + "SECRET_MIDDLE".len());
+    let messages = masked.get("messages").expect("messages");
+    assert!(messages[3]["content"].as_str().unwrap().starts_with("[stale:"));
+    assert!(messages[5]["content"].as_str().unwrap().starts_with("[stale:"));
+    assert_eq!(messages[7]["content"], "KEEP_NEAR");
+    assert_eq!(messages[9]["content"], "KEEP_LAST");
+    assert_eq!(messages[2]["content"], "keep");
+    assert!(!masked.to_string().contains("SECRET_EARLY"));
+    assert!(!masked.to_string().contains("SECRET_MIDDLE"));
+}
+
+/// 造一条只含一次 `read_file` 的 assistant。
+///
+/// **作用**：遮蔽单测用它给后面的 tool 消息配对。
+/// **参数**：`id` 写入 tool_call id，必须和对应 tool 消息的 `tool_call_id` 相同。
+/// **边界**：参数固定为 `{}`。正文固定为 `keep`。
+fn assistant_with(id: &str) -> Value {
+    serde_json::json!({
+        "role": "assistant",
+        "content": "keep",
+        "tool_calls": [{
+            "id": id,
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"}
+        }]
+    })
+}
+
+/// 把保护窗口外的工具结果换成存根后，比较下一步并记录缓存。默认不跑。
+///
+/// **作用**：先发两次完整请求，记下触发前的缓存。再对遮蔽版采样 5 次，和未填充基线比较。
+/// **边界**：这条请求约 3000 token，低于 128K，`prepare` 不会真的触发 L2。这里按规则强制遮蔽窗口外的工具结果。没有密钥、没有 blob、或没有可遮蔽的工具时直接返回。第一次没有完成就停。stdout 不含工具正文。
+#[tokio::test]
+#[ignore = "dials api.deepseek.com when DEEPSEEK_API_KEY and the local request blob are present"]
+async fn masked_tools_for_mini_inventory_k5() {
+    if std::env::var(API_KEY_ENV)
+        .ok()
+        .filter(|key| !key.is_empty())
+        .is_none()
+    {
+        println!("skipped reason=missing_key");
+        return;
+    }
+    let Some(request) = stored_request(REQUEST_K5_SHA256) else {
+        println!("skipped reason=missing_request");
+        return;
+    };
+    let Some((masked, stats)) = mask_old_tool_results(request.clone()) else {
+        println!("skipped reason=missing_messages");
+        return;
+    };
+    println!(
+        "rounds={} tool_stubbed={} bytes_before={}",
+        stats.rounds, stats.stubbed, stats.bytes_before
+    );
+    if stats.stubbed == 0 {
+        println!("stopped reason=nothing_to_mask");
+        return;
+    }
+    let mut client = DeepSeekClient::from_env().expect("key checked above");
+    let cancel = CancellationToken::new();
+    for index in 1..=2 {
+        if !print_usage(&mut client, &request, "before", index, &cancel).await {
+            println!("stopped reason=not_completed phase=before sample={index}");
+            return;
+        }
+    }
+    let baseline = k5_unfilled_baseline();
+    let mut decisions = Vec::new();
+    let mut matched = 0usize;
+    for index in 1..=SAMPLES {
+        match client.round(&masked, &cancel).await {
+            Ok(Round::Completed(completion)) => {
+                let decision = decision_of(&completion);
+                let same = decision == baseline;
+                if same {
+                    matched += 1;
+                }
+                println!(
+                    "phase=masked sample={index} finish={} prompt_tokens={} hit={} miss={} match_baseline={}",
+                    finish_label(&completion.finish_reason),
+                    prompt_label(completion.usage.prompt_tokens),
+                    prompt_label(completion.usage.prompt_cache_hit_tokens),
+                    prompt_label(completion.usage.prompt_cache_miss_tokens),
+                    if same { "yes" } else { "no" }
+                );
+                print_decision(index, &decision);
+                decisions.push(decision);
+            }
+            other => {
+                println!(
+                    "phase=masked sample={index} http={}",
+                    round_label(&other)
+                );
+                println!("stopped reason=not_completed phase=masked sample={index}");
+                return;
+            }
+        }
+    }
+    let rate = pairwise_agreement(&decisions).expect("five samples");
+    let variance = mode_match_variance(&decisions).expect("five samples");
+    println!(
+        "n={SAMPLES} match_baseline={matched} agree_rate={rate} variance={variance} loss={}",
+        1.0 - (matched as f64 / SAMPLES as f64)
+    );
+}
+
+/// 发一次请求并只打印用量。
+///
+/// **作用**：触发前的两次完整请求共用。
+/// **参数**：`client` 是已有密钥的客户端。`request` 是完整请求。`phase` 写入输出前缀。`index` 从 1 起。`cancel` 传给这一次调用。
+/// **边界**：没有完成时返回 `false`，不打印响应正文。
+async fn print_usage(
+    client: &mut DeepSeekClient,
+    request: &Value,
+    phase: &str,
+    index: usize,
+    cancel: &CancellationToken,
+) -> bool {
+    match client.round(request, cancel).await {
+        Ok(Round::Completed(completion)) => {
+            println!(
+                "phase={phase} sample={index} finish={} prompt_tokens={} hit={} miss={}",
+                finish_label(&completion.finish_reason),
+                prompt_label(completion.usage.prompt_tokens),
+                prompt_label(completion.usage.prompt_cache_hit_tokens),
+                prompt_label(completion.usage.prompt_cache_miss_tokens)
+            );
+            true
+        }
+        other => {
+            println!("phase={phase} sample={index} http={}", round_label(&other));
+            false
+        }
+    }
+}
+
+/// 没有完成的那一次调用的短类别。
+///
+/// **作用**：采样失败时只留类别。
+/// **参数**：`round` 是 `round` 的结果。传输错误也走这里。
+/// **边界**：不打印错误正文。
+fn round_label(round: &Result<Round, fluxaxiom_engine_custom::ChatError>) -> String {
+    match round {
+        Ok(Round::Completed(_)) => "completed".to_owned(),
+        Ok(Round::Status { status, .. }) => status.to_string(),
+        Ok(Round::Interrupted) => "interrupted".to_owned(),
+        Ok(Round::Cancelled) => "cancelled".to_owned(),
+        Ok(Round::InvalidToolArguments { .. }) => "invalid_tool_arguments".to_owned(),
+        Ok(Round::MalformedToolCall { .. }) => "malformed_tool_call".to_owned(),
+        Err(_) => "error".to_owned(),
+    }
 }
 
 /// 第 5 次请求的未填充完整对完整基线。默认不跑。
