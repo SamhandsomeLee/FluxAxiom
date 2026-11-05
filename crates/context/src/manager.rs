@@ -6,6 +6,7 @@
 use fluxaxiom_contract::TokenCount;
 
 use crate::forward_dedup::{ForwardDedup, L0_STRATEGY};
+use crate::stale::{StaleMask, L2_STRATEGY};
 use crate::supersede::{L0ThenL1, L0L1_STRATEGY, SupersedeRead, L1_STRATEGY, PROTECT_ROUNDS};
 use crate::profile::ModelProfile;
 use crate::record::{ContextRecord, ContextSpec, Estimate, EstimateSource, ReplayError};
@@ -123,7 +124,7 @@ impl ContextManager {
     ///
     /// **作用**：校验器拿它的结果做逐字节比较。本函数不理解编辑种类。
     /// **参数**：`transcript` 是调用方从 blob 装好的事实。`record` 是当时的 context 记录。
-    /// **边界**：接受 schema 1 与 2 的 `identity@1`、`l0@1`、`l1@1` 与 `l0l1@1`。不可重放、未知策略或恒等记录里有编辑时返回错误。
+    /// **边界**：接受 schema 1 与 2 的 `identity@1`、`l0@1`、`l1@1`、`l0l1@1` 与 `l2@1`。不可重放、未知策略或恒等记录里有编辑时返回错误。
     /// 检查估算来源与锚点的关联及轮次范围；不重新计算估算，也不对照硬上限。
     /// 不读 `spec` 里的软触发、最少腾出和保护窗口。
     pub fn replay(transcript: &Transcript, record: &ContextRecord) -> Result<View, ReplayError> {
@@ -155,6 +156,8 @@ impl ContextManager {
             SupersedeRead.replay(&mut view, record)?;
         } else if record.context_strategy == L0L1_STRATEGY {
             L0ThenL1.replay(&mut view, record)?;
+        } else if record.context_strategy == L2_STRATEGY {
+            StaleMask.replay(&mut view, record)?;
         } else {
             return Err(ReplayError::UnknownStrategy {
                 id: record.context_strategy.clone(),

@@ -2,7 +2,7 @@
 //!
 //! **作用**：Engine 在每次模型调用前调用 [`ContextManager::prepare`]。校验器调用 [`ContextManager::replay`]。
 //! **边界**：不依赖 `engine-api`、`engine-custom`、`run-host`。不读 blob，不改调用预算。
-//! 不发网络请求。`mask@1` 的 L2 不在这一版。
+//! 不发网络请求。`prepare` 不调用 L2。`replay` 接受 `l2@1`。
 mod forward_dedup;
 mod manager;
 mod profile;
@@ -17,6 +17,7 @@ pub use forward_dedup::{ForwardDedup, L0_STRATEGY};
 pub use manager::{ContextExhausted, ContextManager, Prepared};
 pub use profile::{deepseek_flash, ModelProfile, ProfileError, ProfileField};
 pub use record::{ContextRecord, ContextSpec, Estimate, EstimateSource, ReplayError};
+pub use stale::{StaleMask, L2_STRATEGY};
 pub use strategy::{ContextStrategy, Identity, IDENTITY_STRATEGY};
 pub use transcript::{AssistantTurn, Round, ToolCall, ToolResult, Transcript, View};
 pub use supersede::{L0ThenL1, L0L1_STRATEGY, SupersedeRead, L1_STRATEGY};

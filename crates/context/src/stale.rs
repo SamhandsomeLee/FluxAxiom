@@ -1,12 +1,57 @@
-//! L2 陈旧遮蔽：遮蔽保护窗口外的工具原文，并按 edit 重放。
+//! L2 陈旧遮蔽：遮蔽保护窗口外的工具原文，并按 `l2@1` 重放。
 //!
-//! **作用**：测试直接调用 [`mask_stale`] 和 [`replay_stale_edits`]。`prepare` 这一步不调用它们。
-//! **边界**：不读档案，不打开 blob，不看软触发和 64K 目标。
+//! **作用**：[`StaleMask`] 实现策略。[`ContextManager::replay`] 在策略名是 `l2@1` 时调用它。
+//! **边界**：不读档案，不打开 blob，不看软触发和 64K 目标。`prepare` 不调用它。
 
-use crate::record::ReplayError;
+use crate::record::{ContextRecord, ContextSpec, ReplayError};
+use crate::strategy::ContextStrategy;
 use crate::supersede::PROTECT_ROUNDS;
 use crate::transcript::{ToolResult, View};
 use serde_json::{json, Value};
+
+/// 写入记录的 L2 策略标识。
+pub const L2_STRATEGY: &str = "l2@1";
+
+/// 陈旧遮蔽策略。
+///
+/// **作用**：实现 [`ContextStrategy`]。`apply` 遮掉保护窗口外的工具原文，`replay` 按记录写回。
+/// **边界**：没有字段。不读档案，不打开 blob。`prepare` 不调用它。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaleMask;
+
+impl ContextStrategy for StaleMask {
+    /// 返回 `l2@1`。
+    ///
+    /// **作用**：记录和重放用它认出陈旧遮蔽。
+    /// **边界**：不带估算或档案 hash。
+    fn id(&self) -> &str {
+        L2_STRATEGY
+    }
+
+    /// 把保护窗口外的工具原文换成存根，并追加 edit。
+    ///
+    /// **作用**：策略测试直接调用。`prepare` 不调用。
+    /// **参数**：`view` 只改窗口外、正文仍是原文的 `body`。`spec` 不读，硬上限为 0 也允许。
+    /// `record` 只在 `edits` 末尾追加，不改策略名。
+    /// **边界**：没有命中时不追加。不删除 blob。
+    fn apply(&self, view: &mut View, _spec: &ContextSpec, record: &mut ContextRecord) {
+        mask_stale(view, &mut record.edits);
+    }
+
+    /// 按记录把事实视图里的正文写回存根。
+    ///
+    /// **作用**：`ContextManager::replay` 在策略名是 `l2@1` 时调用。
+    /// **参数**：`view` 从事实抄出。`record` 提供策略名和 `edits`。
+    /// **边界**：策略名不是 `l2@1` 时返回 [`ReplayError::UnknownStrategy`]，不改视图。
+    fn replay(&self, view: &mut View, record: &ContextRecord) -> Result<(), ReplayError> {
+        if record.context_strategy != self.id() {
+            return Err(ReplayError::UnknownStrategy {
+                id: record.context_strategy.clone(),
+            });
+        }
+        replay_stale_edits(view, &record.edits)
+    }
+}
 
 /// 把保护窗口之外、正文仍是原文的工具结果换成陈旧存根。
 ///
@@ -61,7 +106,7 @@ fn stale_stub(tool: &ToolResult) -> String {
 
 /// 按 L2 edit 把事实视图里的正文写回存根。
 ///
-/// **作用**：重放测试直接调用。以后的策略 `replay` 再转调它。
+/// **作用**：重放测试直接调用。[`StaleMask::replay`] 再转调它。
 /// **参数**：`view` 从事实抄出，成功时只改 edit 点到的 `body`。`edits` 只处理 `op: stale`，空切片允许。
 /// **边界**：先检查全部 edit，任一不合法返回 [`ReplayError::InvalidEdit`] 且不改 `view`。
 /// 存根由该条工具的名字、参数、大小和 `result_ref` 重拼，不读取 edit 里的其它文字。
@@ -130,7 +175,10 @@ mod tests {
     use super::*;
     use fluxaxiom_contract::{ModelUsage, TokenCount};
 
-    use crate::transcript::{AssistantTurn, Round};
+    use crate::forward_dedup::L0_STRATEGY;
+    use crate::manager::ContextManager;
+    use crate::record::{Estimate, EstimateSource};
+    use crate::transcript::{AssistantTurn, Round, Transcript};
 
     /// 造一条工具结果。
     ///
@@ -424,5 +472,82 @@ mod tests {
             Err(ReplayError::InvalidEdit)
         );
         assert_eq!(facts.rounds[2].tools[0].body, original);
+    }
+
+    /// 造一条策略名已经是 `l2@1` 的记录。
+    ///
+    /// **作用**：策略测试不用经过 `prepare`。
+    /// **边界**：`edits` 为空，`hard_limit` 为 0。`apply` 不读这两项。
+    fn l2_record() -> ContextRecord {
+        ContextRecord {
+            schema_version: 1,
+            profile_version: 1,
+            profile_hash: "profile".to_owned(),
+            context_strategy: L2_STRATEGY.to_owned(),
+            spec: ContextSpec::schema1(0),
+            estimate: Estimate {
+                tokens: 0,
+                source: EstimateSource::Estimated,
+                anchor_round: None,
+            },
+            edits: Vec::new(),
+            replayable: true,
+        }
+    }
+
+    /// 把三轮视图收成一份事实。
+    ///
+    /// **作用**：`ContextManager::replay` 要的是 [`Transcript`]，不是 [`View`]。
+    /// **边界**：正文与 [`three_round_view`] 相同。
+    fn three_round_transcript() -> Transcript {
+        let view = three_round_view();
+        Transcript {
+            system: view.system,
+            user: view.user,
+            rounds: view.rounds,
+        }
+    }
+
+    /// `apply` 留下的 edit 能被 `l2@1` 重放成同一份视图。
+    ///
+    /// **作用**：锁住策略名在 apply 期间不变，并且管理器按这个名字选出实现。
+    /// **边界**：不经过 `prepare`。
+    #[test]
+    fn strategy_round_trips_the_stale_view() {
+        let mut masked = three_round_view();
+        let mut record = l2_record();
+        let spec = record.spec.clone();
+        StaleMask.apply(&mut masked, &spec, &mut record);
+        assert_eq!(record.context_strategy, L2_STRATEGY);
+        assert_eq!(record.edits.len(), 1);
+
+        let mut replayed = three_round_view();
+        StaleMask
+            .replay(&mut replayed, &record)
+            .expect("l2 record matches the facts");
+        assert_eq!(replayed, masked);
+
+        let transcript = three_round_transcript();
+        let managed = ContextManager::replay(&transcript, &record).expect("manager accepts l2");
+        assert_eq!(managed, masked);
+    }
+
+    /// 策略名不是 `l2@1` 时，重放拒绝并且不改正文。
+    ///
+    /// **作用**：避免把别的策略的 edit 当成陈旧遮蔽。
+    /// **边界**：用 `l0@1` 作为错误名字。视图保持原文。
+    #[test]
+    fn strategy_replay_rejects_another_strategy_name() {
+        let mut record = l2_record();
+        record.context_strategy = L0_STRATEGY.to_owned();
+        let mut facts = three_round_view();
+        let original = facts.rounds[0].tools[0].body.clone();
+        assert_eq!(
+            StaleMask.replay(&mut facts, &record),
+            Err(ReplayError::UnknownStrategy {
+                id: L0_STRATEGY.to_owned(),
+            })
+        );
+        assert_eq!(facts.rounds[0].tools[0].body, original);
     }
 }
