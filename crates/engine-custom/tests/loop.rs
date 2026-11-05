@@ -403,7 +403,14 @@ async fn context_over_the_hard_limit_does_not_call_the_model() {
     let record: fluxaxiom_context::ContextRecord =
         serde_json::from_str(&host.blob_text(context_ref)).unwrap();
     assert_eq!(record.context_strategy, *context_strategy);
+    assert_eq!(record.schema_version, 2);
     assert_eq!(record.spec.hard_limit, 711_065);
+    assert_eq!(record.spec.soft_trigger, Some(128_000));
+    assert_eq!(
+        record.spec.min_free,
+        Some(32_000u64.max(record.estimate.tokens / 4))
+    );
+    assert_eq!(record.spec.protect_rounds, Some(2));
     assert!(record.estimate.tokens > record.spec.hard_limit);
     assert_eq!(
         record.estimate.source,

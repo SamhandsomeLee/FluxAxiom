@@ -55,17 +55,25 @@ pub enum RebuildContext {
 /// **边界**：旧事件没有调用 ID 时为 None，不能推断为已验证；正文只用于内存比较。
 #[derive(Clone)]
 pub struct RebuildTool {
+    /// 事件里的调用 ID。旧事件缺失时为 `None`，校验不得补一个。
     pub tool_call_id: Option<String>,
+    /// 事件里的工具名。空串只出现在残缺事件里，前缀核对会失败。
     pub tool_name: String,
+    /// 工具结果 blob 的正文。`None` 表示读不到，整轮变为 `unverifiable`。
     pub result: Option<Vec<u8>>,
+    /// 事件里的结果引用，例如 `sha256:` 加 64 位小写十六进制。写入事实视图供 L1 对编辑。
+    pub result_ref: String,
 }
 
 impl std::fmt::Debug for RebuildTool {
-    /// **作用**：展示身份和字节数，不把工具正文写入调试日志。
+    /// **作用**：展示身份、引用和字节数，不把工具正文写入调试日志。
+    /// **参数**：`f` 接收调试文本。
+    /// **边界**：不写入 `result` 的字节。
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RebuildTool")
             .field("tool_call_id", &self.tool_call_id)
             .field("tool_name", &self.tool_name)
+            .field("result_ref", &self.result_ref)
             .field("bytes", &self.result.as_ref().map(Vec::len))
             .finish()
     }
@@ -233,6 +241,7 @@ fn replay_matches(calls: &[RebuildCall], pos: usize, req: &Value) -> Result<(), 
         ReplayError::InvalidEstimate => {
             inconsistent(call.index, 1, "invalid context estimate anchor")
         }
+        ReplayError::InvalidSpec => inconsistent(call.index, 1, "invalid context spec"),
         ReplayError::InvalidEdit => {
             inconsistent(call.index, 1, "context edit cannot be replayed")
         }
@@ -257,6 +266,7 @@ fn replay_matches(calls: &[RebuildCall], pos: usize, req: &Value) -> Result<(), 
 /// **作用**：`replay_matches` 的事实输入。不含正在核对的这一轮响应。
 /// **参数**：`calls` 是全部模型轮。`pos` 是正在核对的下标；只读取它之前的轮次。
 /// **边界**：工具正文不是 UTF-8 时，这一轮请求按规则 1 不一致。更早轮次的响应形状已由 `verify` 检查过。
+/// 每条工具的 `result_ref` 从事件抄入事实视图，供 L1 对编辑。
 fn transcript_before(calls: &[RebuildCall], pos: usize) -> Result<Transcript, RebuildResult> {
     let first = calls[0].request.as_ref().expect("checked");
     let (system, user) = system_and_user(first).ok_or_else(|| {
@@ -281,7 +291,7 @@ fn transcript_before(calls: &[RebuildCall], pos: usize) -> Result<Transcript, Re
 ///
 /// **作用**：供恒等 `replay` 生成下一轮应有的 assistant 和 tool 消息。
 /// **参数**：`prior` 是更早的模型轮。`reporting_index` 是正在核对的请求序号，工具正文无法解码时记在这一轮上。
-/// **边界**：用量不参与消息比较，这里填未知。`trailing_user` 为空串。
+/// **边界**：用量不参与消息比较，这里填未知。`trailing_user` 为空串。`result_ref` 抄自事件，不从正文推断。
 fn round_from_prior(prior: &RebuildCall, reporting_index: u32) -> Result<Round, RebuildResult> {
     let resp = prior.response.as_ref().expect("checked");
     let calls = resp_tool_calls(resp).expect("validated response");
@@ -300,7 +310,7 @@ fn round_from_prior(prior: &RebuildCall, reporting_index: u32) -> Result<Round, 
             call_id: tool.tool_call_id.clone().unwrap_or_default(),
             name: call.map(|call| call.name.clone()).unwrap_or_default(),
             arguments: call.map(|call| call.arguments.clone()).unwrap_or_default(),
-            result_ref: String::new(),
+            result_ref: tool.result_ref.clone(),
             byte_count: body.len() as u64,
             body,
         });
@@ -339,7 +349,7 @@ fn identity_record() -> ContextRecord {
         profile_version: 1,
         profile_hash: "0".repeat(64),
         context_strategy: IDENTITY_STRATEGY.to_owned(),
-        spec: ContextSpec { hard_limit: 0 },
+        spec: ContextSpec::schema1(0),
         estimate: Estimate {
             tokens: 0,
             source: EstimateSource::Estimated,
@@ -683,6 +693,7 @@ fn check_token(obj: &Value, key: &str, expected: TokenCount) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluxaxiom_context::L0L1_STRATEGY;
     use serde_json::json;
 
     /// 各轮事件共用的已知用量。四个计数都是 `Known`，避免合计被 `unknown` 干扰。
@@ -776,6 +787,7 @@ mod tests {
     /// 组装一轮可校验材料。请求、响应和工具 blob 都视为已读到。
     ///
     /// **参数**：`tools` 的顺序就是该轮 `tool.call_completed` 的顺序；`finish` 同时写入事件的 `finish_reason`。用量用 [`usage_known`]。
+    /// 每条工具的 `result_ref` 默认为 `sha256:t{轮次}:{序号}`，L1 用例会改成真实引用。
     fn call(
         index: u32,
         request: Value,
@@ -787,10 +799,11 @@ mod tests {
         let tool_results = tools
             .into_iter()
             .enumerate()
-            .map(|(index, bytes)| RebuildTool {
-                tool_call_id: Some(response_calls[index].id.clone()),
-                tool_name: response_calls[index].name.clone(),
+            .map(|(tool_index, bytes)| RebuildTool {
+                tool_call_id: Some(response_calls[tool_index].id.clone()),
+                tool_name: response_calls[tool_index].name.clone(),
                 result: Some(bytes.to_vec()),
+                result_ref: format!("sha256:t{index}:{}", tool_index + 1),
             })
             .collect();
         RebuildCall {
@@ -1007,6 +1020,283 @@ mod tests {
             RebuildResult::Unverifiable { missing } => {
                 assert_eq!(missing, "context_replay#1");
             }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 拼一条 `read_file` 渲染正文，供 L1 校验夹具使用。
+    ///
+    /// **参数**：`path` 写入 `path:`。`start` 是起始行。`truncated` 为真时 `next` 必有。`content` 是中间占位，不参与覆盖判断。
+    fn read_file_body(
+        path: &str,
+        start: u32,
+        truncated: bool,
+        next: Option<u32>,
+        content: &str,
+    ) -> String {
+        let mut text = format!("tool: read_file\npath: {path}\nstart_line: {start}\n\n{content}\n");
+        if truncated {
+            text.push_str(&format!(
+                "truncated: true; next_start_line: {}\n",
+                next.expect("truncated read needs next")
+            ));
+        } else {
+            text.push_str("truncated: false\n");
+        }
+        text
+    }
+
+    /// 覆盖读使用的参数原文。
+    fn read_file_args() -> &'static str {
+        r#"{"path":"a.rs","start_line":1}"#
+    }
+
+    /// 一轮带单个 `read_file` 的响应。
+    ///
+    /// **参数**：`id` 是 tool_call id。`reasoning` 必须被下一轮 assistant 原样带回。
+    fn resp_read_file(id: &str, reasoning: &str) -> Value {
+        json!({
+            "content": "",
+            "reasoning_content": reasoning,
+            "tool_calls": [{
+                "id": id,
+                "name": "read_file",
+                "arguments": read_file_args()
+            }],
+            "finish_reason": "tool_calls",
+            "usage": usage_json(),
+            "prompt_layout_version": "1",
+        })
+    }
+
+    /// 下一轮请求里应追加的 `read_file` assistant。
+    ///
+    /// **参数**：`reasoning` 与上一轮响应相同。`id` 与上一轮 tool_call 相同。
+    fn assistant_read_file(reasoning: &str, id: &str) -> Value {
+        json!({
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": reasoning,
+            "tool_calls": [{
+                "id": id,
+                "type": "function",
+                "function": {"name": "read_file", "arguments": read_file_args()}
+            }]
+        })
+    }
+
+    /// 第 1 轮部分读、第 2 轮再读、第 3 轮整文件盖住第 1 轮之后的事实。
+    ///
+    /// **作用**：L1 正向与四类篡改共用前三轮恒等请求。
+    /// **边界**：第 2 轮落在保护窗口内，合法记录只遮第 1 轮。
+    struct L1Reads {
+        /// 第 1 轮部分读正文。
+        earlier: String,
+        /// 第 2 轮再读正文，落在保护窗口内。
+        middle: String,
+        /// 第 3 轮整文件读正文。
+        later: String,
+        /// 由第 1 轮正文与 `sha256:one` 渲染出的存根。
+        stub: String,
+        /// 前三轮恒等请求与事实。
+        prefix: [RebuildCall; 3],
+    }
+
+    /// 构造 [`L1Reads`]。
+    fn l1_reads() -> L1Reads {
+        let earlier = read_file_body("a.rs", 1, true, Some(41), "part");
+        let middle = read_file_body("a.rs", 1, true, Some(41), "mid");
+        let later = read_file_body("a.rs", 1, false, None, "full");
+        let stub = format!(
+            "[superseded: read_file \"a.rs\" L1-40, {} B, sha256:one; see round #3 call 1]",
+            earlier.len()
+        );
+        let mut first = call(
+            1,
+            base_req(system_user()),
+            resp_read_file("c1", "r1"),
+            vec![earlier.as_bytes()],
+            "tool_calls",
+        );
+        first.tool_results[0].result_ref = "sha256:one".to_owned();
+
+        let mut msgs2 = system_user();
+        msgs2.push(assistant_read_file("r1", "c1"));
+        msgs2.push(tool_msg("c1", &earlier));
+        let mut second = call(
+            2,
+            base_req(msgs2),
+            resp_read_file("c2", "r2"),
+            vec![middle.as_bytes()],
+            "tool_calls",
+        );
+        second.tool_results[0].result_ref = "sha256:two".to_owned();
+
+        let mut msgs3 = system_user();
+        msgs3.push(assistant_read_file("r1", "c1"));
+        msgs3.push(tool_msg("c1", &earlier));
+        msgs3.push(assistant_read_file("r2", "c2"));
+        msgs3.push(tool_msg("c2", &middle));
+        let mut third = call(
+            3,
+            base_req(msgs3),
+            resp_read_file("c3", "r3"),
+            vec![later.as_bytes()],
+            "tool_calls",
+        );
+        third.tool_results[0].result_ref = "sha256:three".to_owned();
+
+        L1Reads {
+            earlier,
+            middle,
+            later,
+            stub,
+            prefix: [first, second, third],
+        }
+    }
+
+    /// 合法的 `l0l1@1` 记录：只遮第 1 轮被第 3 轮盖住的那次读取。
+    fn l0l1_record() -> ContextRecord {
+        let mut record = identity_record();
+        record.context_strategy = L0L1_STRATEGY.to_owned();
+        record.edits = vec![json!({
+            "op": "superseded",
+            "round": 1,
+            "call": 1,
+            "superseded_by_round": 3,
+            "superseded_by_call": 1,
+            "result_ref": "sha256:one",
+        })];
+        record
+    }
+
+    /// 第 4 次请求：前三轮历史加上第 3 轮 assistant 与工具，第 1 条 tool 正文由调用方决定。
+    ///
+    /// **参数**：`reads` 提供中间与最后一轮正文。`first_tool` 是第 1 轮 tool 消息的正文，合法时应为存根。
+    /// `context` 是第 4 轮记录。`strategy` 写入事件，`None` 表示旧事件没有策略名。
+    fn l1_fourth(
+        reads: &L1Reads,
+        first_tool: &str,
+        context: RebuildContext,
+        strategy: Option<&str>,
+    ) -> RebuildCall {
+        let mut msgs = system_user();
+        msgs.push(assistant_read_file("r1", "c1"));
+        msgs.push(tool_msg("c1", first_tool));
+        msgs.push(assistant_read_file("r2", "c2"));
+        msgs.push(tool_msg("c2", &reads.middle));
+        msgs.push(assistant_read_file("r3", "c3"));
+        msgs.push(tool_msg("c3", &reads.later));
+        let mut fourth = call(4, base_req(msgs), resp_stop("done", "r4"), vec![], "stop");
+        fourth.event_context_strategy = strategy.map(str::to_owned);
+        fourth.context = context;
+        fourth
+    }
+
+    /// 把前三轮恒等请求和第 4 轮放进 [`verify`]。
+    ///
+    /// **参数**：`reads` 提供前三轮。`fourth` 是正在验收的那一轮。
+    fn l1_verify(reads: L1Reads, fourth: RebuildCall) -> RebuildResult {
+        verify(&[
+            reads.prefix[0].clone(),
+            reads.prefix[1].clone(),
+            reads.prefix[2].clone(),
+            fourth,
+        ])
+    }
+
+    /// 合法的 `l0l1@1` 记录经 replay 后应与带存根的请求一致。
+    #[test]
+    fn l0l1_record_with_stub_is_consistent() {
+        let reads = l1_reads();
+        let stub = reads.stub.clone();
+        let fourth = l1_fourth(
+            &reads,
+            &stub,
+            RebuildContext::Parsed(l0l1_record()),
+            Some(L0L1_STRATEGY),
+        );
+        assert_eq!(l1_verify(reads, fourth), RebuildResult::Consistent);
+    }
+
+    /// 记录合法、请求里的存根被改一个字符时按规则 1 失败。
+    #[test]
+    fn changed_l0l1_stub_is_rule_1() {
+        let reads = l1_reads();
+        let mut stub = reads.stub.clone();
+        stub.push('x');
+        let fourth = l1_fourth(
+            &reads,
+            &stub,
+            RebuildContext::Parsed(l0l1_record()),
+            Some(L0L1_STRATEGY),
+        );
+        match l1_verify(reads, fourth) {
+            RebuildResult::Inconsistent { rule, .. } => assert_eq!(rule, 1),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 记录把保护窗口内的读取标成作废，即使请求也写成存根，仍按规则 1 失败。
+    #[test]
+    fn supersede_inside_protect_window_is_rule_1() {
+        let reads = l1_reads();
+        let mut record = l0l1_record();
+        record.edits[0]["round"] = json!(2);
+        record.edits[0]["result_ref"] = json!("sha256:two");
+        let stub = format!(
+            "[superseded: read_file \"a.rs\" L1-40, {} B, sha256:two; see round #3 call 1]",
+            reads.middle.len()
+        );
+        let mut msgs = system_user();
+        msgs.push(assistant_read_file("r1", "c1"));
+        msgs.push(tool_msg("c1", &reads.earlier));
+        msgs.push(assistant_read_file("r2", "c2"));
+        msgs.push(tool_msg("c2", &stub));
+        msgs.push(assistant_read_file("r3", "c3"));
+        msgs.push(tool_msg("c3", &reads.later));
+        let mut fourth = call(4, base_req(msgs), resp_stop("done", "r4"), vec![], "stop");
+        fourth.event_context_strategy = Some(L0L1_STRATEGY.to_owned());
+        fourth.context = RebuildContext::Parsed(record);
+        match l1_verify(reads, fourth) {
+            RebuildResult::Inconsistent {
+                call,
+                rule,
+                detail,
+            } => {
+                assert_eq!(call, 4);
+                assert_eq!(rule, 1);
+                assert_eq!(detail, "context edit cannot be replayed");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 没有编辑记录却把工具正文换成存根时按规则 1 失败。
+    #[test]
+    fn stub_without_edit_is_rule_1() {
+        let reads = l1_reads();
+        let stub = reads.stub.clone();
+        let fourth = l1_fourth(&reads, &stub, RebuildContext::Identity, None);
+        match l1_verify(reads, fourth) {
+            RebuildResult::Inconsistent { rule, .. } => assert_eq!(rule, 1),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 记录要求写成存根，请求仍是原文时按规则 1 失败。
+    #[test]
+    fn l0l1_edit_with_unchanged_request_is_rule_1() {
+        let reads = l1_reads();
+        let earlier = reads.earlier.clone();
+        let fourth = l1_fourth(
+            &reads,
+            &earlier,
+            RebuildContext::Parsed(l0l1_record()),
+            Some(L0L1_STRATEGY),
+        );
+        match l1_verify(reads, fourth) {
+            RebuildResult::Inconsistent { rule, .. } => assert_eq!(rule, 1),
             other => panic!("{other:?}"),
         }
     }

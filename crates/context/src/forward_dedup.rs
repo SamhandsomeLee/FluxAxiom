@@ -516,7 +516,7 @@ mod tests {
             profile_version: 1,
             profile_hash: "profile".to_owned(),
             context_strategy: L0_STRATEGY.to_owned(),
-            spec: ContextSpec { hard_limit: 0 },
+            spec: ContextSpec::schema1(0),
             estimate: Estimate {
                 tokens: 0,
                 source: EstimateSource::Estimated,

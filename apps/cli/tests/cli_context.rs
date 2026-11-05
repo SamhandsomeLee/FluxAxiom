@@ -90,9 +90,15 @@ async fn exhaustion_diagnostic_survives_reopen_without_a_phantom_model_call() {
         };
         let record_bytes = host.read_blob(&BlobRef::new(&payload.context_ref)).unwrap();
         let record: serde_json::Value = serde_json::from_slice(&record_bytes).unwrap();
-        assert_eq!(payload.context_strategy, "identity@1");
+        assert_eq!(payload.context_strategy, "l0@1");
         assert_eq!(record["context_strategy"], payload.context_strategy);
-        assert_eq!(record["spec"], json!({"hard_limit": 711065}));
+        assert_eq!(record["schema_version"], 2);
+        assert_eq!(record["spec"]["hard_limit"], 711065);
+        assert_eq!(record["spec"]["soft_trigger"], 128000);
+        assert_eq!(record["spec"]["protect_rounds"], 2);
+        let min_free = record["spec"]["min_free"].as_u64().expect("min_free");
+        let tokens = record["estimate"]["tokens"].as_u64().expect("tokens");
+        assert_eq!(min_free, 32_000u64.max(tokens / 4));
         assert!(record["estimate"]["tokens"].as_u64().unwrap() > 711_065);
         assert_eq!(
             record["estimate"]["source"],
@@ -114,7 +120,7 @@ async fn exhaustion_diagnostic_survives_reopen_without_a_phantom_model_call() {
             serde_json::to_value(&diagnostic.body).unwrap(),
             json!({
                 "event_type": "context.exhausted",
-                "payload": { "context_ref": payload.context_ref, "context_strategy": "identity@1" }
+                "payload": { "context_ref": payload.context_ref, "context_strategy": "l0@1" }
             })
         );
         let ended_sequence = events

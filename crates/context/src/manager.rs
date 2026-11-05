@@ -6,7 +6,7 @@
 use fluxaxiom_contract::TokenCount;
 
 use crate::forward_dedup::{ForwardDedup, L0_STRATEGY};
-use crate::supersede::{L0ThenL1, L0L1_STRATEGY, SupersedeRead, L1_STRATEGY};
+use crate::supersede::{L0ThenL1, L0L1_STRATEGY, SupersedeRead, L1_STRATEGY, PROTECT_ROUNDS};
 use crate::profile::ModelProfile;
 use crate::record::{ContextRecord, ContextSpec, Estimate, EstimateSource, ReplayError};
 use crate::strategy::{ContextStrategy, Identity, IDENTITY_STRATEGY};
@@ -66,16 +66,20 @@ impl ContextManager {
     /// **作用**：每次模型调用前调用。通过硬上限时，重复的新工具正文已换成存根；留下 L1 时，被后读盖住的旧正文也换成存根。
     /// **参数**：`transcript` 由调用方填入正文。`max_tokens` 是这次请求的输出上限，用来计算硬上限。
     /// **边界**：估算使用替换后的工具正文。更早轮次的已知 prompt 仍是下界。缓存字段不参加加法。
-    /// 估算不超过 128K 时不试 L1，策略名保持 `l0@1`。超过 128K 时，没超过硬上限则至少要腾出 `max(32K, 估算 / 4)` 才留下 L1；已经超过硬上限时即使腾出不够也留下。
+    /// 记录为 schema 2：软触发 128K、最少腾出 `max(32K, 估算 / 4)`、保护窗口 2 轮。`replay` 不读后三项。
+    /// 估算不超过 128K 时不试 L1，策略名保持 `l0@1`。超过 128K 时，没超过硬上限则至少要腾出最少腾出量才留下 L1；已经超过硬上限时即使腾出不够也留下。
     /// 硬上限为 0，或最终估算仍超过硬上限时，返回 [`ContextExhausted`]，不发送请求。
     pub fn prepare(
         &self,
         transcript: &Transcript,
         max_tokens: u32,
     ) -> Result<Prepared, ContextExhausted> {
-        let spec = ContextSpec {
-            hard_limit: self.profile.hard_limit(max_tokens),
-        };
+        let spec = ContextSpec::schema2(
+            self.profile.hard_limit(max_tokens),
+            SOFT_TRIGGER_TOKENS,
+            MIN_FREE_TOKENS,
+            PROTECT_ROUNDS as u32,
+        );
         let mut view = View::identity(transcript);
         let mut record = ContextRecord::identity(
             self.profile.profile_version,
@@ -90,6 +94,7 @@ impl ContextManager {
         record.context_strategy = L0_STRATEGY.to_owned();
         ForwardDedup.apply(&mut view, &spec, &mut record);
         record.estimate = estimate_view(&self.profile, transcript, &view);
+        record.spec.min_free = Some(MIN_FREE_TOKENS.max(record.estimate.tokens / 4));
         if record.estimate.tokens > SOFT_TRIGGER_TOKENS {
             let before_view = view.clone();
             let before_edits = record.edits.clone();
@@ -118,14 +123,18 @@ impl ContextManager {
     ///
     /// **作用**：校验器拿它的结果做逐字节比较。本函数不理解编辑种类。
     /// **参数**：`transcript` 是调用方从 blob 装好的事实。`record` 是当时的 context 记录。
-    /// **边界**：接受 schema 1 的 `identity@1`、`l0@1`、`l1@1` 与 `l0l1@1`。不可重放、未知策略或恒等记录里有编辑时返回错误。
+    /// **边界**：接受 schema 1 与 2 的 `identity@1`、`l0@1`、`l1@1` 与 `l0l1@1`。不可重放、未知策略或恒等记录里有编辑时返回错误。
     /// 检查估算来源与锚点的关联及轮次范围；不重新计算估算，也不对照硬上限。
+    /// 不读 `spec` 里的软触发、最少腾出和保护窗口。
     pub fn replay(transcript: &Transcript, record: &ContextRecord) -> Result<View, ReplayError> {
-        if record.schema_version != crate::record::SCHEMA_VERSION {
+        if record.schema_version != crate::record::SCHEMA_V1
+            && record.schema_version != crate::record::SCHEMA_VERSION
+        {
             return Err(ReplayError::UnsupportedSchema {
                 schema_version: record.schema_version,
             });
         }
+        record.validate_spec()?;
         if !record.replayable {
             return Err(ReplayError::NotReplayable);
         }
@@ -342,7 +351,11 @@ mod tests {
         assert_eq!(prepared.record.estimate.tokens, 4);
         assert_eq!(prepared.record.estimate.source, EstimateSource::Estimated);
         assert_eq!(prepared.record.estimate.anchor_round, None);
+        assert_eq!(prepared.record.schema_version, 2);
         assert_eq!(prepared.record.spec.hard_limit, 711_065);
+        assert_eq!(prepared.record.spec.soft_trigger, Some(128_000));
+        assert_eq!(prepared.record.spec.min_free, Some(32_000));
+        assert_eq!(prepared.record.spec.protect_rounds, Some(2));
         assert_eq!(prepared.view.system, "Hi");
         assert_eq!(prepared.view.user, "你好，123");
         assert!(prepared.record.edits.is_empty());
@@ -782,7 +795,15 @@ mod tests {
                 assert_eq!(err.record.spec.hard_limit, 0);
                 assert_eq!(err.record.estimate.tokens, 0);
                 let value = serde_json::to_value(&err.record).expect("json");
-                assert_eq!(value["spec"], json!({"hard_limit": 0}));
+                assert_eq!(
+                    value["spec"],
+                    json!({
+                        "hard_limit": 0,
+                        "soft_trigger": 128000,
+                        "min_free": 32000,
+                        "protect_rounds": 2
+                    })
+                );
                 assert_eq!(
                     value["estimate"],
                     json!({"tokens": 0, "source": "estimated", "anchor_round": null})
@@ -824,11 +845,16 @@ mod tests {
         assert_eq!(
             value,
             json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "profile_version": 2,
                 "profile_hash": profile.profile_hash,
                 "context_strategy": "l0@1",
-                "spec": { "hard_limit": 711065 },
+                "spec": {
+                    "hard_limit": 711065,
+                    "soft_trigger": 128000,
+                    "min_free": 32000,
+                    "protect_rounds": 2
+                },
                 "estimate": {
                     "tokens": 7,
                     "source": "estimated",
@@ -842,6 +868,22 @@ mod tests {
         assert!(!encoded.contains("SENTINEL_BODY_do_not_leak"));
         let parsed: ContextRecord = serde_json::from_value(value).expect("parse");
         assert_eq!(parsed, prepared.record);
+    }
+
+    /// schema 1 只有硬上限的旧记录仍能重放；带上 schema 2 字段则拒绝。
+    #[test]
+    fn replay_accepts_schema1_without_reading_new_spec_fields() {
+        let transcript = bare("A", "");
+        let prepared = manager().prepare(&transcript, 32_768).expect("ok");
+        let mut record = prepared.record.clone();
+        record.schema_version = 1;
+        assert!(matches!(
+            ContextManager::replay(&transcript, &record),
+            Err(ReplayError::InvalidSpec)
+        ));
+        record.spec = ContextSpec::schema1(record.spec.hard_limit);
+        let view = ContextManager::replay(&transcript, &record).expect("schema1");
+        assert_eq!(view, prepared.view);
     }
 
     /// 未知策略、不可重放、错误 schema 和带编辑的恒等记录都拒绝。
@@ -862,12 +904,12 @@ mod tests {
             Err(ReplayError::NotReplayable)
         ));
         record.replayable = true;
-        record.schema_version = 2;
+        record.schema_version = 3;
         assert!(matches!(
             ContextManager::replay(&transcript, &record),
-            Err(ReplayError::UnsupportedSchema { schema_version: 2 })
+            Err(ReplayError::UnsupportedSchema { schema_version: 3 })
         ));
-        record.schema_version = 1;
+        record.schema_version = 2;
         record.edits.push(json!({"op": "mask"}));
         assert!(matches!(
             ContextManager::replay(&transcript, &record),

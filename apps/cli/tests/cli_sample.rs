@@ -229,25 +229,40 @@ fn context_strategy_mismatch_is_inconsistent() {
     );
 }
 
-/// 可解析的 identity 非法编辑和越界用量轮次是明确矛盾，不是缺少校验能力。
+/// 可解析的已知策略非法编辑和越界用量轮次是明确矛盾，不是缺少校验能力。
 #[test]
 fn invalid_known_context_records_are_inconsistent() {
-    for invalid_edits in [true, false] {
+    for case in ["l0_bad_edit", "identity_has_edits", "bad_estimate"] {
         let (data, _workspace, run_id) = fixture(&["--max-model-calls", "1"]);
-        replace_context_record(data.path(), |record| {
-            if invalid_edits {
+        replace_context_record(data.path(), |record| match case {
+            "l0_bad_edit" => record["edits"] = json!([{"op": "unexpected-edit"}]),
+            "identity_has_edits" => {
+                record["context_strategy"] = json!("identity@1");
                 record["edits"] = json!([{"op": "unexpected-edit"}]);
-            } else {
+            }
+            "bad_estimate" => {
                 record["estimate"]["source"] = json!("usage");
                 record["estimate"]["anchor_round"] = json!(1);
             }
+            _ => unreachable!(),
         });
+        if case == "identity_has_edits" {
+            edit_event(data.path(), "model.call_completed", |payload| {
+                payload["context_strategy"] = json!("identity@1");
+            });
+        }
+        let detail = match case {
+            "l0_bad_edit" => "context edit cannot be replayed",
+            "identity_has_edits" => "identity context record contains edits",
+            "bad_estimate" => "invalid context estimate anchor",
+            _ => unreachable!(),
+        };
         assert_rebuild_result(
             data.path(),
             &run_id,
             json!({
                 "status": "inconsistent", "call": 1, "rule": 1,
-                "detail": if invalid_edits { "identity context record contains edits" } else { "invalid context estimate anchor" }
+                "detail": detail
             }),
         );
     }
@@ -273,7 +288,7 @@ fn unsupported_and_legacy_context_records_keep_their_classification() {
         } else {
             replace_context_record(data.path(), |record| match kind {
                 "unknown_strategy" => record["context_strategy"] = json!("mask@999"),
-                "unsupported_schema" => record["schema_version"] = json!(2),
+                "unsupported_schema" => record["schema_version"] = json!(3),
                 "not_replayable" => record["replayable"] = json!(false),
                 _ => unreachable!(),
             });

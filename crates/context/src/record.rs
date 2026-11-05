@@ -1,4 +1,4 @@
-//! context 记录。独立 blob 的 schema 1，不进入 `agent-contract`。
+//! context 记录。独立 blob 的 schema 2，仍能读 schema 1，不进入 `agent-contract`。
 //!
 //! **作用**：`prepare` 写出记录；`replay` 按记录重建视图。
 //! **边界**：只有引用和数值。不含 prompt、工具正文或 `reasoning_content`。
@@ -7,16 +7,20 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::strategy::IDENTITY_STRATEGY;
 
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+/// 只含硬上限的旧记录。
+pub(crate) const SCHEMA_V1: u32 = 1;
+
+/// 当前写出的记录。`spec` 含软触发、最少腾出和保护窗口。
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 
 /// 一次 `prepare` 的记录。
 ///
 /// **作用**：以后作为 blob 保存。事件只存它的引用。
-/// **边界**：`schema_version` 为 1 时 `spec` 只有硬上限。`edits` 在恒等策略下为空。
-/// `Debug` 只含这些数和短标识。
+/// **边界**：`schema_version` 为 1 时 `spec` 只有硬上限。为 2 时还有软触发、最少腾出和保护窗口。
+/// `edits` 在恒等策略下为空。`Debug` 只含这些数和短标识。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextRecord {
-    /// 记录 schema。当前只写出 `1`。其它值在 `replay` 时返回 [`ReplayError::UnsupportedSchema`]。
+    /// 记录 schema。`prepare` 写出 `2`。`replay` 接受 `1` 与 `2`，其它值返回 [`ReplayError::UnsupportedSchema`]。
     pub schema_version: u32,
     /// 档案版本，与档案文件里的 `profile_version` 相同。从 1 起。
     pub profile_version: u32,
@@ -24,7 +28,7 @@ pub struct ContextRecord {
     pub profile_hash: String,
     /// 策略标识。成功和耗尽的 `prepare` 写 `l0@1`。`identity()` 仍写 `identity@1`。空串会被 `replay` 当成未知策略。
     pub context_strategy: String,
-    /// 这次调用的派生规格。schema 1 只有硬上限。
+    /// 这次调用的派生规格。schema 1 只有硬上限；schema 2 含软触发、最少腾出和保护窗口。
     pub spec: ContextSpec,
     /// 这次调用的 token 估算。不含正文。
     pub estimate: Estimate,
@@ -34,15 +38,61 @@ pub struct ContextRecord {
     pub replayable: bool,
 }
 
-/// schema 1 的派生规格。
+/// 一次调用的派生规格。
 ///
-/// **作用**：恒等策略只记录硬上限。软触发、目标和保护窗口留给 `mask@1`。
-/// **边界**：JSON 只有 `hard_limit`。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// **作用**：硬上限供耗尽检查。schema 2 另记下这次比较用的软触发、最少腾出和保护窗口，给 trace 解释去留。
+/// **边界**：schema 1 的 JSON 只有 `hard_limit`，三个可选字段为 `None`。schema 2 四个键都在，值不是 null。
+/// `replay` 不读软触发、最少腾出和保护窗口。目标与冷缓存窗口不在这里。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextSpec {
     /// 本次请求允许的 prompt token 上限，单位是 token，已经向下取整。0 表示没有可用输入空间，此时不发请求；正上限在估算超过它时不发请求。
     pub hard_limit: u64,
+    /// 这次比较用的软触发，单位 token。估算不超过它时不试 L1。schema 1 为 `None`。
+    pub soft_trigger: Option<u64>,
+    /// 这次留下 L1 至少要腾出的 token。没超过硬上限时腾不够就退回。schema 1 为 `None`。
+    pub min_free: Option<u64>,
+    /// 这次保护的最近模型轮数。这些轮次里的工具结果不被 L1 遮掉。schema 1 为 `None`。
+    pub protect_rounds: Option<u32>,
+}
+
+impl ContextSpec {
+    /// 只含硬上限的 schema 1 规格。
+    ///
+    /// **作用**：旧记录、恒等占位和策略单测。
+    /// **参数**：`hard_limit` 与字段相同，0 表示没有可用输入空间。
+    /// **边界**：三个可选字段都是 `None`。
+    pub const fn schema1(hard_limit: u64) -> Self {
+        Self {
+            hard_limit,
+            soft_trigger: None,
+            min_free: None,
+            protect_rounds: None,
+        }
+    }
+
+    /// 含这次派生值的 schema 2 规格。
+    ///
+    /// **作用**：`prepare` 写出。
+    /// **参数**：`hard_limit` 是这次硬上限。`soft_trigger` 是这次比较用的软触发。`min_free` 是这次留下 L1 的最少腾出。`protect_rounds` 是这次保护的最近轮数。
+    /// **边界**：不写目标或冷缓存窗口。
+    pub const fn schema2(
+        hard_limit: u64,
+        soft_trigger: u64,
+        min_free: u64,
+        protect_rounds: u32,
+    ) -> Self {
+        Self {
+            hard_limit,
+            soft_trigger: Some(soft_trigger),
+            min_free: Some(min_free),
+            protect_rounds: Some(protect_rounds),
+        }
+    }
+
+    /// schema 2 的三个派生值是否都在。
+    fn has_v2_fields(&self) -> bool {
+        self.soft_trigger.is_some() && self.min_free.is_some() && self.protect_rounds.is_some()
+    }
 }
 
 /// 这次调用的 token 估算。
@@ -75,9 +125,9 @@ pub enum EstimateSource {
 /// `replay` 不能重建视图。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplayError {
-    /// `schema_version` 不是 1。
+    /// `schema_version` 不是 1 或 2。
     UnsupportedSchema {
-        /// 记录里的 schema 版本，不是 1。
+        /// 记录里的 schema 版本，不是 1 或 2。
         schema_version: u32,
     },
     /// 记录里的策略不是 `identity@1`、`l0@1`、`l1@1` 或 `l0l1@1`。
@@ -91,6 +141,8 @@ pub enum ReplayError {
     IdentityHasEdits,
     /// 估算来源与锚点不一致，或锚点为 0、超出事实轮次。
     InvalidEstimate,
+    /// `schema_version` 与 `spec` 的字段集合对不上。
+    InvalidSpec,
 
     /// 一条 edit 不能应用到事实视图。
     ///
@@ -165,8 +217,8 @@ impl ContextRecord {
     /// 组装一条恒等策略记录。
     ///
     /// **作用**：`prepare` 用它打底，再把策略名改成 `l0@1`。直接调用时策略标识是 `identity@1`。
-    /// **参数**：`profile_version` 写入记录，从 1 起。`profile_hash` 是 64 位小写十六进制，原样保存。`spec` 只含硬上限。`estimate` 是这次的 token 估算，其 `source` 与 `anchor_round` 必须一致。
-    /// **边界**：`edits` 为空，`replayable` 为真。不写入任何正文。
+    /// **参数**：`profile_version` 写入记录，从 1 起。`profile_hash` 是 64 位小写十六进制，原样保存。`spec` 是这次的派生规格。`estimate` 是这次的 token 估算，其 `source` 与 `anchor_round` 必须一致。
+    /// **边界**：`schema_version` 为当前版本。`edits` 为空，`replayable` 为真。不写入任何正文。
     pub(crate) fn identity(
         profile_version: u32,
         profile_hash: String,
@@ -184,10 +236,97 @@ impl ContextRecord {
             replayable: true,
         }
     }
+
+    /// 检查 schema 号与 `spec` 字段是否配套。
+    ///
+    /// **作用**：反序列化和 `replay` 共用，避免 schema 1 带上派生值，或 schema 2 缺键。
+    /// **边界**：只检查 1 和 2。其它版本留给 `replay` 报 [`ReplayError::UnsupportedSchema`]。
+    pub(crate) fn validate_spec(&self) -> Result<(), ReplayError> {
+        match self.schema_version {
+            SCHEMA_V1 if !self.spec.has_v2_fields()
+                && self.spec.soft_trigger.is_none()
+                && self.spec.min_free.is_none()
+                && self.spec.protect_rounds.is_none() =>
+            {
+                Ok(())
+            }
+            SCHEMA_VERSION if self.spec.has_v2_fields() => Ok(()),
+            SCHEMA_V1 | SCHEMA_VERSION => Err(ReplayError::InvalidSpec),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl Serialize for ContextSpec {
+    /// 按 schema 写出硬上限，以及 schema 2 的三个派生值。
+    ///
+    /// **作用**：blob 与单测对照同一份 JSON。
+    /// **参数**：`serializer` 是 serde 给出的写入端。
+    /// **边界**：三个可选字段都在时写四个键；否则只写 `hard_limit`。不写正文。
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        if let (Some(soft_trigger), Some(min_free), Some(protect_rounds)) =
+            (self.soft_trigger, self.min_free, self.protect_rounds)
+        {
+            let mut state = serializer.serialize_struct("ContextSpec", 4)?;
+            state.serialize_field("hard_limit", &self.hard_limit)?;
+            state.serialize_field("soft_trigger", &soft_trigger)?;
+            state.serialize_field("min_free", &min_free)?;
+            state.serialize_field("protect_rounds", &protect_rounds)?;
+            state.end()
+        } else {
+            let mut state = serializer.serialize_struct("ContextSpec", 1)?;
+            state.serialize_field("hard_limit", &self.hard_limit)?;
+            state.end()
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ContextSpec {
+    /// 读回硬上限，以及可能存在的三个派生值。
+    ///
+    /// **作用**：旧记录只有 `hard_limit`；新记录四个键都在。
+    /// **参数**：`deserializer` 提供 spec 对象。
+    /// **边界**：未知键拒绝。缺派生值键得到 `None`，配套检查在记录层。
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = WireSpec::deserialize(deserializer)?;
+        Ok(Self {
+            hard_limit: wire.hard_limit,
+            soft_trigger: wire.soft_trigger,
+            min_free: wire.min_free,
+            protect_rounds: wire.protect_rounds,
+        })
+    }
+}
+
+/// spec 的读取形状。
+///
+/// **作用**：schema 1 缺三个派生值键，schema 2 都在。
+/// **边界**：未知键拒绝。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireSpec {
+    /// 与 [`ContextSpec::hard_limit`] 相同。
+    hard_limit: u64,
+    /// 缺席表示 schema 1。
+    #[serde(default)]
+    soft_trigger: Option<u64>,
+    /// 缺席表示 schema 1。
+    #[serde(default)]
+    min_free: Option<u64>,
+    /// 缺席表示 schema 1。
+    #[serde(default)]
+    protect_rounds: Option<u32>,
 }
 
 impl Serialize for ContextRecord {
-    /// 按固定键序写出 schema 1。
+    /// 按固定键序写出记录。
     ///
     /// **作用**：blob 与单测对照同一份 JSON。
     /// **参数**：`serializer` 是 serde 给出的写入端。这里按固定顺序写出 8 个键。
@@ -211,17 +350,18 @@ impl Serialize for ContextRecord {
 }
 
 impl<'de> Deserialize<'de> for ContextRecord {
-    /// 读回 schema 1 的记录。
+    /// 读回 schema 1 或 2 的记录。
     ///
     /// **作用**：`replay` 的输入。未知键拒绝。
     /// **参数**：`deserializer` 是 serde 给出的读取端。缺任一必需键时由它返回错误。
     /// **边界**：不在这里检查策略名是否存在；那是 [`crate::ContextManager::replay`] 的事。
+    /// schema 与 `spec` 字段集合对不上时拒绝。
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         let wire = WireRecord::deserialize(deserializer)?;
-        Ok(Self {
+        let record = Self {
             schema_version: wire.schema_version,
             profile_version: wire.profile_version,
             profile_hash: wire.profile_hash,
@@ -230,7 +370,9 @@ impl<'de> Deserialize<'de> for ContextRecord {
             estimate: wire.estimate,
             edits: wire.edits,
             replayable: wire.replayable,
-        })
+        };
+        record.validate_spec().map_err(serde::de::Error::custom)?;
+        Ok(record)
     }
 }
 
@@ -274,6 +416,7 @@ impl std::fmt::Display for ReplayError {
             Self::NotReplayable => write!(f, "context record is not replayable"),
             Self::IdentityHasEdits => write!(f, "identity record contains edits"),
             Self::InvalidEstimate => write!(f, "invalid context estimate anchor"),
+            Self::InvalidSpec => write!(f, "invalid context spec"),
             Self::InvalidEdit => write!(f, "context edit cannot be replayed"),
         }
     }
@@ -331,5 +474,66 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    /// schema 1 只有硬上限，schema 2 四个键都在，并可往返。
+    #[test]
+    fn spec_json_matches_schema() {
+        let v1 = ContextSpec::schema1(10);
+        let v1_json = json!({"hard_limit": 10});
+        assert_eq!(serde_json::to_value(&v1).expect("json"), v1_json);
+        assert_eq!(
+            serde_json::from_value::<ContextSpec>(v1_json).expect("parse"),
+            v1
+        );
+        let v2 = ContextSpec::schema2(10, 128_000, 32_000, 2);
+        let v2_json = json!({
+            "hard_limit": 10,
+            "soft_trigger": 128000,
+            "min_free": 32000,
+            "protect_rounds": 2
+        });
+        assert_eq!(serde_json::to_value(&v2).expect("json"), v2_json);
+        assert_eq!(
+            serde_json::from_value::<ContextSpec>(v2_json).expect("parse"),
+            v2
+        );
+    }
+
+    /// schema 号与 spec 字段集合必须配套；未知 spec 键拒绝。
+    #[test]
+    fn record_rejects_mismatched_spec() {
+        let estimate = json!({"tokens": 1, "source": "estimated", "anchor_round": null});
+        let base = json!({
+            "profile_version": 1,
+            "profile_hash": "0".repeat(64),
+            "context_strategy": "identity@1",
+            "estimate": estimate,
+            "edits": [],
+            "replayable": true
+        });
+        let mut schema1_extra = base.clone();
+        schema1_extra["schema_version"] = json!(1);
+        schema1_extra["spec"] = json!({
+            "hard_limit": 1,
+            "soft_trigger": 128000,
+            "min_free": 32000,
+            "protect_rounds": 2
+        });
+        assert!(serde_json::from_value::<ContextRecord>(schema1_extra).is_err());
+        let mut schema2_short = base.clone();
+        schema2_short["schema_version"] = json!(2);
+        schema2_short["spec"] = json!({"hard_limit": 1});
+        assert!(serde_json::from_value::<ContextRecord>(schema2_short).is_err());
+        let mut unknown_field = base;
+        unknown_field["schema_version"] = json!(2);
+        unknown_field["spec"] = json!({
+            "hard_limit": 1,
+            "soft_trigger": 128000,
+            "min_free": 32000,
+            "protect_rounds": 2,
+            "target": 64000
+        });
+        assert!(serde_json::from_value::<ContextRecord>(unknown_field).is_err());
     }
 }

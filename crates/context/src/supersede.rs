@@ -194,7 +194,7 @@ impl ContextStrategy for L0ThenL1 {
 }
 
 /// 保护窗口：最近多少个模型轮里的工具结果不被 L1 遮掉。
-const PROTECT_ROUNDS: usize = 2;
+pub(crate) const PROTECT_ROUNDS: usize = 2;
 
 /// 把被后读盖住的旧 `read_file` 正文换成存根。
 ///
@@ -236,6 +236,10 @@ fn mask_superseded(view: &mut View, edits: &mut Vec<Value>) {
 }
 
 /// 在更晚的结果里找最后一次仍盖住 `earlier` 的位置。
+///
+/// **作用**：`mask_superseded` 用来填写 `superseded_by_*`。
+/// **参数**：`rounds` 是当前视图的全部轮次。`earlier_round` 与 `earlier_call` 是被考察的那条，从 0 起。`earlier` 是该条工具结果。
+/// **边界**：同一轮里只看这条之后的调用。没有覆盖时返回 `None`。
 fn latest_covering(
     rounds: &[crate::transcript::Round],
     earlier_round: usize,
@@ -243,15 +247,14 @@ fn latest_covering(
     earlier: &ToolResult,
 ) -> Option<(usize, usize)> {
     let mut found = None;
-    for later_round in earlier_round..rounds.len() {
+    for (later_round, later) in rounds.iter().enumerate().skip(earlier_round) {
         let start_call = if later_round == earlier_round {
             earlier_call + 1
         } else {
             0
         };
-        for later_call in start_call..rounds[later_round].tools.len() {
-            let later = &rounds[later_round].tools[later_call];
-            if later_covers(later, earlier) {
+        for (later_call, later_tool) in later.tools.iter().enumerate().skip(start_call) {
+            if later_covers(later_tool, earlier) {
                 found = Some((later_round, later_call));
             }
         }
@@ -283,8 +286,10 @@ fn superseded_stub(earlier: &ToolResult, by_round: usize, by_call: usize) -> Opt
 /// **作用**：重放测试直接调用。以后的策略 `replay` 再转调它。
 /// **参数**：`view` 从事实抄出，成功时只改 edit 点到的 `body`。`edits` 只处理 `op: superseded`。
 /// **边界**：先检查全部 edit，任一不合法返回 [`ReplayError::InvalidEdit`] 且不改 `view`。不重新计算覆盖。
+/// 被遮的轮次若落在最近 [`PROTECT_ROUNDS`] 轮内，也视为不合法。
 pub(crate) fn replay_superseded_edits(view: &mut View, edits: &[Value]) -> Result<(), ReplayError> {
     let mut changes = Vec::new();
+    let protect_from = view.rounds.len().saturating_sub(PROTECT_ROUNDS);
     for edit in edits {
         let Some(object) = edit.as_object() else {
             return Err(ReplayError::InvalidEdit);
@@ -312,6 +317,9 @@ pub(crate) fn replay_superseded_edits(view: &mut View, edits: &[Value]) -> Resul
             return Err(ReplayError::InvalidEdit);
         }
         if (by_round, by_call) <= (round, call) {
+            return Err(ReplayError::InvalidEdit);
+        }
+        if round >= protect_from {
             return Err(ReplayError::InvalidEdit);
         }
         let stub = superseded_stub(tool, by_round, by_call).ok_or(ReplayError::InvalidEdit)?;
@@ -781,6 +789,51 @@ mod tests {
         assert_eq!(missing_view.rounds[0].tools[0].body, original);
     }
 
+    /// 手工写下保护窗口内的编辑时，重放拒绝并且不改正文。
+    #[test]
+    fn replay_superseded_rejects_protected_round() {
+        let mut facts = View {
+            system: "s".to_owned(),
+            user: "u".to_owned(),
+            rounds: vec![
+                round(vec![read_tool(
+                    "a.rs",
+                    1,
+                    true,
+                    Some(41),
+                    "chunk-1",
+                    500,
+                    "sha256:one",
+                )]),
+                round(vec![]),
+                round(vec![read_tool(
+                    "a.rs",
+                    1,
+                    false,
+                    None,
+                    "full-2",
+                    900,
+                    "sha256:two",
+                )]),
+                round(vec![read_tool("b.rs", 1, false, None, "other", 10, "sha256:three")]),
+            ],
+        };
+        let original = facts.rounds[2].tools[0].body.clone();
+        let edits = vec![json!({
+            "op": "superseded",
+            "round": 3,
+            "call": 1,
+            "superseded_by_round": 4,
+            "superseded_by_call": 1,
+            "result_ref": "sha256:two",
+        })];
+        assert_eq!(
+            replay_superseded_edits(&mut facts, &edits),
+            Err(ReplayError::InvalidEdit)
+        );
+        assert_eq!(facts.rounds[2].tools[0].body, original);
+    }
+
     /// 造一条策略名已经是 `l1@1` 的记录。
     ///
     /// **作用**：策略测试不用经过 `prepare`。
@@ -791,7 +844,7 @@ mod tests {
             profile_version: 1,
             profile_hash: "profile".to_owned(),
             context_strategy: L1_STRATEGY.to_owned(),
-            spec: ContextSpec { hard_limit: 0 },
+            spec: ContextSpec::schema1(0),
             estimate: Estimate {
                 tokens: 0,
                 source: EstimateSource::Estimated,

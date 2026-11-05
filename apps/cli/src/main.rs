@@ -882,6 +882,7 @@ fn rebuild_from_trace(host: &RunHost, trace: &RunTrace) -> RebuildResult {
                 tool_call_id: tool.tool_call_id.clone(),
                 tool_name: tool.tool_name.clone(),
                 result: read_bytes_blob(host, &tool.result_ref),
+                result_ref: tool.result_ref.clone(),
             })
             .collect();
         calls.push(RebuildCall {
