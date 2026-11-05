@@ -12,7 +12,7 @@ pub const IDENTITY_STRATEGY: &str = "identity@1";
 /// 一次可重放的上下文编辑。
 ///
 /// **作用**：`apply` 改视图并记下编辑；`replay` 按记录重做同一件事。
-/// **边界**：`ForwardDedup` 已经实现它，`prepare` 会调用。L1、L2 留给以后。
+/// **边界**：`ForwardDedup` 与 `SupersedeRead` 已经实现它。`prepare` 每次调用 L0，只在超过软触发后才试 L1。L2 留给以后。
 pub trait ContextStrategy: Send + Sync {
     /// 返回这条策略的稳定标识。
     ///
@@ -22,7 +22,7 @@ pub trait ContextStrategy: Send + Sync {
 
     /// 在视图上执行编辑，并把编辑追加到记录。
     ///
-    /// **作用**：策略链上的一步。P1 的管理器不调用它。
+    /// **作用**：策略链上的一步。`prepare` 调用 L0，并在超过软触发后调用 L1。
     /// **参数**：`view` 是这次准备好的视图，策略可以改其中的工具正文；空视图允许。`spec` 是这次调用的派生规格。`record` 已有估算和硬上限，策略只追加自己的 `edits`。
     /// **边界**：不得删除事实里的 blob。恒等实现三个参数都不改。
     fn apply(&self, view: &mut View, spec: &ContextSpec, record: &mut ContextRecord);

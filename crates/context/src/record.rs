@@ -80,7 +80,7 @@ pub enum ReplayError {
         /// 记录里的 schema 版本，不是 1。
         schema_version: u32,
     },
-    /// 记录里的策略不是 `identity@1` 或 `l0@1`。
+    /// 记录里的策略不是 `identity@1`、`l0@1`、`l1@1` 或 `l0l1@1`。
     UnknownStrategy {
         /// 记录里的 `context_strategy` 原文。空串也会出现在这里。
         id: String,
@@ -94,7 +94,7 @@ pub enum ReplayError {
 
     /// 一条 edit 不能应用到事实视图。
     ///
-    /// **作用**：L0 重放拒绝缺字段、错误的 `op`、越界序号或对不上的 `result_ref`。
+    /// **作用**：L0 与 L1 的重放拒绝缺字段、错误的 `op`、越界序号或对不上的 `result_ref`。
     /// **边界**：不区分是哪一种。不含工具正文。
     InvalidEdit,
 }

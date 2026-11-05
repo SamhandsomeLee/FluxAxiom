@@ -139,6 +139,59 @@ impl ContextStrategy for SupersedeRead {
     }
 }
 
+/// `prepare` 在留下 L1 时写入的策略标识。
+pub const L0L1_STRATEGY: &str = "l0l1@1";
+
+/// 先重放 L0 的 edit，再重放 L1 的 edit。
+///
+/// **作用**：`ContextManager::replay` 在策略名是 `l0l1@1` 时调用。
+/// **边界**：`prepare` 不调用 [`Self::apply`]。不打开 blob。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct L0ThenL1;
+
+impl ContextStrategy for L0ThenL1 {
+    /// 返回 `l0l1@1`。
+    ///
+    /// **作用**：记录和重放用它认出「L0 之后又留下了 L1」。
+    /// **边界**：不带估算或档案 hash。
+    fn id(&self) -> &str {
+        L0L1_STRATEGY
+    }
+
+    /// 不在这里跑软触发。
+    ///
+    /// **作用**：trait 要求有 `apply`。软触发和腾出量在 `prepare` 里。
+    /// **参数**：`view`、`spec`、`record` 都不读。空视图允许。
+    /// **边界**：不改视图，不追加 edit。
+    fn apply(&self, _view: &mut View, _spec: &ContextSpec, _record: &mut ContextRecord) {}
+
+    /// 按 `op` 分成两段重放。
+    ///
+    /// **作用**：同一条记录里可以同时有 `unchanged` 和 `superseded`。
+    /// **参数**：`view` 从事实抄出。`record` 提供策略名和 `edits`。
+    /// **边界**：策略名不是 `l0l1@1`，或出现第三种 `op`，都不改视图。
+    fn replay(&self, view: &mut View, record: &ContextRecord) -> Result<(), ReplayError> {
+        if record.context_strategy != self.id() {
+            return Err(ReplayError::UnknownStrategy {
+                id: record.context_strategy.clone(),
+            });
+        }
+        let mut unchanged = Vec::new();
+        let mut superseded = Vec::new();
+        for edit in &record.edits {
+            let Some(op) = edit.get("op").and_then(|value| value.as_str()) else {
+                return Err(ReplayError::InvalidEdit);
+            };
+            match op {
+                "unchanged" => unchanged.push(edit.clone()),
+                "superseded" => superseded.push(edit.clone()),
+                _ => return Err(ReplayError::InvalidEdit),
+            }
+        }
+        crate::forward_dedup::replay_unchanged_edits(view, &unchanged)?;
+        replay_superseded_edits(view, &superseded)
+    }
+}
 
 /// 保护窗口：最近多少个模型轮里的工具结果不被 L1 遮掉。
 const PROTECT_ROUNDS: usize = 2;
@@ -230,7 +283,7 @@ fn superseded_stub(earlier: &ToolResult, by_round: usize, by_call: usize) -> Opt
 /// **作用**：重放测试直接调用。以后的策略 `replay` 再转调它。
 /// **参数**：`view` 从事实抄出，成功时只改 edit 点到的 `body`。`edits` 只处理 `op: superseded`。
 /// **边界**：先检查全部 edit，任一不合法返回 [`ReplayError::InvalidEdit`] 且不改 `view`。不重新计算覆盖。
-fn replay_superseded_edits(view: &mut View, edits: &[Value]) -> Result<(), ReplayError> {
+pub(crate) fn replay_superseded_edits(view: &mut View, edits: &[Value]) -> Result<(), ReplayError> {
     let mut changes = Vec::new();
     for edit in edits {
         let Some(object) = edit.as_object() else {

@@ -1,4 +1,4 @@
-//! 上下文管理器。成功的准备先做 L0 去重，再检查硬上限。
+//! 上下文管理器。成功的准备先做 L0，超过软触发后再决定是否留下 L1，然后检查硬上限。
 //!
 //! **作用**：Engine 每次模型调用前调用 [`ContextManager::prepare`]。校验器调用 [`ContextManager::replay`]。
 //! **边界**：不读 blob，不改调用预算，不发请求。超硬上限时返回记录，不改事实。
@@ -6,20 +6,26 @@
 use fluxaxiom_contract::TokenCount;
 
 use crate::forward_dedup::{ForwardDedup, L0_STRATEGY};
-use crate::supersede::{SupersedeRead, L1_STRATEGY};
+use crate::supersede::{L0ThenL1, L0L1_STRATEGY, SupersedeRead, L1_STRATEGY};
 use crate::profile::ModelProfile;
 use crate::record::{ContextRecord, ContextSpec, Estimate, EstimateSource, ReplayError};
 use crate::strategy::{ContextStrategy, Identity, IDENTITY_STRATEGY};
 use crate::text::ceil_tokens;
 use crate::transcript::{Round, Transcript, View};
 
+/// 未校准的软触发。估算不超过这个数时不试 L1。
+const SOFT_TRIGGER_TOKENS: u64 = 128_000;
+
+/// 没超过硬上限时，L1 至少要腾出的 token。
+const MIN_FREE_TOKENS: u64 = 32_000;
+
 /// 一次通过硬上限的准备结果。
 ///
 /// **作用**：调用方把 `view` 序列化成模型请求，把 `record` 写成 blob。
-/// **边界**：L0 可能把最后一轮的重复工具正文换成存根。
+/// **边界**：L0 可能把最后一轮的重复工具正文换成存根。留下 L1 时，更早的被覆盖读取也会换成存根。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prepared {
-    /// 发给模型的视图。L0 可能把最后一轮的重复工具正文换成存根。`Debug` 只打印长度。
+    /// 发给模型的视图。L0 可能把最后一轮的重复工具正文换成存根。留下 L1 时，更早的被覆盖读取也会换成存根。`Debug` 只打印长度。
     pub view: View,
     /// 这次 `prepare` 的记录。只有数值和引用，调用方以后把它写成 blob。
     pub record: ContextRecord,
@@ -37,7 +43,7 @@ pub struct ContextExhausted {
 
 /// 持有一份档案的恒等管理器。
 ///
-/// **作用**：成功记录和耗尽记录的策略名都是 `l0@1`。
+/// **作用**：没留下 L1 时策略名是 `l0@1`。留下 L1 时策略名是 `l0l1@1`。
 /// **边界**：不读取档案里没有取值的字段，也不读取单价。耗尽时不发送请求。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextManager {
@@ -55,13 +61,13 @@ impl ContextManager {
         Self { profile }
     }
 
-    /// 先做 L0 去重，再按替换后的正文估算并检查硬上限。
+    /// 先做 L0，超过软触发后再决定是否留下 L1，最后检查硬上限。
     ///
-    /// **作用**：每次模型调用前调用。通过硬上限时，最后一轮的重复工具正文已换成存根。
+    /// **作用**：每次模型调用前调用。通过硬上限时，重复的新工具正文已换成存根；留下 L1 时，被后读盖住的旧正文也换成存根。
     /// **参数**：`transcript` 由调用方填入正文。`max_tokens` 是这次请求的输出上限，用来计算硬上限。
     /// **边界**：估算使用替换后的工具正文。更早轮次的已知 prompt 仍是下界。缓存字段不参加加法。
-    /// 硬上限为 0，或去重后的估算仍超过硬上限时，返回 [`ContextExhausted`]，不发送请求。
-    /// 耗尽记录的策略名也是 `l0@1`。
+    /// 估算不超过 128K 时不试 L1，策略名保持 `l0@1`。超过 128K 时，没超过硬上限则至少要腾出 `max(32K, 估算 / 4)` 才留下 L1；已经超过硬上限时即使腾出不够也留下。
+    /// 硬上限为 0，或最终估算仍超过硬上限时，返回 [`ContextExhausted`]，不发送请求。
     pub fn prepare(
         &self,
         transcript: &Transcript,
@@ -83,13 +89,25 @@ impl ContextManager {
         );
         record.context_strategy = L0_STRATEGY.to_owned();
         ForwardDedup.apply(&mut view, &spec, &mut record);
-        let mut estimated = transcript.clone();
-        for (round, view_round) in estimated.rounds.iter_mut().zip(&view.rounds) {
-            for (tool, view_tool) in round.tools.iter_mut().zip(&view_round.tools) {
-                tool.body = view_tool.body.clone();
+        record.estimate = estimate_view(&self.profile, transcript, &view);
+        if record.estimate.tokens > SOFT_TRIGGER_TOKENS {
+            let before_view = view.clone();
+            let before_edits = record.edits.clone();
+            let before_tokens = record.estimate.tokens;
+            SupersedeRead.apply(&mut view, &spec, &mut record);
+            let after = estimate_view(&self.profile, transcript, &view);
+            let freed = before_tokens.saturating_sub(after.tokens);
+            let minimum = MIN_FREE_TOKENS.max(before_tokens / 4);
+            let over_hard = spec.hard_limit == 0 || before_tokens > spec.hard_limit;
+            let added = record.edits.len() > before_edits.len();
+            if added && (over_hard || freed >= minimum) {
+                record.context_strategy = L0L1_STRATEGY.to_owned();
+                record.estimate = after;
+            } else {
+                view = before_view;
+                record.edits = before_edits;
             }
         }
-        record.estimate = estimate_transcript(&self.profile, &estimated);
         if record.spec.hard_limit == 0 || record.estimate.tokens > record.spec.hard_limit {
             return Err(ContextExhausted { record });
         }
@@ -100,7 +118,7 @@ impl ContextManager {
     ///
     /// **作用**：校验器拿它的结果做逐字节比较。本函数不理解编辑种类。
     /// **参数**：`transcript` 是调用方从 blob 装好的事实。`record` 是当时的 context 记录。
-    /// **边界**：接受 schema 1 的 `identity@1` 与 `l0@1`。不可重放、未知策略或恒等记录里有编辑时返回错误。
+    /// **边界**：接受 schema 1 的 `identity@1`、`l0@1`、`l1@1` 与 `l0l1@1`。不可重放、未知策略或恒等记录里有编辑时返回错误。
     /// 检查估算来源与锚点的关联及轮次范围；不重新计算估算，也不对照硬上限。
     pub fn replay(transcript: &Transcript, record: &ContextRecord) -> Result<View, ReplayError> {
         if record.schema_version != crate::record::SCHEMA_VERSION {
@@ -126,6 +144,8 @@ impl ContextManager {
             ForwardDedup.replay(&mut view, record)?;
         } else if record.context_strategy == L1_STRATEGY {
             SupersedeRead.replay(&mut view, record)?;
+        } else if record.context_strategy == L0L1_STRATEGY {
+            L0ThenL1.replay(&mut view, record)?;
         } else {
             return Err(ReplayError::UnknownStrategy {
                 id: record.context_strategy.clone(),
@@ -133,6 +153,21 @@ impl ContextManager {
         }
         Ok(view)
     }
+}
+
+/// 用视图里的工具正文估算下一次请求。
+///
+/// **作用**：`prepare` 在 L0 之后和 L1 试跑之后各调用一次。
+/// **参数**：`profile` 提供字符比例。`transcript` 是事实。`view` 是当前要发送的视图，只采用它的工具正文。
+/// **边界**：不改 `transcript` 和 `view`。轮次条数不一致时，多出来的一侧不参与这次抄写。
+fn estimate_view(profile: &ModelProfile, transcript: &Transcript, view: &View) -> Estimate {
+    let mut estimated = transcript.clone();
+    for (round, view_round) in estimated.rounds.iter_mut().zip(&view.rounds) {
+        for (tool, view_tool) in round.tools.iter_mut().zip(&view_round.tools) {
+            tool.body = view_tool.body.clone();
+        }
+    }
+    estimate_transcript(profile, &estimated)
 }
 
 /// 选择锚点估算或全量估算，并以已知 prompt 用量托底。
@@ -359,6 +394,131 @@ mod tests {
         assert_eq!(prepared.record.edits.len(), 1);
         let view = ContextManager::replay(&transcript, &prepared.record).expect("replay");
         assert_eq!(view, prepared.view);
+    }
+
+    /// 拼一条 `read_file` 的渲染正文。
+    ///
+    /// **作用**：软触发测试用它构造可被 `read_span` 识别的工具结果。
+    /// **参数**：`path` 写入 `path:` 行。`start` 是起始行。`truncated` 为真时必须有 `next`。`content` 是正文，汉字按 1 token 估算。
+    /// **边界**：不检查 `next` 是否大于 `start`。
+    fn rendered_read(path: &str, start: u32, truncated: bool, next: Option<u32>, content: &str) -> String {
+        let mut text = format!("tool: read_file\npath: {path}\nstart_line: {start}\n\n{content}\n");
+        if truncated {
+            text.push_str(&format!(
+                "truncated: true; next_start_line: {}\n",
+                next.expect("truncated read needs next_start_line")
+            ));
+        } else {
+            text.push_str("truncated: false\n");
+        }
+        text
+    }
+
+    /// 造一轮用量全部未知的工具结果。
+    ///
+    /// **作用**：让估算走全文字符，不被锚点挡住。
+    /// **参数**：`body` 是渲染正文。`result_ref` 必须和另一条不同，避免被 L0 当成同一次结果。
+    /// **边界**：工具名固定为 `read_file`。
+    fn unread_round(body: String, result_ref: &str) -> Round {
+        Round {
+            assistant: AssistantTurn {
+                content: "keep".to_owned(),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+            },
+            tools: vec![ToolResult {
+                call_id: "call".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: r#"{"path":"a.rs"}"#.to_owned(),
+                result_ref: result_ref.to_owned(),
+                byte_count: body.len() as u64,
+                body,
+            }],
+            usage: ModelUsage {
+                prompt_tokens: TokenCount::Unknown,
+                completion_tokens: TokenCount::Unknown,
+                prompt_cache_hit_tokens: TokenCount::Unknown,
+                prompt_cache_miss_tokens: TokenCount::Unknown,
+            },
+            trailing_user: String::new(),
+        }
+    }
+
+    /// 三轮：第 1 轮是部分读取，第 3 轮整文件盖住它。第 2 轮没有工具。
+    ///
+    /// **作用**：让第 1 轮落在保护窗口之外。
+    /// **参数**：`user` 是首条用户文本。`earlier` 是第 1 轮工具正文里的内容。
+    /// **边界**：两条 `result_ref` 不同。
+    fn covered_read(user: &str, earlier: &str) -> Transcript {
+        Transcript {
+            system: "s".to_owned(),
+            user: user.to_owned(),
+            rounds: vec![
+                unread_round(
+                    rendered_read("a.rs", 1, true, Some(41), earlier),
+                    "sha256:one",
+                ),
+                unread_round(String::new(), "sha256:empty"),
+                unread_round(
+                    rendered_read("a.rs", 1, false, None, "full"),
+                    "sha256:three",
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn prepare_skips_l1_below_the_soft_trigger() {
+        let transcript = covered_read("hi", "part");
+        let prepared = manager().prepare(&transcript, 32_768).expect("under limit");
+        assert_eq!(prepared.record.context_strategy, L0_STRATEGY);
+        assert!(prepared
+            .record
+            .edits
+            .iter()
+            .all(|edit| edit["op"] != "superseded"));
+        assert!(prepared.view.rounds[0].tools[0].body.starts_with("tool: read_file"));
+    }
+
+    #[test]
+    fn prepare_reverts_l1_when_it_does_not_free_enough() {
+        let earlier = rendered_read("a.rs", 1, true, Some(41), "part");
+        let transcript = covered_read(&"中".repeat(130_000), "part");
+        let prepared = manager().prepare(&transcript, 32_768).expect("under limit");
+        assert_eq!(prepared.record.context_strategy, L0_STRATEGY);
+        assert_eq!(prepared.view.rounds[0].tools[0].body, earlier);
+        assert!(prepared
+            .record
+            .edits
+            .iter()
+            .all(|edit| edit["op"] != "superseded"));
+    }
+
+    #[test]
+    fn prepare_keeps_l1_when_it_frees_enough() {
+        let transcript = covered_read(&"中".repeat(50_000), &"中".repeat(100_000));
+        let prepared = manager().prepare(&transcript, 32_768).expect("under limit");
+        assert_eq!(prepared.record.context_strategy, L0L1_STRATEGY);
+        assert!(prepared.view.rounds[0].tools[0]
+            .body
+            .starts_with("[superseded:"));
+        let view = ContextManager::replay(&transcript, &prepared.record).expect("replay");
+        assert_eq!(view, prepared.view);
+    }
+
+    #[test]
+    fn prepare_keeps_l1_when_already_over_the_hard_limit() {
+        let transcript = covered_read(&"中".repeat(145_000), "part");
+        let exhausted = manager()
+            .prepare(&transcript, 848_576)
+            .expect_err("over the hard limit");
+        assert_eq!(exhausted.record.context_strategy, L0L1_STRATEGY);
+        assert!(exhausted
+            .record
+            .edits
+            .iter()
+            .any(|edit| edit["op"] == "superseded"));
+        assert!(exhausted.record.estimate.tokens > exhausted.record.spec.hard_limit);
     }
 
     /// 锚点只加最后一轮的工具正文。assistant 正文和未知的缓存字段不再数一遍。

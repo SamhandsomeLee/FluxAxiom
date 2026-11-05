@@ -199,6 +199,18 @@ fn replay_edits(view: &mut View, edits: &[Value]) -> Result<(), ReplayError> {
     Ok(())
 }
 
+/// 只重放 `op` 为 `unchanged` 的 edit。
+///
+/// **作用**：`l0l1@1` 先调用它，再重放作废遮蔽。
+/// **参数**：`view` 从事实抄出，成功时只改这些 edit 点到的 `body`。`edits` 只能含 `unchanged`，空切片允许。
+/// **边界**：出现别的 `op` 时返回 [`ReplayError::InvalidEdit`]，并且不改 `view`。
+pub(crate) fn replay_unchanged_edits(
+    view: &mut View,
+    edits: &[Value],
+) -> Result<(), ReplayError> {
+    replay_edits(view, edits)
+}
+
 /// 读取 edit 里从 1 起的序号，并转换成切片下标。
 ///
 /// **作用**：`replay_edits` 用它读 `round`、`call`、`same_as_round` 和 `same_as_call`。
