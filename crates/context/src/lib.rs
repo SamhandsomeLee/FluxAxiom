@@ -7,6 +7,7 @@ mod forward_dedup;
 mod manager;
 mod profile;
 mod record;
+mod stale;
 mod strategy;
 mod text;
 mod transcript;
