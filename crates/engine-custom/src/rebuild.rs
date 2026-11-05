@@ -693,7 +693,7 @@ fn check_token(obj: &Value, key: &str, expected: TokenCount) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluxaxiom_context::L0L1_STRATEGY;
+    use fluxaxiom_context::{L0L1L2_STRATEGY, L0L1_STRATEGY, L0L2_STRATEGY};
     use serde_json::json;
 
     /// 各轮事件共用的已知用量。四个计数都是 `Known`，避免合计被 `unknown` 干扰。
@@ -1298,6 +1298,183 @@ mod tests {
         match l1_verify(reads, fourth) {
             RebuildResult::Inconsistent { rule, .. } => assert_eq!(rule, 1),
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// 按事实里的工具名、参数、大小和引用拼 L2 存根。
+    ///
+    /// **作用**：`l0l2` 与 `l0l1l2` 的请求夹具共用这一句。
+    /// **参数**：`body` 是原工具正文，长度写入存根。`result_ref` 是该条结果的引用。
+    /// **边界**：工具名和参数与 [`resp_read_file`] 相同。不打开 blob。
+    fn stale_stub(body: &str, result_ref: &str) -> String {
+        format!(
+            "[stale: read_file {}, {} B, {}; call this tool again if needed]",
+            read_file_args(),
+            body.len(),
+            result_ref
+        )
+    }
+
+    /// 一条落在第 `round` 轮的 `stale` 编辑。
+    ///
+    /// **作用**：L2 校验记录共用。
+    /// **参数**：`round` 从 1 起。`result_ref` 必须与该轮事实的引用相同。
+    /// **边界**：`call` 固定为 1。
+    fn stale_edit(round: u32, result_ref: &str) -> Value {
+        json!({
+            "op": "stale",
+            "round": round,
+            "call": 1,
+            "result_ref": result_ref,
+        })
+    }
+
+    /// `prepare` 留下 L2 时会写的两个策略名。
+    ///
+    /// **作用**：同一组验收对 `l0l2@1` 和 `l0l1l2@1` 各跑一遍。
+    /// **边界**：不含单独的 `l2@1`。那不是 `prepare` 留下 L2 时写的名字。
+    fn l2_strategy_ids() -> [&'static str; 2] {
+        [L0L2_STRATEGY, L0L1L2_STRATEGY]
+    }
+
+    /// 按策略名组装一条记录。`l0l1l2@1` 先带上合法的作废编辑，再追加 `stale`。
+    ///
+    /// **作用**：让两种策略的重放都能走到 L2。
+    /// **参数**：`strategy` 只能是 [`l2_strategy_ids`] 里的名字。`stale` 是这条记录的陈旧编辑。
+    /// **边界**：`l0l2@1` 只有 `stale`。`l0l1l2@1` 的作废编辑遮第 1 轮，并由第 3 轮盖住。
+    fn l2_record(strategy: &str, stale: Value) -> ContextRecord {
+        let mut record = identity_record();
+        record.context_strategy = strategy.to_owned();
+        if strategy == L0L1L2_STRATEGY {
+            record.edits = l0l1_record().edits;
+        }
+        record.edits.push(stale);
+        record
+    }
+
+    /// 合法存根经 rebuild 后为 `consistent`。
+    ///
+    /// **作用**：锁住 `l0l2@1` 与 `l0l1l2@1`。后者先作废再陈旧遮蔽，请求里看见的是 L2 存根。
+    /// **边界**：只遮第 1 轮。第 2、3 轮仍是原文。
+    #[test]
+    fn l2_record_with_stub_is_consistent() {
+        for strategy in l2_strategy_ids() {
+            let reads = l1_reads();
+            let stub = stale_stub(&reads.earlier, "sha256:one");
+            let fourth = l1_fourth(
+                &reads,
+                &stub,
+                RebuildContext::Parsed(l2_record(strategy, stale_edit(1, "sha256:one"))),
+                Some(strategy),
+            );
+            assert_eq!(
+                l1_verify(reads, fourth),
+                RebuildResult::Consistent,
+                "{strategy}"
+            );
+        }
+    }
+
+    /// 记录合法、请求里的 L2 存根被改一个字符时按规则 1 失败。
+    ///
+    /// **作用**：两种留下 L2 的策略都要能发现存根被篡改。
+    /// **边界**：编辑仍指向第 1 轮。
+    #[test]
+    fn changed_l2_stub_is_rule_1() {
+        for strategy in l2_strategy_ids() {
+            let reads = l1_reads();
+            let mut stub = stale_stub(&reads.earlier, "sha256:one");
+            stub.push('x');
+            let fourth = l1_fourth(
+                &reads,
+                &stub,
+                RebuildContext::Parsed(l2_record(strategy, stale_edit(1, "sha256:one"))),
+                Some(strategy),
+            );
+            match l1_verify(reads, fourth) {
+                RebuildResult::Inconsistent { rule, .. } => assert_eq!(rule, 1),
+                other => panic!("{strategy}: {other:?}"),
+            }
+        }
+    }
+
+    /// 陈旧编辑落在最近两轮时，即使请求也写成存根，仍按规则 1 失败。
+    ///
+    /// **作用**：保护窗口由重放拒绝，不信任 edit 自己写的轮次。
+    /// **边界**：第 2 轮在三轮事实的保护窗口内。`l0l1l2@1` 另有一条合法的第 1 轮作废编辑。
+    #[test]
+    fn stale_inside_protect_window_is_rule_1() {
+        for strategy in l2_strategy_ids() {
+            let reads = l1_reads();
+            let stub = stale_stub(&reads.middle, "sha256:two");
+            let mut msgs = system_user();
+            msgs.push(assistant_read_file("r1", "c1"));
+            msgs.push(tool_msg("c1", &reads.earlier));
+            msgs.push(assistant_read_file("r2", "c2"));
+            msgs.push(tool_msg("c2", &stub));
+            msgs.push(assistant_read_file("r3", "c3"));
+            msgs.push(tool_msg("c3", &reads.later));
+            let mut fourth = call(4, base_req(msgs), resp_stop("done", "r4"), vec![], "stop");
+            fourth.event_context_strategy = Some(strategy.to_owned());
+            fourth.context =
+                RebuildContext::Parsed(l2_record(strategy, stale_edit(2, "sha256:two")));
+            match l1_verify(reads, fourth) {
+                RebuildResult::Inconsistent { call, rule, detail } => {
+                    assert_eq!(call, 4, "{strategy}");
+                    assert_eq!(rule, 1, "{strategy}");
+                    assert_eq!(detail, "context edit cannot be replayed", "{strategy}");
+                }
+                other => panic!("{strategy}: {other:?}"),
+            }
+        }
+    }
+
+    /// 请求已是 L2 存根，记录没有对应编辑时按规则 1 失败。
+    ///
+    /// **作用**：两种策略名都不能把未记录的替换当成合法遮蔽。
+    /// **边界**：记录的 `edits` 只有 `l0l1l2@1` 那条作废编辑，没有 `stale`。
+    #[test]
+    fn l2_stub_without_stale_edit_is_rule_1() {
+        for strategy in l2_strategy_ids() {
+            let reads = l1_reads();
+            let stub = stale_stub(&reads.earlier, "sha256:one");
+            let mut record = identity_record();
+            record.context_strategy = strategy.to_owned();
+            if strategy == L0L1L2_STRATEGY {
+                record.edits = l0l1_record().edits;
+            }
+            let fourth = l1_fourth(
+                &reads,
+                &stub,
+                RebuildContext::Parsed(record),
+                Some(strategy),
+            );
+            match l1_verify(reads, fourth) {
+                RebuildResult::Inconsistent { rule, .. } => assert_eq!(rule, 1),
+                other => panic!("{strategy}: {other:?}"),
+            }
+        }
+    }
+
+    /// 记录要求写成 L2 存根，请求仍是原文时按规则 1 失败。
+    ///
+    /// **作用**：有编辑就必须改变请求。
+    /// **边界**：第 1 轮编辑本身合法。
+    #[test]
+    fn l2_edit_with_unchanged_request_is_rule_1() {
+        for strategy in l2_strategy_ids() {
+            let reads = l1_reads();
+            let earlier = reads.earlier.clone();
+            let fourth = l1_fourth(
+                &reads,
+                &earlier,
+                RebuildContext::Parsed(l2_record(strategy, stale_edit(1, "sha256:one"))),
+                Some(strategy),
+            );
+            match l1_verify(reads, fourth) {
+                RebuildResult::Inconsistent { rule, .. } => assert_eq!(rule, 1),
+                other => panic!("{strategy}: {other:?}"),
+            }
         }
     }
 
