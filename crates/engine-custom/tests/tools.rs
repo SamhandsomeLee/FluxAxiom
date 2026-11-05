@@ -2,15 +2,17 @@
 //!
 //! **作用**：证明工具只读授权根，超页或超字节会标 `truncated` 并给出续读。
 //! **边界**：不接 Engine Loop，不记账。这里的工具不碰模型输出；流式 `tool_calls` 的解析在 `tests/sse.rs`。样本是测试临时目录，不是真实仓库。
+//! `read_file_large_file_baseline` 默认忽略，只在显式运行时写数兆字节文件并打印耗时。
 
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fluxaxiom_engine_custom::{
-    list_files, read_file, search_code, ToolError, WorkspaceError, WorkspaceRoot, LIST_PAGE_LIMIT,
-    READ_BYTE_LIMIT, READ_LINE_LIMIT, SEARCH_MATCH_LIMIT,
+    list_files, read_file, search_code, ToolError, ToolOutput, WorkspaceError, WorkspaceRoot,
+    LIST_PAGE_LIMIT, READ_BYTE_LIMIT, READ_LINE_LIMIT, SEARCH_MATCH_LIMIT,
 };
 
 /// 每个测试一个临时目录，避免互相看见文件。
@@ -723,4 +725,169 @@ fn make_dir_symlink(target: &Path, link: &Path) {
     #[cfg(not(windows))]
     let result = std::os::unix::fs::symlink(target, link);
     result.expect("UNVERIFIED: directory symlink capability is required for this security test");
+}
+
+/// 基线文本每一行的文件字节数，不含换行。能整除 `READ_BYTE_LIMIT`，所以一页正好是整数行。
+const BASELINE_LINE_BYTES: usize = 128;
+
+/// 每个位置重复读取的次数。中位耗时取排序后的中间一次。
+const BASELINE_REPEATS: usize = 3;
+
+/// 大文件 `read_file` 的耗时基线。
+///
+/// **作用**：记录 1 MiB 与 8 MiB 上首页、第二页和末页的中位耗时，以及 1 MiB 文件末尾空字节仍整次拒绝。
+/// **边界**：默认不跑。不断言毫秒数，不改读取行为。输出不含正文。临时目录在结束时删除。
+#[test]
+#[ignore = "writes multi-megabyte files and only records timing"]
+fn read_file_large_file_baseline() {
+    let lines_per_page = (READ_BYTE_LIMIT / BASELINE_LINE_BYTES) as u32;
+    assert_eq!(READ_BYTE_LIMIT % BASELINE_LINE_BYTES, 0);
+    for target in [1024 * 1024, 8 * 1024 * 1024] {
+        let file = write_baseline(target, false);
+        assert!(file.lines > lines_per_page * 2);
+        let first_next = lines_per_page + 1;
+        let second_next = lines_per_page * 2 + 1;
+        let last_start = file.lines - lines_per_page + 1;
+        time_page(&file, 1, Some(first_next));
+        time_page(&file, first_next, Some(second_next));
+        time_page(&file, last_start, None);
+    }
+    let nul = write_baseline(1024 * 1024, true);
+    let mut samples = Vec::with_capacity(BASELINE_REPEATS);
+    for _ in 0..BASELINE_REPEATS {
+        let started = Instant::now();
+        let error = read_file(&nul.root, "sample.txt", 1).unwrap_err();
+        samples.push(started.elapsed());
+        assert_eq!(error, ToolError::Binary);
+        assert!(!error.to_string().contains("aaa"));
+    }
+    println!(
+        "bytes={} start_line=1 median_us={} samples_us={} result=binary",
+        nul.bytes,
+        median_us(&samples),
+        sample_list(&samples),
+    );
+}
+
+/// 基线用的临时文件。
+///
+/// **作用**：给 `read_file_large_file_baseline` 提供授权根和已知行数。
+/// **边界**：离开作用域时删除整个临时目录。正文是重复的 `a`，不进入测试输出。
+struct BaselineFile {
+    /// 临时目录。测试结束时整目录删除。
+    directory: PathBuf,
+    /// 已打开的授权根，指向 `directory`。
+    root: WorkspaceRoot,
+    /// 磁盘上的文件字节数。文本场景含换行；空字节场景再加 1。大于 0。
+    bytes: u64,
+    /// 完整文本行数，等于最后一行的行号。每行正好 `BASELINE_LINE_BYTES` 个 `a`。
+    lines: u32,
+}
+
+impl Drop for BaselineFile {
+    /// **作用**：删除临时目录，避免数兆字节文件留在系统临时目录。
+    /// **边界**：删除失败时忽略，不把清理失败当成基线失败。
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// 写成至少 `target_bytes` 字节的 `sample.txt`。
+///
+/// **作用**：行宽固定为 128 字节加换行，避免单行截断混进基线。
+/// **参数**：`target_bytes` 是文本部分希望达到的最小字节数，必须大于 0。`nul_tail` 为真时在最后一个换行后再写一个 0。
+/// **边界**：实际字节数按整行向上取整，可以略大于 `target_bytes`。不调用 `read_file`。
+fn write_baseline(target_bytes: u64, nul_tail: bool) -> BaselineFile {
+    assert!(target_bytes > 0);
+    let directory = fresh_dir();
+    let stride = (BASELINE_LINE_BYTES + 1) as u64;
+    let lines = u32::try_from(target_bytes.div_ceil(stride)).expect("line count fits u32");
+    let path = directory.join("sample.txt");
+    let mut writer = BufWriter::new(fs::File::create(&path).unwrap());
+    let content = vec![b'a'; BASELINE_LINE_BYTES];
+    for _ in 0..lines {
+        writer.write_all(&content).unwrap();
+        writer.write_all(b"\n").unwrap();
+    }
+    if nul_tail {
+        writer.write_all(&[0]).unwrap();
+    }
+    writer.flush().unwrap();
+    let bytes = fs::metadata(&path).unwrap().len();
+    let root = WorkspaceRoot::open(&directory).unwrap();
+    BaselineFile {
+        directory,
+        root,
+        bytes,
+        lines,
+    }
+}
+
+/// 重复读取同一页，打印中位耗时，并检查这一页的形状。
+///
+/// **参数**：`file` 是基线文件。`start_line` 从 1 起。`continuation` 是期望的下一行；`None` 表示这一页已经到文件末尾。
+/// **边界**：三次的截断标记和续读行必须相同。不打印正文，不断言耗时。
+fn time_page(file: &BaselineFile, start_line: u32, continuation: Option<u32>) {
+    let mut samples = Vec::with_capacity(BASELINE_REPEATS);
+    for _ in 0..BASELINE_REPEATS {
+        let started = Instant::now();
+        let output = read_file(&file.root, "sample.txt", start_line).unwrap();
+        samples.push(started.elapsed());
+        assert_full_page(&output, start_line, continuation);
+    }
+    let continued = continuation
+        .map(|line| line.to_string())
+        .unwrap_or_else(|| "none".to_owned());
+    println!(
+        "bytes={} start_line={start_line} median_us={} samples_us={} truncated={} continuation={continued}",
+        file.bytes,
+        median_us(&samples),
+        sample_list(&samples),
+        continuation.is_some(),
+    );
+}
+
+/// 这一页正好装满字节上限，并且从 `start_line` 开始。
+///
+/// **参数**：`output` 是同一次成功读取。`start_line` 是请求的起始行，从 1 起。`continuation` 是期望的下一行；`None` 表示没有续读。
+/// **边界**：纳入的文件字节等于 `READ_BYTE_LIMIT`。行内没有截断省略号。不检查耗时。
+fn assert_full_page(output: &ToolOutput, start_line: u32, continuation: Option<u32>) {
+    assert_eq!(output.cursor, start_line);
+    assert_eq!(output.truncated, continuation.is_some());
+    assert_eq!(output.continuation, continuation);
+    let rendered = output.render();
+    let lines = numbered_lines(&rendered);
+    assert_eq!(lines.len(), READ_BYTE_LIMIT / BASELINE_LINE_BYTES);
+    assert!(lines[0].starts_with(&format!("{start_line}|")));
+    let mut kept = 0_usize;
+    for line in lines {
+        let (number, text) = line.split_once('|').unwrap();
+        let number: u32 = number.parse().unwrap();
+        assert!(number >= start_line);
+        assert!(!text.ends_with('…'));
+        kept += text.len();
+    }
+    assert_eq!(kept, READ_BYTE_LIMIT);
+}
+
+/// 三次耗时排序后的中间值，单位是微秒。
+///
+/// **参数**：`samples` 必须正好是 `BASELINE_REPEATS` 次。空切片会在取中间值时失败。
+/// **边界**：不把 0 微秒改写成别的数。
+fn median_us(samples: &[Duration]) -> u128 {
+    let mut ordered: Vec<u128> = samples.iter().map(Duration::as_micros).collect();
+    ordered.sort_unstable();
+    ordered[ordered.len() / 2]
+}
+
+/// 按调用顺序写出每次耗时，单位是微秒。
+///
+/// **参数**：`samples` 是同一次位置的三次读取。空切片得到空字符串。
+/// **边界**：不含正文。
+fn sample_list(samples: &[Duration]) -> String {
+    samples
+        .iter()
+        .map(|sample| sample.as_micros().to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
