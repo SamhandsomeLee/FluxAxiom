@@ -3,6 +3,7 @@
 //! **作用**：Engine 在每次模型调用前调用 [`ContextManager::prepare`]。校验器调用 [`ContextManager::replay`]。
 //! **边界**：不依赖 `engine-api`、`engine-custom`、`run-host`。不读 blob，不改调用预算。
 //! 不发网络请求。`mask@1` 与实测轮不在本 crate 的这一版里。
+mod forward_dedup;
 mod manager;
 mod profile;
 mod record;
@@ -10,6 +11,7 @@ mod strategy;
 mod text;
 mod transcript;
 
+pub use forward_dedup::{ForwardDedup, L0_STRATEGY};
 pub use manager::{ContextExhausted, ContextManager, Prepared};
 pub use profile::{deepseek_flash, ModelProfile, ProfileError, ProfileField};
 pub use record::{ContextRecord, ContextSpec, Estimate, EstimateSource, ReplayError};

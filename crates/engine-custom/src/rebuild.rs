@@ -233,6 +233,9 @@ fn replay_matches(calls: &[RebuildCall], pos: usize, req: &Value) -> Result<(), 
         ReplayError::InvalidEstimate => {
             inconsistent(call.index, 1, "invalid context estimate anchor")
         }
+        ReplayError::InvalidEdit => {
+            inconsistent(call.index, 1, "context edit cannot be replayed")
+        }
         ReplayError::UnsupportedSchema { .. }
         | ReplayError::UnknownStrategy { .. }
         | ReplayError::NotReplayable => RebuildResult::Unverifiable {

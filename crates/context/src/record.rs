@@ -91,6 +91,12 @@ pub enum ReplayError {
     IdentityHasEdits,
     /// 估算来源与锚点不一致，或锚点为 0、超出事实轮次。
     InvalidEstimate,
+
+    /// 一条 edit 不能应用到事实视图。
+    ///
+    /// **作用**：L0 重放拒绝缺字段、错误的 `op`、越界序号或对不上的 `result_ref`。
+    /// **边界**：不区分是哪一种。不含工具正文。
+    InvalidEdit,
 }
 
 impl Estimate {
@@ -268,6 +274,7 @@ impl std::fmt::Display for ReplayError {
             Self::NotReplayable => write!(f, "context record is not replayable"),
             Self::IdentityHasEdits => write!(f, "identity record contains edits"),
             Self::InvalidEstimate => write!(f, "invalid context estimate anchor"),
+            Self::InvalidEdit => write!(f, "context edit cannot be replayed"),
         }
     }
 }
