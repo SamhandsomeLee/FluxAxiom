@@ -10,6 +10,7 @@ mod record;
 mod strategy;
 mod text;
 mod transcript;
+mod supersede;
 
 pub use forward_dedup::{ForwardDedup, L0_STRATEGY};
 pub use manager::{ContextExhausted, ContextManager, Prepared};
