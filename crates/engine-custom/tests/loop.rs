@@ -399,7 +399,7 @@ async fn context_over_the_hard_limit_does_not_call_the_model() {
     else {
         panic!("expected exhaustion diagnostic");
     };
-    assert_eq!(context_strategy, "identity@1");
+    assert_eq!(context_strategy, "l0@1");
     let record: fluxaxiom_context::ContextRecord =
         serde_json::from_str(&host.blob_text(context_ref)).unwrap();
     assert_eq!(record.context_strategy, *context_strategy);
@@ -560,9 +560,9 @@ async fn prepared_call_stores_context_record_without_prompt_text() {
             context_strategy: Some(strategy),
             ..
         } => {
-            assert_eq!(strategy, "identity@1");
+            assert_eq!(strategy, "l0@1");
             let record = host.blob_text(context_ref);
-            assert!(record.contains("identity@1"));
+            assert!(record.contains("l0@1"));
             assert!(!record.contains("summarize note.txt"));
             assert!(!record.contains("think"));
             assert!(host.blob_text(request_ref).contains("summarize note.txt"));
@@ -796,7 +796,7 @@ async fn invalid_tool_arguments_observe_then_provider_error() {
             assert_eq!(*recorded, usage());
             assert_eq!(finish_reason, "invalid_tool_arguments");
             assert!(context_ref.is_some());
-            assert_eq!(context_strategy.as_deref(), Some("identity@1"));
+            assert_eq!(context_strategy.as_deref(), Some("l0@1"));
         }
         other => panic!("expected ModelCall, got {other:?}"),
     }

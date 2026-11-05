@@ -22,13 +22,13 @@ pub struct ContextRecord {
     pub profile_version: u32,
     /// 档案文件 UTF-8 字节的 sha256，64 位小写十六进制，无 `sha256:` 前缀。
     pub profile_hash: String,
-    /// 策略标识。P1 固定为 `identity@1`。空串会被 `replay` 当成未知策略。
+    /// 策略标识。成功和耗尽的 `prepare` 写 `l0@1`。`identity()` 仍写 `identity@1`。空串会被 `replay` 当成未知策略。
     pub context_strategy: String,
     /// 这次调用的派生规格。schema 1 只有硬上限。
     pub spec: ContextSpec,
     /// 这次调用的 token 估算。不含正文。
     pub estimate: Estimate,
-    /// 各策略追加的编辑。恒等策略必须是空数组。元素是 JSON 值，P1 不定义内部形状，也不含正文。
+    /// 各策略追加的编辑。恒等策略必须是空数组。L0 的元素是不含正文的 edit 对象。
     pub edits: Vec<serde_json::Value>,
     /// 能否按记录重建视图。`false` 时 `replay` 返回 [`ReplayError::NotReplayable`]，不猜视图。
     pub replayable: bool,
@@ -80,7 +80,7 @@ pub enum ReplayError {
         /// 记录里的 schema 版本，不是 1。
         schema_version: u32,
     },
-    /// 记录里的策略不是本 crate 当前认识的 `identity@1`。
+    /// 记录里的策略不是 `identity@1` 或 `l0@1`。
     UnknownStrategy {
         /// 记录里的 `context_strategy` 原文。空串也会出现在这里。
         id: String,
@@ -164,7 +164,7 @@ where
 impl ContextRecord {
     /// 组装一条恒等策略记录。
     ///
-    /// **作用**：`prepare` 在空链上调用。策略标识固定为 `identity@1`。
+    /// **作用**：`prepare` 用它打底，再把策略名改成 `l0@1`。直接调用时策略标识是 `identity@1`。
     /// **参数**：`profile_version` 写入记录，从 1 起。`profile_hash` 是 64 位小写十六进制，原样保存。`spec` 只含硬上限。`estimate` 是这次的 token 估算，其 `source` 与 `anchor_round` 必须一致。
     /// **边界**：`edits` 为空，`replayable` 为真。不写入任何正文。
     pub(crate) fn identity(

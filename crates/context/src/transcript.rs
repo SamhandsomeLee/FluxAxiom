@@ -105,7 +105,7 @@ pub struct View {
 impl View {
     /// 按恒等关系从事实抄出视图。
     ///
-    /// **作用**：空链的 `prepare` 和 `identity@1` 的 `replay` 使用。
+    /// **作用**：`prepare` 先抄出这份视图，再交给 L0。`identity@1` 的重放也使用它。
     /// **参数**：`transcript` 的正文被克隆。调用方仍持有原来的事实。
     /// **边界**：不删除、不替换任何字段。
     pub(crate) fn identity(transcript: &Transcript) -> Self {

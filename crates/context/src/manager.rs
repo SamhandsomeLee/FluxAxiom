@@ -1,10 +1,11 @@
-//! 上下文管理器。P1 的链为空，只估算并检查硬上限。
+//! 上下文管理器。成功的准备先做 L0 去重，再检查硬上限。
 //!
 //! **作用**：Engine 每次模型调用前调用 [`ContextManager::prepare`]。校验器调用 [`ContextManager::replay`]。
 //! **边界**：不读 blob，不改调用预算，不发请求。超硬上限时返回记录，不改事实。
 
 use fluxaxiom_contract::TokenCount;
 
+use crate::forward_dedup::{ForwardDedup, L0_STRATEGY};
 use crate::profile::ModelProfile;
 use crate::record::{ContextRecord, ContextSpec, Estimate, EstimateSource, ReplayError};
 use crate::strategy::{ContextStrategy, Identity, IDENTITY_STRATEGY};
@@ -14,10 +15,10 @@ use crate::transcript::{Round, Transcript, View};
 /// 一次通过硬上限的准备结果。
 ///
 /// **作用**：调用方把 `view` 序列化成模型请求，把 `record` 写成 blob。
-/// **边界**：恒等策略下 `view` 的文字与输入事实相同。
+/// **边界**：L0 可能把最后一轮的重复工具正文换成存根。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prepared {
-    /// 发给模型的视图。恒等策略下文字与输入事实相同，含工具正文。`Debug` 只打印长度。
+    /// 发给模型的视图。L0 可能把最后一轮的重复工具正文换成存根。`Debug` 只打印长度。
     pub view: View,
     /// 这次 `prepare` 的记录。只有数值和引用，调用方以后把它写成 blob。
     pub record: ContextRecord,
@@ -35,8 +36,8 @@ pub struct ContextExhausted {
 
 /// 持有一份档案的恒等管理器。
 ///
-/// **作用**：P1 不接收策略链。空链的标识固定为 `identity@1`。
-/// **边界**：不读取档案里没有取值的字段，也不读取单价。
+/// **作用**：成功记录和耗尽记录的策略名都是 `l0@1`。
+/// **边界**：不读取档案里没有取值的字段，也不读取单价。耗尽时不发送请求。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextManager {
     /// 这次使用的模型档案。所有权在管理器里，运行中不替换。
@@ -53,42 +54,52 @@ impl ContextManager {
         Self { profile }
     }
 
-    /// 估算、跳过空链、检查硬上限。
+    /// 先做 L0 去重，再按替换后的正文估算并检查硬上限。
     ///
-    /// **作用**：每次模型调用前调用。成功时视图与事实文字相同。
-    /// **参数**：`transcript` 由调用方填入正文。`max_tokens` 是这次请求的输出上限。
-    /// **边界**：以最近一个 `prompt_tokens` 与 `completion_tokens` 都已知的轮次为服务端锚点。
-    /// completion 缺失时，已知 prompt 仍作为估算下界。缓存字段不参加加法。
-    /// 硬上限为 0 或估算超过硬上限时返回 [`ContextExhausted`]，记录仍完整。
+    /// **作用**：每次模型调用前调用。通过硬上限时，最后一轮的重复工具正文已换成存根。
+    /// **参数**：`transcript` 由调用方填入正文。`max_tokens` 是这次请求的输出上限，用来计算硬上限。
+    /// **边界**：估算使用替换后的工具正文。更早轮次的已知 prompt 仍是下界。缓存字段不参加加法。
+    /// 硬上限为 0，或去重后的估算仍超过硬上限时，返回 [`ContextExhausted`]，不发送请求。
+    /// 耗尽记录的策略名也是 `l0@1`。
     pub fn prepare(
         &self,
         transcript: &Transcript,
         max_tokens: u32,
     ) -> Result<Prepared, ContextExhausted> {
-        let estimate = estimate_transcript(&self.profile, transcript);
         let spec = ContextSpec {
-            hard_limit: self.profile.hard_limit(max_tokens), //当前轮次可以使用的token上限
+            hard_limit: self.profile.hard_limit(max_tokens),
         };
-        let record = ContextRecord::identity(
+        let mut view = View::identity(transcript);
+        let mut record = ContextRecord::identity(
             self.profile.profile_version,
             self.profile.profile_hash.clone(),
-            spec,
-            estimate,
+            spec.clone(),
+            Estimate {
+                tokens: 0,
+                source: EstimateSource::Estimated,
+                anchor_round: None,
+            },
         );
+        record.context_strategy = L0_STRATEGY.to_owned();
+        ForwardDedup.apply(&mut view, &spec, &mut record);
+        let mut estimated = transcript.clone();
+        for (round, view_round) in estimated.rounds.iter_mut().zip(&view.rounds) {
+            for (tool, view_tool) in round.tools.iter_mut().zip(&view_round.tools) {
+                tool.body = view_tool.body.clone();
+            }
+        }
+        record.estimate = estimate_transcript(&self.profile, &estimated);
         if record.spec.hard_limit == 0 || record.estimate.tokens > record.spec.hard_limit {
             return Err(ContextExhausted { record });
         }
-        Ok(Prepared {
-            view: View::identity(transcript),
-            record, //record : record，record移入Prepared后，prepare函数中不能再使用了，所有权转移了。
-        })
+        Ok(Prepared { view, record })
     }
 
     /// 用事实和记录重建视图。
     ///
     /// **作用**：校验器拿它的结果做逐字节比较。本函数不理解编辑种类。
     /// **参数**：`transcript` 是调用方从 blob 装好的事实。`record` 是当时的 context 记录。
-    /// **边界**：只接受 schema 1 和 `identity@1`。不可重放、未知策略或恒等记录里有编辑时返回错误。
+    /// **边界**：接受 schema 1 的 `identity@1` 与 `l0@1`。不可重放、未知策略或恒等记录里有编辑时返回错误。
     /// 检查估算来源与锚点的关联及轮次范围；不重新计算估算，也不对照硬上限。
     pub fn replay(transcript: &Transcript, record: &ContextRecord) -> Result<View, ReplayError> {
         if record.schema_version != crate::record::SCHEMA_VERSION {
@@ -99,11 +110,6 @@ impl ContextManager {
         if !record.replayable {
             return Err(ReplayError::NotReplayable);
         }
-        if record.context_strategy != IDENTITY_STRATEGY {
-            return Err(ReplayError::UnknownStrategy {
-                id: record.context_strategy.clone(),
-            });
-        }
         record.estimate.validate()?;
         if record
             .estimate
@@ -113,7 +119,15 @@ impl ContextManager {
             return Err(ReplayError::InvalidEstimate);
         }
         let mut view = View::identity(transcript);
-        Identity.replay(&mut view, record)?;
+        if record.context_strategy == IDENTITY_STRATEGY {
+            Identity.replay(&mut view, record)?;
+        } else if record.context_strategy == L0_STRATEGY {
+            ForwardDedup.replay(&mut view, record)?;
+        } else {
+            return Err(ReplayError::UnknownStrategy {
+                id: record.context_strategy.clone(),
+            });
+        }
         Ok(view)
     }
 }
@@ -295,7 +309,53 @@ mod tests {
         assert_eq!(prepared.view.user, "你好，123");
         assert!(prepared.record.edits.is_empty());
         assert!(prepared.record.replayable);
-        assert_eq!(prepared.record.context_strategy, IDENTITY_STRATEGY);
+        assert_eq!(prepared.record.context_strategy, L0_STRATEGY);
+    }
+
+    /// 造一轮只有一次 `read_file` 的模型轮。
+    ///
+    /// **作用**：准备测试放两条引用相同、正文不同的结果。
+    /// **参数**：`body` 是这条工具结果的原文，允许空串。
+    /// **边界**：参数固定为 `{"path":"a.rs"}`，引用固定为 `sha256:abc`。用量是已知的 10 和 1。
+    fn read_round(body: &str) -> Round {
+        Round {
+            assistant: AssistantTurn {
+                content: "keep".to_owned(),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+            },
+            tools: vec![ToolResult {
+                call_id: "call".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: r#"{"path":"a.rs"}"#.to_owned(),
+                result_ref: "sha256:abc".to_owned(),
+                byte_count: 1,
+                body: body.to_owned(),
+            }],
+            usage: usage(10, 1, TokenCount::Unknown, TokenCount::Unknown),
+            trailing_user: String::new(),
+        }
+    }
+
+    /// 重复的新工具正文换成存根，重放得到同一份视图。
+    #[test]
+    fn prepare_stubs_a_duplicate_and_replay_matches() {
+        let transcript = Transcript {
+            system: "s".to_owned(),
+            user: "u".to_owned(),
+            rounds: vec![read_round("old"), read_round("new")],
+        };
+        let prepared = manager().prepare(&transcript, 32_768).expect("under limit");
+        assert_eq!(prepared.record.context_strategy, L0_STRATEGY);
+        assert_eq!(prepared.view.rounds[0].tools[0].body, "old");
+        assert_eq!(prepared.view.rounds[0].assistant.content, "keep");
+        assert_eq!(
+            prepared.view.rounds[1].tools[0].body,
+            "[unchanged: same result as round #1 call 1]"
+        );
+        assert_eq!(prepared.record.edits.len(), 1);
+        let view = ContextManager::replay(&transcript, &prepared.record).expect("replay");
+        assert_eq!(view, prepared.view);
     }
 
     /// 锚点只加最后一轮的工具正文。assistant 正文和未知的缓存字段不再数一遍。
@@ -431,8 +491,11 @@ mod tests {
     ///
     /// **作用**：多轮锚点测试少写重复结构。
     /// **参数**：`content` 是 assistant 正文，空串允许。`tool_body` 是工具正文，空串允许。`usage` 原样放进这一轮，可以是未知 completion。
-    /// **边界**：思维链为空，没有工具调用参数。工具名和引用是固定短字符串。
+    /// **边界**：思维链为空，没有工具调用参数。每次调用使用不同的 `result_ref`，避免被 L0 当成同一结果。
     fn round_of(content: &str, tool_body: &str, usage: ModelUsage) -> Round {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_REF: AtomicU64 = AtomicU64::new(1);
+        let result_ref = format!("sha256:{:x}", NEXT_REF.fetch_add(1, Ordering::Relaxed));
         Round {
             assistant: AssistantTurn {
                 content: content.to_owned(),
@@ -443,7 +506,7 @@ mod tests {
                 call_id: "c".to_owned(),
                 name: "n".to_owned(),
                 arguments: String::new(),
-                result_ref: "sha256:z".to_owned(),
+                result_ref,
                 byte_count: 1,
                 body: tool_body.to_owned(),
             }],
@@ -601,7 +664,7 @@ mod tests {
                 "schema_version": 1,
                 "profile_version": 2,
                 "profile_hash": profile.profile_hash,
-                "context_strategy": "identity@1",
+                "context_strategy": "l0@1",
                 "spec": { "hard_limit": 711065 },
                 "estimate": {
                     "tokens": 7,

@@ -1,7 +1,7 @@
 //! L0 前向去重。
 //!
 //! **作用**：发现完全相同的新工具结果时，准备把新正文换成存根。
-//! **边界**：`ForwardDedup` 实现 `ContextStrategy`。`prepare` 仍不调用它。
+//! **边界**：`ForwardDedup` 实现 `ContextStrategy`。成功和耗尽的 `prepare` 都会调用它。
 //!
 
 use crate::record::{ContextRecord, ContextSpec, ReplayError};
