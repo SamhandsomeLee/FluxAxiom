@@ -6,13 +6,13 @@
 use fluxaxiom_contract::TokenCount;
 
 use crate::forward_dedup::{ForwardDedup, L0_STRATEGY};
+use crate::profile::ModelProfile;
+use crate::record::{ContextRecord, ContextSpec, Estimate, EstimateSource, ReplayError};
 use crate::stale::{
     L0ThenL1ThenL2, L0ThenL2, StaleMask, L0L1L2_STRATEGY, L0L2_STRATEGY, L2_STRATEGY,
 };
-use crate::supersede::{L0ThenL1, L0L1_STRATEGY, SupersedeRead, L1_STRATEGY, PROTECT_ROUNDS};
-use crate::profile::ModelProfile;
-use crate::record::{ContextRecord, ContextSpec, Estimate, EstimateSource, ReplayError};
 use crate::strategy::{ContextStrategy, Identity, IDENTITY_STRATEGY};
+use crate::supersede::{L0ThenL1, SupersedeRead, L0L1_STRATEGY, L1_STRATEGY, PROTECT_ROUNDS};
 use crate::text::ceil_tokens;
 use crate::transcript::{Round, Transcript, View};
 
@@ -453,7 +453,13 @@ mod tests {
     /// **作用**：软触发测试用它构造可被 `read_span` 识别的工具结果。
     /// **参数**：`path` 写入 `path:` 行。`start` 是起始行。`truncated` 为真时必须有 `next`。`content` 是正文，汉字按 1 token 估算。
     /// **边界**：不检查 `next` 是否大于 `start`。
-    fn rendered_read(path: &str, start: u32, truncated: bool, next: Option<u32>, content: &str) -> String {
+    fn rendered_read(
+        path: &str,
+        start: u32,
+        truncated: bool,
+        next: Option<u32>,
+        content: &str,
+    ) -> String {
         let mut text = format!("tool: read_file\npath: {path}\nstart_line: {start}\n\n{content}\n");
         if truncated {
             text.push_str(&format!(
@@ -559,7 +565,9 @@ mod tests {
             .edits
             .iter()
             .all(|edit| edit["op"] != "superseded"));
-        assert!(prepared.view.rounds[0].tools[0].body.starts_with("tool: read_file"));
+        assert!(prepared.view.rounds[0].tools[0]
+            .body
+            .starts_with("tool: read_file"));
     }
 
     #[test]

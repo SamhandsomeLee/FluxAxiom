@@ -331,7 +331,9 @@ fn mask_old_tool_results(mut request: Value) -> Option<(Value, MaskStats)> {
             last_assistant = Some(index);
             continue;
         }
-        if role != "tool" || current_round == 0 || current_round > rounds.saturating_sub(PROTECT_ROUNDS)
+        if role != "tool"
+            || current_round == 0
+            || current_round > rounds.saturating_sub(PROTECT_ROUNDS)
         {
             continue;
         }
@@ -476,10 +478,19 @@ fn mask_replaces_only_tool_results_outside_the_protect_window() {
     let (masked, stats) = mask_old_tool_results(request).expect("messages");
     assert_eq!(stats.rounds, 4);
     assert_eq!(stats.stubbed, 2);
-    assert_eq!(stats.bytes_before, "SECRET_EARLY".len() + "SECRET_MIDDLE".len());
+    assert_eq!(
+        stats.bytes_before,
+        "SECRET_EARLY".len() + "SECRET_MIDDLE".len()
+    );
     let messages = masked.get("messages").expect("messages");
-    assert!(messages[3]["content"].as_str().unwrap().starts_with("[stale:"));
-    assert!(messages[5]["content"].as_str().unwrap().starts_with("[stale:"));
+    assert!(messages[3]["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("[stale:"));
+    assert!(messages[5]["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("[stale:"));
     assert_eq!(messages[7]["content"], "KEEP_NEAR");
     assert_eq!(messages[9]["content"], "KEEP_LAST");
     assert_eq!(messages[2]["content"], "keep");
@@ -566,10 +577,7 @@ async fn masked_tools_for_mini_inventory_k5() {
                 decisions.push(decision);
             }
             other => {
-                println!(
-                    "phase=masked sample={index} http={}",
-                    round_label(&other)
-                );
+                println!("phase=masked sample={index} http={}", round_label(&other));
                 println!("stopped reason=not_completed phase=masked sample={index}");
                 return;
             }

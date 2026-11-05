@@ -10,7 +10,6 @@ use serde_json::{json, Value};
 use crate::record::{ContextRecord, ContextSpec, ReplayError};
 use crate::strategy::ContextStrategy;
 
-
 /// 一次 `read_file` 实际读到的范围。
 ///
 /// **作用**：`later_covers` 用它比较两条结果。
@@ -23,7 +22,6 @@ struct ReadSpan {
     /// 不含在内的下一行。`None` 表示这次读到了文件末尾。
     end: Option<u32>,
 }
-
 
 impl ReadSpan {
     /// 判断这次读取是否包含另一次读取的全部行。
@@ -99,7 +97,6 @@ fn read_span(tool: &ToolResult) -> Option<ReadSpan> {
 
 /// 写入记录的 L1 策略标识。
 pub const L1_STRATEGY: &str = "l1@1";
-
 
 /// 作废遮蔽策略。
 ///
@@ -331,7 +328,6 @@ pub(crate) fn replay_superseded_edits(view: &mut View, edits: &[Value]) -> Resul
     Ok(())
 }
 
-
 /// 读取 edit 里从 1 起的序号，并转换成切片下标。
 ///
 /// **作用**：`replay_superseded_edits` 读轮次与调用序号。
@@ -356,9 +352,7 @@ fn one_based(object: &serde_json::Map<String, Value>, key: &str) -> Result<usize
 /// **参数**：`view` 只读。`round` 是轮次下标，`call` 是该轮工具下标，都从 0 起。
 /// **边界**：越界时返回 `None`。
 fn tool_at(view: &View, round: usize, call: usize) -> Option<&ToolResult> {
-    view.rounds
-        .get(round)
-        .and_then(|item| item.tools.get(call))
+    view.rounds.get(round).and_then(|item| item.tools.get(call))
 }
 
 #[cfg(test)]
@@ -375,10 +369,14 @@ mod tests {
     /// **作用**：`read_span` 和 `mask_superseded` 测试共用。
     /// **参数**：`path` 写入 `path:` 行。`start` 是起始行。`truncated` 为真时必须有 `next`。
     /// **边界**：中间正文用 `content` 占位，不参与覆盖判断。
-    fn read_body(path: &str, start: u32, truncated: bool, next: Option<u32>, content: &str) -> String {
-        let mut text = format!(
-            "tool: read_file\npath: {path}\nstart_line: {start}\n\n{content}\n"
-        );
+    fn read_body(
+        path: &str,
+        start: u32,
+        truncated: bool,
+        next: Option<u32>,
+        content: &str,
+    ) -> String {
+        let mut text = format!("tool: read_file\npath: {path}\nstart_line: {start}\n\n{content}\n");
         if truncated {
             text.push_str(&format!(
                 "truncated: true; next_start_line: {}\n",
@@ -540,7 +538,15 @@ mod tests {
                     900,
                     "sha256:two",
                 )]),
-                round(vec![read_tool("b.rs", 1, false, None, "other", 10, "sha256:three")]),
+                round(vec![read_tool(
+                    "b.rs",
+                    1,
+                    false,
+                    None,
+                    "other",
+                    10,
+                    "sha256:three",
+                )]),
             ],
         };
         let mut edits = Vec::new();
@@ -815,7 +821,15 @@ mod tests {
                     900,
                     "sha256:two",
                 )]),
-                round(vec![read_tool("b.rs", 1, false, None, "other", 10, "sha256:three")]),
+                round(vec![read_tool(
+                    "b.rs",
+                    1,
+                    false,
+                    None,
+                    "other",
+                    10,
+                    "sha256:three",
+                )]),
             ],
         };
         let original = facts.rounds[2].tools[0].body.clone();

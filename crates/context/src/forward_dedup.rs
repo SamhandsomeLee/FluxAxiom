@@ -204,10 +204,7 @@ fn replay_edits(view: &mut View, edits: &[Value]) -> Result<(), ReplayError> {
 /// **作用**：`l0l1@1` 先调用它，再重放作废遮蔽。
 /// **参数**：`view` 从事实抄出，成功时只改这些 edit 点到的 `body`。`edits` 只能含 `unchanged`，空切片允许。
 /// **边界**：出现别的 `op` 时返回 [`ReplayError::InvalidEdit`]，并且不改 `view`。
-pub(crate) fn replay_unchanged_edits(
-    view: &mut View,
-    edits: &[Value],
-) -> Result<(), ReplayError> {
+pub(crate) fn replay_unchanged_edits(view: &mut View, edits: &[Value]) -> Result<(), ReplayError> {
     replay_edits(view, edits)
 }
 

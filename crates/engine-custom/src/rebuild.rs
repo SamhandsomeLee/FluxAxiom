@@ -242,9 +242,7 @@ fn replay_matches(calls: &[RebuildCall], pos: usize, req: &Value) -> Result<(), 
             inconsistent(call.index, 1, "invalid context estimate anchor")
         }
         ReplayError::InvalidSpec => inconsistent(call.index, 1, "invalid context spec"),
-        ReplayError::InvalidEdit => {
-            inconsistent(call.index, 1, "context edit cannot be replayed")
-        }
+        ReplayError::InvalidEdit => inconsistent(call.index, 1, "context edit cannot be replayed"),
         ReplayError::UnsupportedSchema { .. }
         | ReplayError::UnknownStrategy { .. }
         | ReplayError::NotReplayable => RebuildResult::Unverifiable {
@@ -1259,11 +1257,7 @@ mod tests {
         fourth.event_context_strategy = Some(L0L1_STRATEGY.to_owned());
         fourth.context = RebuildContext::Parsed(record);
         match l1_verify(reads, fourth) {
-            RebuildResult::Inconsistent {
-                call,
-                rule,
-                detail,
-            } => {
+            RebuildResult::Inconsistent { call, rule, detail } => {
                 assert_eq!(call, 4);
                 assert_eq!(rule, 1);
                 assert_eq!(detail, "context edit cannot be replayed");

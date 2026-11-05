@@ -9,9 +9,9 @@ mod profile;
 mod record;
 mod stale;
 mod strategy;
+mod supersede;
 mod text;
 mod transcript;
-mod supersede;
 
 pub use forward_dedup::{ForwardDedup, L0_STRATEGY};
 pub use manager::{ContextExhausted, ContextManager, Prepared};
@@ -19,8 +19,8 @@ pub use profile::{deepseek_flash, ModelProfile, ProfileError, ProfileField};
 pub use record::{ContextRecord, ContextSpec, Estimate, EstimateSource, ReplayError};
 pub use stale::{L0ThenL1ThenL2, L0ThenL2, StaleMask, L0L1L2_STRATEGY, L0L2_STRATEGY, L2_STRATEGY};
 pub use strategy::{ContextStrategy, Identity, IDENTITY_STRATEGY};
+pub use supersede::{L0ThenL1, SupersedeRead, L0L1_STRATEGY, L1_STRATEGY};
 pub use transcript::{AssistantTurn, Round, ToolCall, ToolResult, Transcript, View};
-pub use supersede::{L0ThenL1, L0L1_STRATEGY, SupersedeRead, L1_STRATEGY};
 
 #[cfg(test)]
 mod tests {
