@@ -375,12 +375,12 @@ pub fn search_code(
     })
 }
 
-/// 三个工具共用的目录遍历。
+/// 三个工具与路径核对共用的目录遍历。
 ///
-/// **作用**：`list_files`、`search_code` 和可见性判断使用同一组过滤。
+/// **作用**：`list_files`、`search_code`、可见性判断和报告路径核对使用同一组过滤。
 /// **参数**：`path` 是本次遍历的起点，必须已经落在授权根内。
 /// **边界**：不读授权根上层的忽略文件，也不读用户的全局 gitignore。没有 `.git` 目录时仍然读取 `.gitignore`。不跟随符号链接。
-fn walk_from(path: &Path) -> WalkBuilder {
+pub(crate) fn walk_from(path: &Path) -> WalkBuilder {
     let mut walker = WalkBuilder::new(path);
     walker
         .standard_filters(true)

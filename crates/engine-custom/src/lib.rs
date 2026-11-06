@@ -6,6 +6,7 @@
 //! `ChatRequest::new` 默认带未校准的 `max_tokens: 32768`。
 
 mod chat;
+mod citations;
 mod decision;
 mod doc_version;
 mod engine;
@@ -23,6 +24,7 @@ pub use chat::{
     FinishReason, Message, ObservedText, ReasoningEffort, ReplayReasoning, ToolCall, ToolSpec,
     API_KEY_ENV, DEFAULT_MAX_TOKENS, DEFAULT_MODEL, MAX_TOKENS_LIMIT,
 };
+pub use citations::{missing_path_citations, path_citations, PathCitation};
 pub use doc_version::{lookup as lookup_doc_version, DocVersion};
 pub use engine::{EngineA, PROMPT_LAYOUT_VERSION};
 pub use fake::{FakeChat, FakeStep, ScriptedTurn};
