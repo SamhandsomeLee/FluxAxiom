@@ -36,3 +36,4 @@
 | 日期 | 模型 | 结果 | 备注 |
 |---|---|---|---|
 | 2026-10-27 | deepseek-flash / DeepSeek-V4.1-Flash-1017 / `p0a-loop-1` | Completed；verify=consistent；feedback=usable；事实 4/4；缺陷命中 remove 下溢 | G-A 门禁前质量基线，不计正式观察期；`ga-baseline-1` / `run_01a17b3f-8420-769a-90c2-9b682321646f`；model 6/8 tool 11/32；Sample 与 data_dir 仅本机，见 `docs/development/G-A验收报告.md` §3 |
+| 2026-11-06 | deepseek-flash / DeepSeek-V4.1-Flash-1017 / `p0a-loop-1` | Completed；verify=consistent；事实 4/4；路径均存在；缺陷命中 `Inventory::remove` 下溢 | 事实由核对代理对照源码判定，未写 `feedback`。`run_01a1ae5d-885f-719c-9c62-3889ef8b8a94`；commit `2c4b25ae`，dirty=false；model 5/8 tool 12/32；prompt 9195，completion 3129，wall 21s。数据目录 `target/ea04-eval`。次要说法里「名称含 TAB 或换行下次一定被丢弃」与 `load` 的实际解析不完全一致 |
